@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -297,6 +297,121 @@ test("微信 /new 的项目 alias 错误会回复微信并把 queue 标记 compl
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+test("/sessions 输出列标题、未命名会话首句及截断后的标题", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-sessions-title-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-sessions-title" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "测试项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const unnamedSessionId = "session-with-first-message";
+  const unnamedSessionFile = join(temporaryDirectory, `${unnamedSessionId}.jsonl`);
+  const firstUserMessage = "请帮我排查登录页面无法提交表单的问题";
+  await writeFile(unnamedSessionFile, [
+    JSON.stringify({
+      type: "session",
+      version: 3,
+      id: unnamedSessionId,
+      timestamp: new Date().toISOString(),
+      cwd: projectPath,
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "user-entry-1",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "user",
+        content: [{ type: "text", text: firstUserMessage }],
+      },
+    }),
+  ].join("\n"), "utf8");
+  const indexedUnnamedSession = await registry.upsertSession({
+    sessionId: unnamedSessionId,
+    sessionFile: unnamedSessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    mode: "background",
+    state: "active",
+    lastActivityAt: new Date().toISOString(),
+  });
+  await registry.upsertInstance({
+    instanceId: "current-wechat-owner",
+    pid: process.pid,
+    processBirthId: `${process.pid}:sessions-title-test`,
+    sessionId: indexedUnnamedSession.sessionId,
+    sessionFile: unnamedSessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    mode: "background",
+    state: "idle",
+    heartbeatAt: new Date().toISOString(),
+  });
+  await registry.setRoute("wx-sessions-title", {
+    sessionId: indexedUnnamedSession.sessionId,
+    workerInstanceId: "current-wechat-owner",
+    generation: 1,
+    updatedAt: new Date().toISOString(),
+  });
+  const longTitle = "较长会话标题".repeat(8);
+  await registry.upsertSession({
+    sessionId: "session-with-long-name",
+    sessionFile: join(temporaryDirectory, "session-with-long-name.jsonl"),
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: longTitle,
+    mode: "background",
+    state: "saved",
+    lastActivityAt: new Date(Date.now() - 1000).toISOString(),
+  });
+  const workerManager = new BackgroundWorkerManager({
+    projectService,
+    registry,
+    invocation: { command: process.execPath, args: ["unused"] },
+    disableDiscoveredResources: true,
+  });
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const result = await router.receive({
+      messageId: "wx-sessions-title",
+      senderId: "wx-sessions-title",
+      text: "/sessions --state all",
+    });
+    assert.equal(result.state, "completed");
+    const reply = replies.at(-1) ?? "";
+    assert.match(reply, /#索引 \| 标题 \| 项目 \| 模式 \| 状态 \| 微信路由/);
+    assert.match(reply, new RegExp(firstUserMessage));
+    assert.match(reply, /\| 当前$/m);
+    assert.ok(!reply.includes("未命名"));
+    assert.ok(reply.includes(`${Array.from(longTitle).slice(0, 37).join("")}...`));
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
 test("Gateway 在 allowlist 检查前不写 queue", async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-auth-"));
   const managerDirectory = join(temporaryDirectory, "manager-data");

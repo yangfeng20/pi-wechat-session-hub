@@ -1,3 +1,5 @@
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { ConfigurationStore } from "../config/store.ts";
 import type { ManagerConfiguration, RuntimeMode } from "../config/types.ts";
 import type { GatewayInboundMessage, IlinkReplyContext } from "./channel-types.ts";
@@ -493,6 +495,7 @@ export class GatewayCommandRouter {
   /**
    * 列出 sessions, 不更改当前 route。
    *
+   * @param routeId 当前微信 route ID。
    * @param projectAlias 可选项目筛选。
    * @param state 状态筛选。
    * @param page 页码。
@@ -500,12 +503,14 @@ export class GatewayCommandRouter {
    * @returns 分页清单文本。
    */
   private async formatSessions(
+    routeId: string,
     projectAlias: string | undefined,
     state: "default" | "active" | "saved" | "pending" | "all",
     page: number,
     config: ManagerConfiguration,
   ): Promise<string> {
     const snapshot = await this.registry.readSnapshot();
+    const currentRouteSessionId = snapshot.routes[routeId]?.sessionId;
     const activeSessionIds = new Set(
       Object.values(snapshot.instances)
         .filter((instance) => instance.state !== "stale" && instance.state !== "stopping")
@@ -535,9 +540,14 @@ export class GatewayCommandRouter {
     if (pageSessions.length === 0) {
       return "没有匹配的会话。";
     }
+    const displaySessions = await Promise.all(pageSessions.map(async (session) => ({
+      session,
+      title: await resolveSessionTitle(session),
+    })));
     return [
-      `会话列表 (${page}/${pageCount}):`,,
-      ...pageSessions.map((session) => {
+      `会话列表 (${page}/${pageCount}):`,
+      "#索引 | 标题 | 项目 | 模式 | 状态 | 微信路由",
+      ...displaySessions.map(({ session, title }) => {
         const projectName = Object.hasOwn(config.projects, session.projectAlias)
           ? config.projects[session.projectAlias].displayName
           : session.projectAlias;
@@ -545,7 +555,8 @@ export class GatewayCommandRouter {
           ? session.state === "pending" ? "等待首条记录" : "活跃"
           : session.state === "pending" ? "等待首条记录" : "已保存";
         const mode = activeSessionIds.has(session.sessionId) && session.mode === "ui" ? "前台" : "后台";
-        return `#${session.publicIndex ?? "?"} | ${session.name ?? "未命名"} | ${projectName} | ${mode} | ${status}`;
+        const routeMark = currentRouteSessionId === session.sessionId ? "当前" : "-";
+        return `#${session.publicIndex ?? "?"} | ${title} | ${projectName} | ${mode} | ${status} | ${routeMark}`;
       }),
     ].join("\n");
   }
@@ -754,7 +765,7 @@ export class GatewayCommandRouter {
         case "new":
           return await this.handleNew(routeId, command.mode, command.projectAlias, command.name, config);
         case "sessions":
-          return await this.formatSessions(command.projectAlias, command.state, command.page, config);
+          return await this.formatSessions(routeId, command.projectAlias, command.state, command.page, config);
         case "resume":
           return await this.handleResume(routeId, command.selector);
         case "stop":
@@ -800,6 +811,103 @@ export class GatewayCommandRouter {
       );
     }
   }
+}
+
+const SESSION_TITLE_LIMIT = 40;
+
+/**
+ * 解析 session 显示标题: 优先使用名称, 否则使用 Pi resume 列表采用的首条用户文本。
+ *
+ * @param session Hub session 索引。
+ * @returns 已清理并截断的会话标题。
+ */
+async function resolveSessionTitle(session: SessionIndexRecord): Promise<string> {
+  const name = session.name ? normalizeSessionTitle(session.name) : "";
+  const firstMessage = name ? undefined : await readFirstUserMessage(session.sessionFile);
+  return truncateSessionTitle(name || firstMessage || "（尚无用户消息）");
+}
+
+/**
+ * 从 Pi JSONL session 文件中读取首条非空 user 文本。
+ *
+ * @param sessionFile Pi session 文件路径。
+ * @returns 首条用户文本, 不存在或无法读取时返回 undefined。
+ */
+async function readFirstUserMessage(sessionFile: string): Promise<string | undefined> {
+  let input: ReturnType<typeof createReadStream> | undefined;
+  let lines: ReturnType<typeof createInterface> | undefined;
+  try {
+    input = createReadStream(sessionFile, { encoding: "utf8" });
+    lines = createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      let entry: unknown;
+      try {
+        entry = JSON.parse(line) as unknown;
+      } catch {
+        continue;
+      }
+      if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
+        continue;
+      }
+      const message = entry.message;
+      if (message.role !== "user") {
+        continue;
+      }
+      const content = message.content;
+      const text = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content
+            .filter((block) => isRecord(block) && block.type === "text" && typeof block.text === "string")
+            .map((block) => (block as { text: string }).text)
+            .join(" ")
+          : "";
+      const normalized = normalizeSessionTitle(text);
+      if (normalized) {
+        return normalized;
+      }
+    }
+  } catch {
+    return undefined;
+  } finally {
+    lines?.close();
+    input?.destroy();
+  }
+  return undefined;
+}
+
+/**
+ * 清理标题中的控制字符并折叠空白, 保证每个会话只占一行。
+ *
+ * @param title 原始标题或用户文本。
+ * @returns 去除控制字符并折叠空白后的文本。
+ */
+function normalizeSessionTitle(title: string): string {
+  return title.replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 将会话标题限制为 40 个 Unicode code point, 超出部分以三个点省略。
+ *
+ * @param title 已清理标题。
+ * @returns 长度限制内的标题。
+ */
+function truncateSessionTitle(title: string): string {
+  const characters = Array.from(title);
+  if (characters.length <= SESSION_TITLE_LIMIT) {
+    return title;
+  }
+  return `${characters.slice(0, SESSION_TITLE_LIMIT - 3).join("")}...`;
+}
+
+/**
+ * 判断未知值是否为非数组对象。
+ *
+ * @param value 待检查的值。
+ * @returns 值可安全读取字段时返回 true。
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 const GATEWAY_HELP_TEXT = [
