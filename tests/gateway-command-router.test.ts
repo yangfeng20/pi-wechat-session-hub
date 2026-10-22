@@ -144,6 +144,14 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     assert.match(sentReplies.at(-1)?.text ?? "", /#1 \| 调查应用错误/);
     assert.match(sentReplies.at(-1)?.text ?? "", /后台/);
 
+    const help = await router.receive({
+      messageId: "wx-help-1",
+      senderId: "wx-user-1",
+      text: "/help",
+    });
+    assert.equal(help.state, "completed");
+    assert.match(sentReplies.at(-1)?.text ?? "", /\/new[^\n]*\n\n\/projects/);
+
     const stopped = await router.receive({
       messageId: "wx-stop-1",
       senderId: "wx-user-1",

@@ -919,7 +919,7 @@ const GATEWAY_HELP_TEXT = [
   "/retry <message-id> --confirm - 显式重试失败/中断消息; 会重新执行, 可能重复产生副作用",
   "/status",
   "/help",
-].join("\n");
+].join("\n\n");
 
 /**
  * 将 durable queue dispatch 结果规范化为 Gateway receive 结果。
