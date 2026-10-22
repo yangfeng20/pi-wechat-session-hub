@@ -1,0 +1,27 @@
+name: Pi 版本兼容性
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-version:
+          - 0.85.1
+          - 1.0.0
+          - 1.3.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.3
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm install --no-save --ignore-scripts --package-lock=false --no-audit --no-fund @earendil-works/pi-coding-agent@${{ matrix.pi-version }}
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:pi-runtime
