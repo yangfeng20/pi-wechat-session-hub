@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { constants } from "node:fs";
-import { mkdir, open, readdir, lstat, realpath, rename, unlink } from "node:fs/promises";
+import { mkdir, open, readdir, lstat, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GatewayLease } from "../registry/gateway-lease.ts";
@@ -28,7 +28,8 @@ export class UiWorkerIpcError extends Error {
       | "handshake_rejected"
       | "worker_disconnected"
       | "request_timeout"
-      | "launch_record_invalid",
+      | "launch_record_invalid"
+      | "project_not_registered",
     message: string,
   ) {
     super(message);
@@ -105,11 +106,12 @@ export interface UiWorkerIpcServerHandlers {
 }
 
 /**
- * 通过 stable named pipe 管理 UI worker 注册、重连与 request。
+ * 通过 stable named pipe 管理 Hub session owner 注册、重连与受控 request。
  */
 export class UiWorkerIpcServer extends EventEmitter {
   readonly endpoint: string;
   private server?: Server;
+  private managerAuthHash?: string;
   private stopping = false;
   private handlers?: UiWorkerIpcServerHandlers;
   private readonly pendingLaunches = new Map<string, UiWorkerLaunchRecord>();
@@ -158,6 +160,7 @@ export class UiWorkerIpcServer extends EventEmitter {
       return;
     }
     await this.cleanupAbandonedLaunchRecords();
+    this.managerAuthHash = hashUiWorkerTicket(await readOrCreateUiWorkerAttachToken(this.managerDirectory));
     const server = createServer((socket) => {
       this.sockets.add(socket);
       socket.once("close", () => this.sockets.delete(socket));
@@ -375,11 +378,22 @@ export class UiWorkerIpcServer extends EventEmitter {
     let reservedLaunchId: string | undefined;
     try {
       const hello = await peer.nextMessage(10000);
+      if (!isPlainRecord(hello)) {
+        throw new UiWorkerIpcError("handshake_rejected", "UI worker hello frame 无效。 ");
+      }
+      if (hello.kind === "control_hello") {
+        await this.acceptControlConnection(peer, hello);
+        return;
+      }
       if (hello.kind !== "hello") {
         throw new UiWorkerIpcError("handshake_rejected", "UI worker 首个 IPC frame 必须为 hello。 ");
       }
       const registration = parseUiWorkerRegistration(hello.registration);
-      const auth = await this.resolveAuthContext(registration);
+      const authKind = hello.authKind === undefined ? "ticket" : hello.authKind;
+      if (authKind !== "ticket" && authKind !== "manager") {
+        throw new UiWorkerIpcError("handshake_rejected", "UI worker authentication kind 无效。 ");
+      }
+      const auth = await this.resolveAuthContext(registration, authKind);
       if (auth.launchRecord) {
         reservedLaunchId = auth.launchRecord.launchId;
       }
@@ -444,14 +458,63 @@ export class UiWorkerIpcServer extends EventEmitter {
   }
 
   /**
+   * 建立只允许发起 can_switch_session request 的临时本机控制连接。
+   *
+   * @param peer 已连接 JSONL peer。
+   * @param hello 已通过 JSON decode 的首个 control frame。
+   * @returns control client ready handshake 完成后正常结束。
+   * @throws {UiWorkerIpcError} attach token 或 control request 校验失败时抛出。
+   */
+  private async acceptControlConnection(
+    peer: JsonLinePeer,
+    hello: Record<string, unknown>,
+  ): Promise<void> {
+    const registration = parseUiWorkerRegistration(hello.registration);
+    await this.lease.assertOwned();
+    const authHash = this.managerAuthHash;
+    if (!authHash) {
+      throw new UiWorkerIpcError("handshake_rejected", "Gateway UI attach key 尚未初始化。 ");
+    }
+    const nonce = randomBytes(32).toString("base64url");
+    peer.send({ kind: "challenge", nonce });
+    const proof = await peer.nextMessage(10000);
+    if (proof.kind !== "proof" || typeof proof.value !== "string") {
+      throw new UiWorkerIpcError("handshake_rejected", "UI switch control proof 格式无效。 ");
+    }
+    const expectedProof = createUiWorkerProof(authHash, nonce, registration);
+    if (!safeEqualBase64(proof.value, expectedProof)) {
+      throw new UiWorkerIpcError("handshake_rejected", "UI switch control attach token 校验失败。 ");
+    }
+    const connection = new UiWorkerIpcConnection(peer, registration);
+    peer.setRequestHandler(async (method, params) => {
+      await this.lease.assertOwned();
+      if (method !== "can_switch_session" || !this.handlers?.onRequest) {
+        throw new UiWorkerIpcError("invalid_frame", "UI switch control connection 仅允许 can_switch_session。 ");
+      }
+      return this.handlers.onRequest(connection, method, params);
+    });
+    peer.send({ kind: "control_registered", instanceId: registration.instanceId });
+    const ready = await peer.nextMessage(5000);
+    if (ready.kind !== "client_ready") {
+      throw new UiWorkerIpcError("handshake_rejected", "UI switch control client 未能就绪。 ");
+    }
+  }
+
+  /**
    * 解析初次 launch 或进程重连所需的共享秘密 hash。
    *
    * @param registration Pi extension registration。
    * @returns HMAC key 和可选启动记录。
    */
-  private async resolveAuthContext(registration: UiWorkerRegistration): Promise<UiWorkerLaunchAuthContext> {
+  private async resolveAuthContext(
+    registration: UiWorkerRegistration,
+    authKind: "ticket" | "manager",
+  ): Promise<UiWorkerLaunchAuthContext> {
     const launchRecord = this.pendingLaunches.get(registration.launchId);
     if (launchRecord) {
+      if (authKind !== "ticket") {
+        throw new UiWorkerIpcError("handshake_rejected", "一次性 UI launch 只能使用对应 ticket 认证。 ");
+      }
       if (this.reservedLaunches.has(registration.launchId)) {
         throw new UiWorkerIpcError("handshake_rejected", "UI worker launch ticket 已被另一连接使用。 ");
       }
@@ -469,6 +532,16 @@ export class UiWorkerIpcServer extends EventEmitter {
         throw new UiWorkerIpcError("handshake_rejected", "UI worker registration 与 launch record 不匹配。 ");
       }
       return { authHash: hashUiWorkerTicket(launchRecord.ticket), launchRecord };
+    }
+
+    if (authKind === "manager") {
+      await this.lease.assertOwned();
+      const authHash = this.managerAuthHash;
+      if (!authHash) {
+        throw new UiWorkerIpcError("handshake_rejected", "Gateway UI attach key 尚未初始化。 ");
+      }
+      await this.lease.assertOwned();
+      return { authHash };
     }
 
     const snapshot = await this.registry.readSnapshot();
@@ -490,7 +563,7 @@ export class UiWorkerIpcServer extends EventEmitter {
 }
 
 /**
- * 通过 Gateway named pipe 接收控制请求并重新连接。
+ * 通过 Gateway named pipe 接收可见 Pi TUI control request 并安全重连。
  */
 export class UiWorkerIpcClient extends EventEmitter {
   private requestHandler?: (method: string, params: Record<string, unknown>) => Promise<unknown>;
@@ -526,6 +599,7 @@ export class UiWorkerIpcClient extends EventEmitter {
     registration: UiWorkerRegistration,
     options: {
       timeoutMs?: number;
+      managerToken?: string;
       requestHandler?: (method: string, params: Record<string, unknown>) => Promise<unknown>;
     } = {},
   ): Promise<UiWorkerIpcClient> {
@@ -533,14 +607,22 @@ export class UiWorkerIpcClient extends EventEmitter {
     const peer = new JsonLinePeer(createConnection(endpoint));
     try {
       await peer.waitUntilOpen(timeoutMs);
-      peer.send({ kind: "hello", registration: publicRegistration(registration) });
+      peer.send({
+        kind: "hello",
+        registration: publicRegistration(registration),
+        authKind: options.managerToken ? "manager" : "ticket",
+      });
       const challenge = await peer.nextMessage(timeoutMs);
       if (challenge.kind !== "challenge" || typeof challenge.nonce !== "string") {
         throw new UiWorkerIpcError("handshake_rejected", "Gateway 未返回有效 IPC challenge。 ");
       }
       peer.send({
         kind: "proof",
-        value: createUiWorkerProof(hashUiWorkerTicket(ticket), challenge.nonce, registration),
+        value: createUiWorkerProof(
+          hashUiWorkerTicket(options.managerToken ?? ticket),
+          challenge.nonce,
+          registration,
+        ),
       });
       const accepted = await peer.nextMessage(timeoutMs);
       if (accepted.kind !== "registered" || accepted.instanceId !== registration.instanceId) {
@@ -561,6 +643,62 @@ export class UiWorkerIpcClient extends EventEmitter {
         throw error;
       }
       throw new UiWorkerIpcError("pipe_unavailable", "无法连接 Gateway named pipe。 ");
+    }
+  }
+
+  /**
+   * 建立不占有 session 的本机 UI switch control connection。
+   *
+   * @param endpoint Gateway UI IPC endpoint。
+   * @param managerDirectory Hub 私有数据目录。
+   * @param managerToken 当前 manager 目录稳定 attach token。
+   * @param options 握手超时配置。
+   * @returns 仅用于 can_switch_session 等授权 control request 的 client。
+   * @throws {UiWorkerIpcError} server 身份验证或连接失败时抛出。
+   */
+  static async connectControl(
+    endpoint: string,
+    managerDirectory: string,
+    managerToken: string,
+    options: { timeoutMs?: number } = {},
+  ): Promise<UiWorkerIpcClient> {
+    const registration: UiWorkerRegistration = {
+      launchId: randomUUID(),
+      instanceId: randomUUID(),
+      pid: process.pid,
+      processBirthId: `${process.pid}:${Math.floor(Date.now() - process.uptime() * 1000)}`,
+      sessionId: "control-only",
+      sessionFile: join(resolve(managerDirectory), "control-only.jsonl"),
+      cwd: resolve(managerDirectory),
+      projectAlias: "control",
+      state: "idle",
+    };
+    const peer = new JsonLinePeer(createConnection(endpoint));
+    const timeoutMs = options.timeoutMs ?? 3000;
+    try {
+      await peer.waitUntilOpen(timeoutMs);
+      peer.send({ kind: "control_hello", registration: publicRegistration(registration) });
+      const challenge = await peer.nextMessage(timeoutMs);
+      if (challenge.kind !== "challenge" || typeof challenge.nonce !== "string") {
+        throw new UiWorkerIpcError("handshake_rejected", "Gateway 未返回有效 control challenge。 ");
+      }
+      peer.send({
+        kind: "proof",
+        value: createUiWorkerProof(hashUiWorkerTicket(managerToken), challenge.nonce, registration),
+      });
+      const accepted = await peer.nextMessage(timeoutMs);
+      if (accepted.kind !== "control_registered") {
+        throw new UiWorkerIpcError("handshake_rejected", "Gateway 未确认 UI switch control connection。 ");
+      }
+      const client = new UiWorkerIpcClient(peer, registration);
+      peer.send({ kind: "client_ready" });
+      return client;
+    } catch (error) {
+      peer.close();
+      if (error instanceof UiWorkerIpcError) {
+        throw error;
+      }
+      throw new UiWorkerIpcError("pipe_unavailable", "无法连接 Gateway UI switch control endpoint。 ");
     }
   }
 
@@ -1134,6 +1272,60 @@ export function createUiWorkerProof(
     .update("\n", "utf8")
     .update(canonical, "utf8")
     .digest("base64url");
+}
+
+/**
+ * 读取或 create-only 创建跨 Gateway 重启稳定的 UI attach 认证令牌。
+ *
+ * @param managerDirectory Hub 私有数据目录。
+ * @returns 稳定的随机 IPC 令牌。
+ * @throws {UiWorkerIpcError} key 文件权限路径、格式或写入无效时抛出。
+ */
+export async function readOrCreateUiWorkerAttachToken(managerDirectory: string): Promise<string> {
+  const keyPath = join(managerDirectory, "ui-attachment.key");
+  const newToken = randomBytes(32).toString("hex");
+  let handle;
+  try {
+    handle = await open(keyPath, "wx", 0o600);
+    await handle.writeFile(`${newToken}\n`, "utf8");
+    await handle.sync();
+    await handle.close();
+    return newToken;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (isNodeError(error) && error.code === "EEXIST") {
+      const existingToken = await readUiWorkerAttachToken(managerDirectory);
+      if (existingToken) {
+        return existingToken;
+      }
+      throw new UiWorkerIpcError("handshake_rejected", "UI attach key 文件不可读取。 ");
+    }
+    if (handle) {
+      await unlink(keyPath).catch(() => undefined);
+    }
+    throw new UiWorkerIpcError("handshake_rejected", "无法安全创建 UI attach key。 ");
+  }
+}
+
+export async function readUiWorkerAttachToken(managerDirectory: string): Promise<string | undefined> {
+  const keyPath = join(managerDirectory, "ui-attachment.key");
+  let keyInfo;
+  try {
+    keyInfo = await lstat(keyPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw new UiWorkerIpcError("handshake_rejected", "UI attach key 文件不可读取。 ");
+  }
+  if (!keyInfo.isFile() || keyInfo.isSymbolicLink()) {
+    throw new UiWorkerIpcError("handshake_rejected", "UI attach key 文件类型不可信。 ");
+  }
+  const token = await readFile(keyPath, "utf8");
+  if (!/^[a-f0-9]{64}\r?\n?$/i.test(token)) {
+    throw new UiWorkerIpcError("handshake_rejected", "UI attach key 文件内容无效。 ");
+  }
+  return token.trim();
 }
 
 /**

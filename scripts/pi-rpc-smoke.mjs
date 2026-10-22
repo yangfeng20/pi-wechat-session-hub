@@ -24,24 +24,24 @@ const cliPath = join(packageDirectory, cliRelativePath);
 
 try {
   const output = await runRpcSmoke(cliPath, extensionPath, temporaryDirectory);
-  const records = output
+  const records = output.stdout
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => JSON.parse(line));
   const statusNotices = records.filter((record) =>
     record.type === "extension_ui_request" &&
     record.method === "notify" &&
-    record.message?.includes("Gateway: 当前扩展实例未启动"),
+    record.message?.includes("微信连接: 已停止"),
   );
   const promptResponses = records.filter((record) =>
     record.type === "response" &&
     record.command === "prompt" &&
     record.success === true &&
-    ["compat-status-smoke", "compat-manager-smoke"].includes(record.id),
+    ["compat-status-smoke", "compat-wx-smoke", "compat-manager-smoke"].includes(record.id),
   );
 
-  assert.equal(statusNotices.length, 2, `Pi RPC 未收到两个扩展状态通知: ${JSON.stringify(records)}`);
-  assert.equal(promptResponses.length, 2, "Pi RPC 未接受 /status 和 /wechat-manager status 命令。");
+  assert.equal(statusNotices.length, 3, `Pi RPC 未收到三个共享服务状态通知: ${JSON.stringify(records)}\n${output.stderr}`);
+  assert.equal(promptResponses.length, 3, `Pi RPC 未接受 /status、/wx status 和兼容别名命令: ${JSON.stringify(records)}\n${output.stderr}`);
   process.stdout.write(`Pi ${packageManifest.version} 扩展 RPC smoke test 通过。\n`);
 } finally {
   await rm(temporaryDirectory, { recursive: true, force: true });
@@ -53,7 +53,7 @@ try {
  * @param cliPath Pi CLI JavaScript 入口路径。
  * @param extensionPath 本项目扩展入口路径。
  * @param temporaryDirectory 隔离配置目录。
- * @returns Pi stdout 中的 JSONL 数据。
+ * @returns Pi stdout 与 stderr。
  */
 function runRpcSmoke(cliPath, extensionPath, temporaryDirectory) {
   return new Promise((resolveOutput, rejectOutput) => {
@@ -85,6 +85,9 @@ function runRpcSmoke(cliPath, extensionPath, temporaryDirectory) {
     );
     let stdout = "";
     let stderr = "";
+    let pendingOutputLine = "";
+    const expectedResponseIds = new Set(["compat-status-smoke", "compat-wx-smoke", "compat-manager-smoke"]);
+    const completedResponseIds = new Set();
     const timeout = setTimeout(() => {
       child.kill();
       rejectOutput(new Error("Pi RPC smoke test 超时。"));
@@ -94,6 +97,27 @@ function runRpcSmoke(cliPath, extensionPath, temporaryDirectory) {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
+      pendingOutputLine += chunk;
+      const lines = pendingOutputLine.split(/\r?\n/);
+      pendingOutputLine = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line) continue;
+        try {
+          const record = JSON.parse(line);
+          if (
+            record.type === "response" &&
+            record.command === "prompt" &&
+            expectedResponseIds.has(record.id)
+          ) {
+            completedResponseIds.add(record.id);
+          }
+        } catch {
+          continue;
+        }
+      }
+      if (completedResponseIds.size === expectedResponseIds.size && !child.stdin.destroyed) {
+        child.stdin.end();
+      }
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
@@ -108,10 +132,11 @@ function runRpcSmoke(cliPath, extensionPath, temporaryDirectory) {
         rejectOutput(new Error(`Pi RPC 退出码为 ${code}: ${stderr}`));
         return;
       }
-      resolveOutput(stdout);
+      resolveOutput({ stdout, stderr });
     });
-    child.stdin.end([
+    child.stdin.write([
       { id: "compat-status-smoke", type: "prompt", message: "/status" },
+      { id: "compat-wx-smoke", type: "prompt", message: "/wx status" },
       { id: "compat-manager-smoke", type: "prompt", message: "/wechat-manager status" },
     ].map((request) => JSON.stringify(request)).join("\n") + "\n");
   });

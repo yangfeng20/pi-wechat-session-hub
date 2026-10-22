@@ -122,7 +122,7 @@ function runtimeOptions(
   fixture: RuntimeFixture,
   fetcher: typeof fetch,
   invocation: PiCliInvocation = { command: process.execPath, args: [] },
-  extra: Partial<Pick<Parameters<typeof GatewayRuntime.start>[0], "uiWorkerLauncher" | "uiIpcEndpoint" | "uiPlatform">> = {},
+  extra: Partial<Pick<Parameters<typeof GatewayRuntime.start>[0], "uiWorkerLauncher" | "uiIpcEndpoint" | "uiPlatform" | "lease">> = {},
 ) {
   return {
     dataDirectory: fixture.managerDirectory,
@@ -166,6 +166,39 @@ test("Gateway runtime 启停 poller, 持久化状态并释放 lease", async () =
     await assert.rejects(readFile(join(fixture.managerDirectory, "manager.lock")), { code: "ENOENT" });
     await assert.rejects(readFile(join(fixture.managerDirectory, "gateway.json")), { code: "ENOENT" });
   } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Gateway runtime 可使用 daemon 预先取得的 lease", async () => {
+  const fixture = await createRuntimeFixture();
+  const lease = await GatewayLease.acquire(fixture.managerDirectory);
+  let notifyPollStarted!: () => void;
+  const pollStarted = new Promise<void>((resolveStarted) => {
+    notifyPollStarted = resolveStarted;
+  });
+  const fetcher: typeof fetch = async (_input, init) => {
+    notifyPollStarted();
+    const signal = init?.signal as AbortSignal;
+    return new Promise<Response>((_resolveResponse, rejectResponse) => {
+      const rejectOnAbort = (): void => rejectResponse(new DOMException("已取消", "AbortError"));
+      if (signal.aborted) {
+        rejectOnAbort();
+        return;
+      }
+      signal.addEventListener("abort", rejectOnAbort, { once: true });
+    });
+  };
+  let runtime: GatewayRuntime | undefined;
+  try {
+    runtime = await GatewayRuntime.start(runtimeOptions(fixture, fetcher, undefined, { lease }));
+    await pollStarted;
+    assert.equal(runtime.status, "online");
+    await runtime.stop();
+    await assert.rejects(readFile(join(fixture.managerDirectory, "manager.lock")), { code: "ENOENT" });
+  } finally {
+    await runtime?.stop().catch(() => undefined);
+    await lease.release().catch(() => undefined);
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
@@ -241,8 +274,9 @@ test("Gateway runtime 恢复已保存 route 到同一 Pi session 并更新 owner
   }
 });
 
-test("Gateway runtime 恢复 saved UI route 并更新 owner generation", { timeout: 15000 }, async () => {
+test("Gateway runtime 将已保存 UI route 恢复为后台, 不自动打开 Windows Terminal tab", { timeout: 15000 }, async () => {
   const fixture = await createRuntimeFixture();
+  const fakeCli = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-pi-session-manager.mjs");
   const sessionId = "saved-ui-runtime-session";
   const sessionDirectory = join(fixture.root, "ui-sessions");
   const sessionFile = join(sessionDirectory, `${sessionId}.jsonl`);
@@ -355,8 +389,10 @@ test("Gateway runtime 恢复 saved UI route 并更新 owner generation", { timeo
     });
   };
   const bridges: UiWorkerExtensionBridge[] = [];
+  let uiLaunches = 0;
   const uiWorkerLauncher = {
     launch: async (managerDirectory: string, _cwd: string, launchId: string): Promise<void> => {
+      uiLaunches += 1;
       const launch = await readUiWorkerLaunchRecord(managerDirectory, launchId);
       const bridge = createFakeUiBridge(launch, fixture.projectService);
       bridges.push(bridge.bridge);
@@ -369,7 +405,7 @@ test("Gateway runtime 恢复 saved UI route 并更新 owner generation", { timeo
     runtime = await GatewayRuntime.start(runtimeOptions(
       fixture,
       fetcher,
-      { command: process.execPath, args: [process.execPath] },
+      { command: process.execPath, args: [fakeCli] },
       {
         uiPlatform: "win32",
         uiIpcEndpoint: uiEndpoint,
@@ -383,26 +419,29 @@ test("Gateway runtime 恢复 saved UI route 并更新 owner generation", { timeo
     assert.equal(sentUiMessages.length, 1);
     assert.equal(sentUiMessages[0].context_token, "ui-runtime-reply-context");
     assert.equal(sentUiMessages[0].to_user_id, AUTHORIZED_USER_ID);
-    assert.match(sentUiMessages[0].item_list[0].text_item.text, /UI reply: 从微信发到可见 Pi TUI/);
+    assert.match(sentUiMessages[0].item_list[0].text_item.text, /测试回复: 从微信发到可见 Pi TUI/);
     const recovered = await registry.readSnapshot();
     const route = recovered.routes[AUTHORIZED_USER_ID];
     const owner = route ? recovered.instances[route.workerInstanceId] : undefined;
     assert.ok(owner);
-    assert.equal(owner.mode, "ui");
+    assert.equal(owner.mode, "background");
     assert.equal(route.sessionId, sessionId);
     assert.equal(route.generation, 8);
+    assert.equal(recovered.sessions[sessionId].mode, "background");
     assert.equal(recovered.sessions[sessionId].state, "active");
+    assert.equal(uiLaunches, 0);
 
     await runtime.stop();
     runtime = undefined;
     const detached = await registry.readSnapshot();
-    assert.equal(detached.instances[owner.instanceId].state, "idle");
+    assert.equal(detached.instances[owner.instanceId], undefined);
+    assert.equal(detached.sessions[sessionId].state, "saved");
     assert.equal(detached.routes[AUTHORIZED_USER_ID].sessionId, sessionId);
 
     runtime = await GatewayRuntime.start(runtimeOptions(
       fixture,
       fetcher,
-      { command: process.execPath, args: [process.execPath] },
+      { command: process.execPath, args: [fakeCli] },
       {
         uiPlatform: "win32",
         uiIpcEndpoint: uiEndpoint,
@@ -411,9 +450,11 @@ test("Gateway runtime 恢复 saved UI route 并更新 owner generation", { timeo
     ));
     await pollStarted;
     const reattached = await registry.readSnapshot();
-    assert.equal(reattached.instances[owner.instanceId].pid, owner.pid);
-    assert.equal(reattached.instances[owner.instanceId].mode, "ui");
-    assert.equal(reattached.routes[AUTHORIZED_USER_ID].generation, 8);
+    const recoveredOwner = reattached.instances[reattached.routes[AUTHORIZED_USER_ID].workerInstanceId];
+    assert.ok(recoveredOwner);
+    assert.notEqual(recoveredOwner.pid, owner.pid);
+    assert.equal(recoveredOwner.mode, "background");
+    assert.equal(reattached.routes[AUTHORIZED_USER_ID].generation, 9);
     await runtime.stop();
     runtime = undefined;
   } finally {

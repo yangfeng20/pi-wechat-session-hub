@@ -12,6 +12,7 @@ export function createDefaultConfiguration(
 ): ManagerConfiguration {
   return {
     schemaVersion: 1,
+    autoStartOnWindowsLogon: false,
     defaultMode: "background",
     allowedProjectRoots: [],
     projects: {},

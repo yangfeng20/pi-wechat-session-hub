@@ -6,6 +6,7 @@ coverage/
 .env.*
 !.env.example
 **/credentials.json
+**/ui-attachment.key
 **/manager.lock
 **/gateway.json
 **/instances.json

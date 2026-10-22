@@ -1,11 +1,19 @@
-import { realpath } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { ProjectService } from "../projects/project-service.ts";
-import { UiWorkerIpcClient, UiWorkerIpcError, readUiWorkerLaunchRecord } from "./ui-worker-ipc.ts";
+import {
+  createStableNamedPipe,
+  readOrCreateUiWorkerAttachToken,
+  readUiWorkerAttachToken,
+  UiWorkerIpcClient,
+  UiWorkerIpcError,
+  readUiWorkerLaunchRecord,
+} from "./ui-worker-ipc.ts";
 import type { UiWorkerLaunchRecord, UiWorkerRegistration } from "./ui-worker-types.ts";
 
 interface PendingUiPrompt {
@@ -23,7 +31,7 @@ const bridgeProcess = process as UiWorkerBridgeProcessState;
 const PROCESS_BIRTH_ID = `${process.pid}:${Math.floor(Date.now() - process.uptime() * 1000)}`;
 
 /**
- * 在 UI worker 的 Pi extension host 内运行 named pipe bridge。
+ * 在一个 Pi TUI extension host 内运行 session owner named pipe bridge。
  */
 export class UiWorkerExtensionBridge {
   private pi?: ExtensionAPI;
@@ -39,17 +47,31 @@ export class UiWorkerExtensionBridge {
   private latestAssistantText = "";
   private pendingPrompt?: PendingUiPrompt;
   private readonly idleWaiters = new Set<() => void>();
+  private readonly launchId: string;
+  private readonly instanceId: string;
+  private readonly managerDirectory: string;
+  private readonly launchRecord?: UiWorkerLaunchRecord;
 
   /**
-   * 创建一个与 Gateway launch ticket 绑定的 UI worker bridge。
+   * 创建可见 Pi session 的 Gateway bridge, 支持 Gateway 启动的 TUI 与普通 Pi TUI。
    *
-   * @param launchRecord 一次性启动记录, ticket 只保留在当前进程内存。
+   * @param launchRecord 可选的一次性 UI worker 启动记录。
    * @param projectService 用于重新解析当前 session cwd 与项目 alias。
+   * @param managerDirectory 普通 Pi TUI 使用的 Hub 数据目录。
    */
   constructor(
-    private readonly launchRecord: UiWorkerLaunchRecord,
+    launchRecord: UiWorkerLaunchRecord | undefined,
     private readonly projectService: ProjectService,
-  ) {}
+    managerDirectory?: string,
+  ) {
+    this.launchRecord = launchRecord;
+    this.managerDirectory = launchRecord?.managerDirectory ?? managerDirectory ?? "";
+    if (!this.managerDirectory) {
+      throw new UiWorkerIpcError("handshake_rejected", "普通 Pi TUI bridge 缺少 Hub manager directory。 ");
+    }
+    this.launchId = launchRecord?.launchId ?? randomUUID();
+    this.instanceId = launchRecord?.instanceId ?? randomUUID();
+  }
 
   /**
    * 绑定 Pi 当前 session context 并注册或更新 Gateway session owner。
@@ -60,7 +82,7 @@ export class UiWorkerExtensionBridge {
    */
   async attach(pi: ExtensionAPI, context: ExtensionContext): Promise<void> {
     const isFirstSession = this.initialSessionId === undefined;
-    if (isFirstSession && this.launchRecord.sessionName) {
+    if (isFirstSession && this.launchRecord?.sessionName) {
       pi.setSessionName(this.launchRecord.sessionName);
     }
     const registration = await this.createRegistration(context, isFirstSession);
@@ -92,15 +114,92 @@ export class UiWorkerExtensionBridge {
    * @returns Gateway 确认无 writer 冲突时返回 true。
    */
   async canSwitchSession(sessionFile: string): Promise<boolean> {
-    if (!this.client || !isAbsolute(sessionFile)) {
+    if (!isAbsolute(sessionFile)) {
       return false;
     }
+    if (this.client) {
+      try {
+        const result = await this.client.request("can_switch_session", { sessionFile }, 10000);
+        return isRecord(result) && result.allowed === true;
+      } catch {
+        return false;
+      }
+    }
+
+    let controlClient: UiWorkerIpcClient | undefined;
     try {
-      const result = await this.client.request("can_switch_session", { sessionFile }, 10000);
+      const managerToken = await readUiWorkerAttachToken(this.managerDirectory);
+      if (!managerToken) {
+        return !(await this.hasLiveSessionOwner(sessionFile));
+      }
+      controlClient = await UiWorkerIpcClient.connectControl(
+        createStableNamedPipe(this.managerDirectory),
+        this.managerDirectory,
+        managerToken,
+        { timeoutMs: 3000 },
+      );
+      const result = await controlClient.request("can_switch_session", { sessionFile }, 5000);
       return isRecord(result) && result.allowed === true;
     } catch {
-      return false;
+      return !(await this.hasLiveSessionOwner(sessionFile));
+    } finally {
+      controlClient?.close();
     }
+  }
+
+  /**
+   * 在 Gateway IPC 不可用时检查目标 transcript 是否仍有存活 registry owner。
+   *
+   * @param sessionFile 用户选择的 Pi session transcript 文件。
+   * @returns 存在活跃/状态不明 owner 时返回 true。
+   */
+  private async hasLiveSessionOwner(sessionFile: string): Promise<boolean> {
+    let managerInfo;
+    try {
+      managerInfo = await lstat(this.managerDirectory);
+    } catch (error) {
+      return !(error instanceof Error && "code" in error && error.code === "ENOENT");
+    }
+    if (!managerInfo.isDirectory() || managerInfo.isSymbolicLink()) {
+      return true;
+    }
+    const instanceFile = join(this.managerDirectory, "instances.json");
+    let instanceFileInfo;
+    try {
+      instanceFileInfo = await lstat(instanceFile);
+    } catch (error) {
+      return !(error instanceof Error && "code" in error && error.code === "ENOENT");
+    }
+    if (!instanceFileInfo.isFile() || instanceFileInfo.isSymbolicLink()) {
+      return true;
+    }
+    let records: unknown;
+    try {
+      records = JSON.parse(await readFile(instanceFile, "utf8")) as unknown;
+    } catch {
+      return true;
+    }
+    if (!isRecord(records)) {
+      return true;
+    }
+    for (const value of Object.values(records)) {
+      if (!isRecord(value) || typeof value.sessionFile !== "string" || !samePath(value.sessionFile, sessionFile)) {
+        continue;
+      }
+      if (value.instanceId === this.instanceId) {
+        continue;
+      }
+      if (
+        typeof value.pid !== "number" ||
+        !Number.isSafeInteger(value.pid) ||
+        value.pid <= 0 ||
+        (value.state !== "stale" && value.state !== "stopping") ||
+        isProcessAlive(value.pid)
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -243,11 +342,11 @@ export class UiWorkerExtensionBridge {
     }
     const projectAlias = await this.resolveProjectAlias(cwd, isFirstSession);
     const sessionName = isFirstSession
-      ? this.launchRecord.sessionName ?? context.sessionManager.getSessionName()
+      ? this.launchRecord?.sessionName ?? context.sessionManager.getSessionName()
       : context.sessionManager.getSessionName();
     return {
-      launchId: this.launchRecord.launchId,
-      instanceId: this.launchRecord.instanceId,
+      launchId: this.launchId,
+      instanceId: this.instanceId,
       pid: process.pid,
       processBirthId: PROCESS_BIRTH_ID,
       sessionId,
@@ -267,8 +366,20 @@ export class UiWorkerExtensionBridge {
    * @returns 唯一匹配项目 alias。
    */
   private async resolveProjectAlias(cwd: string, isFirstSession: boolean): Promise<string> {
-    const canonicalCwd = await realpath(cwd);
-    if (isFirstSession && samePath(canonicalCwd, this.launchRecord.projectPath)) {
+    let canonicalCwd: string;
+    try {
+      canonicalCwd = await realpath(cwd);
+    } catch {
+      if (!this.launchRecord) {
+        throw new UiWorkerIpcError("project_not_registered", "当前 Pi TUI 项目目录不可用, 未接入 Hub。 ");
+      }
+      throw new UiWorkerIpcError("handshake_rejected", "UI worker 项目目录不可用。 ");
+    }
+    if (
+      this.launchRecord &&
+      isFirstSession &&
+      samePath(canonicalCwd, this.launchRecord.projectPath)
+    ) {
       await this.projectService.resolveSession(this.launchRecord.projectAlias, canonicalCwd);
       return this.launchRecord.projectAlias;
     }
@@ -283,11 +394,18 @@ export class UiWorkerExtensionBridge {
     const aliases = matches.filter((alias): alias is string => alias !== undefined);
     if (aliases.length !== 1) {
       throw new UiWorkerIpcError(
-        "handshake_rejected",
-        "当前 Pi TUI cwd 必须唯一匹配一个已登记且授权的项目 alias。",
+        this.launchRecord ? "handshake_rejected" : "project_not_registered",
+        "当前 Pi TUI 项目未登记为 Hub 项目, 该 session 不会接入微信管理。",
       );
     }
-    await this.projectService.resolveSession(aliases[0], canonicalCwd);
+    try {
+      await this.projectService.resolveSession(aliases[0], canonicalCwd);
+    } catch (error) {
+      if (!this.launchRecord) {
+        throw new UiWorkerIpcError("project_not_registered", "当前 Pi TUI 项目不在 Hub 授权范围内。 ");
+      }
+      throw error;
+    }
     return aliases[0];
   }
 
@@ -395,11 +513,15 @@ export class UiWorkerExtensionBridge {
       return;
     }
     try {
+      const managerToken = this.launchRecord
+        ? undefined
+        : await readOrCreateUiWorkerAttachToken(this.managerDirectory);
       const client = await UiWorkerIpcClient.connect(
-        this.launchRecord.pipeEndpoint,
-        this.launchRecord.ticket,
+        this.launchRecord?.pipeEndpoint ?? createStableNamedPipe(this.managerDirectory),
+        this.launchRecord?.ticket ?? "",
         registration,
         {
+          ...(managerToken ? { managerToken } : {}),
           requestHandler: (method, params) => this.handleGatewayRequest(method, params),
         },
       );
@@ -527,16 +649,16 @@ export class UiWorkerExtensionBridge {
 }
 
 /**
- * 判断当前 Pi extension host 是否本身由 Gateway 作为 UI worker 管理。
+ * 判断当前 Pi extension host 是否已经为可见 TUI session 创建了 Hub bridge。
  *
- * @returns 当前进程持有 UI worker bridge 时返回 true。
+ * @returns 当前进程持有可见 TUI bridge 时返回 true。
  */
 export function isUiWorkerBridgeActive(): boolean {
   return bridgeProcess.piWechatUiWorkerBridge !== undefined;
 }
 
 /**
- * 注册可见 UI worker 的 Pi event bridge; 普通 Pi session 不会启动 IPC client。
+ * 注册所有可见 Pi TUI 的 Hub session owner bridge。
  *
  * @param pi Pi extension API。
  * @param projectService 已登记项目路径校验服务。
@@ -554,23 +676,24 @@ export function registerUiWorkerBridgeHooks(
     if (sessionContext.mode !== "tui") {
       return;
     }
-    const launchId = process.env.PI_WECHAT_MANAGER_LAUNCH_ID;
-    if (!bridge && !launchId) {
+    const configuredManagerDirectory = process.env.PI_WECHAT_MANAGER_DIR;
+    if (configuredManagerDirectory && !samePath(configuredManagerDirectory, managerDirectory)) {
+      sessionContext.ui.notify("UI worker managerDirectory 与当前 Pi agent 配置不一致, 已拒绝注册。", "error");
       return;
     }
     if (!bridge) {
-      const configuredManagerDirectory = process.env.PI_WECHAT_MANAGER_DIR;
-      if (configuredManagerDirectory && !samePath(configuredManagerDirectory, managerDirectory)) {
-        sessionContext.ui.notify("UI worker managerDirectory 与当前 Pi agent 配置不一致, 已拒绝注册。", "error");
-        return;
-      }
+      const launchId = process.env.PI_WECHAT_MANAGER_LAUNCH_ID;
       try {
-        const launchRecord = await readUiWorkerLaunchRecord(managerDirectory, launchId!);
-        const endpoint = process.env.PI_WECHAT_MANAGER_PIPE;
-        if (endpoint && endpoint !== launchRecord.pipeEndpoint) {
-          throw new UiWorkerIpcError("launch_record_invalid", "UI worker pipe endpoint 与 launch record 不一致。 ");
+        if (launchId) {
+          const launchRecord = await readUiWorkerLaunchRecord(managerDirectory, launchId);
+          const endpoint = process.env.PI_WECHAT_MANAGER_PIPE;
+          if (endpoint && endpoint !== launchRecord.pipeEndpoint) {
+            throw new UiWorkerIpcError("launch_record_invalid", "UI worker pipe endpoint 与 launch record 不一致。 ");
+          }
+          bridge = new UiWorkerExtensionBridge(launchRecord, projectService);
+        } else {
+          bridge = new UiWorkerExtensionBridge(undefined, projectService, managerDirectory);
         }
-        bridge = new UiWorkerExtensionBridge(launchRecord, projectService);
         bridgeProcess.piWechatUiWorkerBridge = bridge;
       } catch (error) {
         sessionContext.ui.notify(
@@ -582,8 +705,11 @@ export function registerUiWorkerBridgeHooks(
     }
     try {
       await bridge.attach(pi, sessionContext);
-    } catch {
-      sessionContext.ui.notify("无法准备 UI worker session registration; Gateway route 未建立。", "error");
+    } catch (error) {
+      if (error instanceof UiWorkerIpcError && error.code === "project_not_registered") {
+        return;
+      }
+      sessionContext.ui.notify("无法准备当前 Pi TUI session registration; Hub route 未建立。", "error");
     }
   });
 
@@ -601,7 +727,7 @@ export function registerUiWorkerBridgeHooks(
     const allowed = await bridge.canSwitchSession(event.targetSessionFile);
     if (!allowed) {
       sessionContext.ui.notify(
-        "Gateway 拒绝切换到未登记或仍被其他 Pi worker 持有的 session, 以避免双 writer。",
+        "Gateway 拒绝切换到未登记或仍由其他 Pi runtime 持有的 session, 以避免双 writer。",
         "warning",
       );
       return { cancel: true };
@@ -667,6 +793,21 @@ function extractAssistantText(message: unknown): string {
     .filter((item) => isRecord(item) && item.type === "text" && typeof item.text === "string")
     .map((item) => (item as { text: string }).text)
     .join("");
+}
+
+/**
+ * 判断指定 PID 是否仍可能运行。
+ *
+ * @param pid 进程 ID。
+ * @returns PID 存活或状态不明确时返回 true。
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(error instanceof Error && "code" in error && error.code === "ESRCH");
+  }
 }
 
 /**

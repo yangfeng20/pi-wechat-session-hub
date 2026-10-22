@@ -7,17 +7,32 @@ import {
 
 test("解析新建后台 session, 支持带空格的 session name", () => {
   assert.deepEqual(
-    parseGatewayCommand('/new --mode background --project demo --name "调查应用错误"'),
+    parseGatewayCommand('/new --project demo --name "调查应用错误"'),
     {
       kind: "new",
-      mode: "background",
       projectAlias: "demo",
       name: "调查应用错误",
     },
   );
+  assert.deepEqual(parseGatewayCommand("/new --mode ui"), {
+    kind: "new",
+    mode: "ui",
+  });
+  assert.deepEqual(parseGatewayCommand("/new --mode background"), {
+    kind: "new",
+    mode: "background",
+  });
 });
 
 test("解析 session 分页、恢复和显式重试确认", () => {
+  assert.deepEqual(
+    parseGatewayCommand("/sessions"),
+    {
+      kind: "sessions",
+      state: "active",
+      page: 1,
+    },
+  );
   assert.deepEqual(
     parseGatewayCommand("/sessions --project demo --state saved --page 2"),
     {
@@ -28,11 +43,10 @@ test("解析 session 分页、恢复和显式重试确认", () => {
     },
   );
   assert.deepEqual(
-    parseGatewayCommand('/resume "调查应用错误" --mode background'),
+    parseGatewayCommand('/resume "调查应用错误"'),
     {
       kind: "resume",
       selector: "调查应用错误",
-      mode: "background",
     },
   );
   assert.deepEqual(
@@ -51,7 +65,8 @@ test("普通文本作为 prompt, 未知 slash command fail-closed", () => {
     text: "继续排查这个问题",
   });
   assert.throws(() => parseGatewayCommand("/unknown command"), GatewayCommandParseError);
-  assert.throws(() => parseGatewayCommand("/new --mode invalid"), GatewayCommandParseError);
+  assert.throws(() => parseGatewayCommand("/new --mode terminal"), GatewayCommandParseError);
+  assert.throws(() => parseGatewayCommand("/resume 1 --mode ui"), GatewayCommandParseError);
 });
 
 test("/projects parser 保留原始引号供项目命令解析器使用", () => {

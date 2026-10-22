@@ -53,7 +53,7 @@ export class GatewayWorkerManager implements GatewayWorkerService {
   }
 
   /**
-   * 按显式 mode 或保存记录的原 mode 恢复 Pi session。
+   * 按显式 mode 或当前活跃 owner 模式恢复 Pi session; 没有 UI owner 时恢复到后台。
    *
    * @param sessionId Pi session ID。
    * @param mode 可选强制恢复模式。
@@ -65,8 +65,8 @@ export class GatewayWorkerManager implements GatewayWorkerService {
     if (!session) {
       return this.background.resume(sessionId);
     }
-    const requestedMode = mode ?? session.mode;
     const owner = findOwner(snapshot, sessionId);
+    const requestedMode = mode ?? (owner?.mode ?? "background");
     if (owner) {
       if (owner.mode === requestedMode && this.hasAvailableOwner(owner)) {
         return session;

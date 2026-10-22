@@ -5,10 +5,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { ConfigurationStore } from "../src/config/store.ts";
+import type { RuntimeMode } from "../src/config/types.ts";
 import { ProjectService } from "../src/projects/project-service.ts";
 import { GatewayLease } from "../src/registry/gateway-lease.ts";
 import { ManagerRegistry } from "../src/registry/manager-registry.ts";
+import type { SessionIndexRecord } from "../src/registry/types.ts";
 import { BackgroundWorkerManager } from "../src/runtime/background-worker-manager.ts";
+import type { GatewayWorkerService } from "../src/runtime/gateway-worker-manager.ts";
 import { DurableMessageQueue } from "../src/gateway/durable-message-queue.ts";
 import type { IlinkReplyContext } from "../src/gateway/channel-types.ts";
 import {
@@ -76,7 +79,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     const created = await router.receive({
       messageId: "wx-new-1",
       senderId: "wx-user-1",
-      text: "/new --mode background --name \"调查应用错误\"",
+      text: "/new --name \"调查应用错误\"",
       replyContext: { recipientId: "wx-user-1", contextToken: "context-token-new" },
     });
     assert.equal(created.state, "completed");
@@ -138,7 +141,8 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
       text: "/sessions --project demo --state all",
     });
     assert.equal(sessionList.state, "completed");
-    assert.match(sentReplies.at(-1)?.text ?? "", /调查应用错误/);
+    assert.match(sentReplies.at(-1)?.text ?? "", /#1 \| 调查应用错误/);
+    assert.match(sentReplies.at(-1)?.text ?? "", /后台/);
 
     const stopped = await router.receive({
       messageId: "wx-stop-1",
@@ -152,7 +156,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     const resumed = await router.receive({
       messageId: "wx-resume-1",
       senderId: "wx-user-1",
-      text: `/resume ${sessionId.slice(0, 8)} --mode background`,
+      text: "/resume 1",
     });
     assert.equal(resumed.state, "completed");
     assert.equal((await registry.readSnapshot()).routes["wx-user-1"].sessionId, sessionId);
@@ -165,7 +169,89 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
   }
 });
 
-test("UI /new 的项目 alias 错误会回复微信并把 queue 标记 completed", async () => {
+test("微信 /new --mode ui 将显式 UI 模式交给 worker manager", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-router-ui-mode-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-user-ui-mode" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "测试项目", projectPath);
+  await projectService.setDefault("demo");
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const sessionFile = join(projectPath, "ui-mode-session.jsonl");
+  let requestedMode: RuntimeMode | undefined;
+  const workerManager: GatewayWorkerService = {
+    startNew: async (projectAlias, name, mode) => {
+      requestedMode = mode;
+      const session = await registry.upsertSession({
+        sessionId: "ui-mode-session",
+        sessionFile,
+        cwd: projectPath,
+        projectAlias,
+        ...(name ? { name } : {}),
+        mode: mode ?? "background",
+        state: "pending",
+        lastActivityAt: new Date().toISOString(),
+      });
+      await registry.upsertInstance({
+        instanceId: "ui-mode-owner",
+        pid: process.pid,
+        processBirthId: `${process.pid}:ui-mode-test`,
+        sessionId: session.sessionId,
+        sessionFile,
+        cwd: projectPath,
+        projectAlias,
+        mode: mode ?? "background",
+        state: "idle",
+        heartbeatAt: new Date().toISOString(),
+      });
+      return session;
+    },
+    resume: async () => { throw new Error("此测试不调用 resume"); },
+    prompt: async () => "",
+    stop: async () => undefined,
+    stopAll: async () => undefined,
+    listSessions: async () => [],
+  };
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const result = await router.receive({
+      messageId: "wx-new-ui-mode",
+      senderId: "wx-user-ui-mode",
+      text: "/new --mode ui --name \"UI 模式测试\"",
+    });
+    assert.equal(result.state, "completed");
+    assert.equal(requestedMode, "ui");
+    assert.match(replies.at(-1) ?? "", /可见 UI Pi session 已创建: UI 模式测试/);
+    assert.equal((await registry.readSnapshot()).routes["wx-user-ui-mode"].sessionId, "ui-mode-session");
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("微信 /new 的项目 alias 错误会回复微信并把 queue 标记 completed", async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-router-ui-project-error-"));
   const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
   await configStore.update((config) => ({
@@ -200,7 +286,7 @@ test("UI /new 的项目 alias 错误会回复微信并把 queue 标记 completed
     const result = await router.receive({
       messageId: "wx-new-ui-missing-project",
       senderId: "wx-user-1",
-      text: "/new --mode ui --project demo",
+      text: "/new --project demo",
     });
     assert.equal(result.state, "completed");
     assert.equal(replies.length, 1);

@@ -7,7 +7,7 @@ export type GatewayCommand =
   | { kind: "projects"; arguments: string }
   | { kind: "new"; mode?: RuntimeMode; projectAlias?: string; name?: string }
   | { kind: "sessions"; projectAlias?: string; state: "default" | "active" | "saved" | "pending" | "all"; page: number }
-  | { kind: "resume"; selector: string; mode?: RuntimeMode }
+  | { kind: "resume"; selector: string }
   | { kind: "stop"; selector?: string }
   | { kind: "retry"; messageId: string; confirmed: boolean }
   | { kind: "prompt"; text: string };
@@ -142,7 +142,7 @@ function parseNewCommand(arguments_: string[]): GatewayCommand {
 function parseSessionsCommand(arguments_: string[]): GatewayCommand {
   const options = readOptions(arguments_, ["project", "state", "page"]);
   const projectAlias = options.get("project");
-  const state = options.get("state") ?? "default";
+  const state = options.get("state") ?? "active";
   const pageText = options.get("page") ?? "1";
   const page = Number(pageText);
   if (!Number.isInteger(page) || page < 1) {
@@ -172,17 +172,30 @@ function parseSessionsCommand(arguments_: string[]): GatewayCommand {
  * @returns 恢复 session 参数。
  */
 function parseResumeCommand(arguments_: string[]): GatewayCommand {
-  if (arguments_.length === 0 || !arguments_[0].trim()) {
+  if (arguments_.length !== 1 || !arguments_[0].trim()) {
     throw usageError();
   }
-  const selector = arguments_[0];
-  const options = readOptions(arguments_.slice(1), ["mode"]);
-  const mode = parseMode(options.get("mode"));
   return {
     kind: "resume",
-    selector,
-    ...(mode ? { mode } : {}),
+    selector: arguments_[0],
   };
+}
+
+/**
+ * 解析新会话运行模式。
+ *
+ * @param value 模式参数。
+ * @returns 已指定的运行模式, 未指定时返回 undefined。
+ * @throws {GatewayCommandParseError} 模式不是 background 或 ui 时抛出。
+ */
+function parseMode(value: string | undefined): RuntimeMode | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== "background" && value !== "ui") {
+    throw new GatewayCommandParseError("mode 只能是 background 或 ui。");
+  }
+  return value;
 }
 
 /**
@@ -222,23 +235,6 @@ function readOptions(tokens: string[], allowed: string[]): Map<string, string> {
 }
 
 /**
- * 校验并规范化运行模式。
- *
- * @param value 模式参数。
- * @returns 有效模式或 undefined。
- * @throws {GatewayCommandParseError} 模式非法时抛出。
- */
-function parseMode(value: string | undefined): RuntimeMode | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (value !== "background" && value !== "ui") {
-    throw new GatewayCommandParseError("mode 只能是 background 或 ui。");
-  }
-  return value;
-}
-
-/**
  * 检查命令不包含额外参数。
  *
  * @param arguments_ 去掉命令名后的 token 列表。
@@ -263,7 +259,7 @@ function extractRawArguments(input: string): string {
 }
 
 const GATEWAY_COMMAND_USAGE =
-  "用法: /new [--mode background|ui] [--project <alias>] [--name <名称>] | /sessions [--project <alias>] [--state default|active|saved|pending|all] [--page <n>] | /resume <session-id-or-name> [--mode background|ui] | /stop [session-id] | /retry <message-id> --confirm | /status | /projects | /help";
+  "用法: /new [--mode background|ui] [--project <alias>] [--name <名称>] | /sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>] | /resume <会话索引|名称> | /stop [会话索引|名称] | /retry <message-id> --confirm | /status | /projects | /help";
 
 /**
  * 创建统一格式的 command usage 错误。

@@ -28,6 +28,7 @@ export interface WorkerInstanceRecord {
 
 export interface SessionIndexRecord {
   sessionId: string;
+  publicIndex?: number;
   sessionFile: string;
   cwd: string;
   projectAlias: string;

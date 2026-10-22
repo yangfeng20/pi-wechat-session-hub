@@ -101,22 +101,38 @@ export class GatewayRuntime extends EventEmitter {
     sessionDirectory?: string;
     env?: NodeJS.ProcessEnv;
     disableDiscoveredResources?: boolean;
+    lease?: GatewayLease;
+    onControlReady?: (lease: GatewayLease, registry: ManagerRegistry) => Promise<void>;
     fetcher?: typeof fetch;
     uiWorkerLauncher?: Pick<WindowsTerminalLauncher, "launch">;
     uiIpcEndpoint?: string;
     uiPlatform?: NodeJS.Platform;
     credentialStoreOptions?: ConstructorParameters<typeof IlinkCredentialStore>[2];
   }): Promise<GatewayRuntime> {
-    const { config } = await options.configStore.load();
-    if (!config.wechat.authorizedUserId.trim()) {
-      throw new GatewayRuntimeError(
-        "configuration_incomplete",
-        "启动 Gateway 前必须配置唯一授权微信 userId。",
-      );
+    let config: ManagerConfiguration;
+    try {
+      const snapshot = await options.configStore.load();
+      config = snapshot.config;
+      if (!config.wechat.authorizedUserId.trim()) {
+        throw new GatewayRuntimeError(
+          "configuration_incomplete",
+          "启动 Gateway 前必须配置唯一授权微信 userId。",
+        );
+      }
+    } catch (error) {
+      await options.lease?.release().catch(() => undefined);
+      throw error;
     }
 
     const dataDirectory = resolve(options.dataDirectory);
-    const lease = await GatewayLease.acquire(dataDirectory);
+    if (options.lease && resolve(options.lease.directory) !== dataDirectory) {
+      await options.lease.release().catch(() => undefined);
+      throw new GatewayRuntimeError(
+        "registry_inconsistent",
+        "预先取得的 Gateway lease 与 dataDirectory 不匹配。",
+      );
+    }
+    const lease = options.lease ?? await GatewayLease.acquire(dataDirectory);
     let registry: ManagerRegistry | undefined;
     let queue: DurableMessageQueue | undefined;
     let workerManager: BackgroundWorkerManager | undefined;
@@ -150,6 +166,7 @@ export class GatewayRuntime extends EventEmitter {
         projectService: options.projectService,
         registry,
         ipcServer: uiIpcServer,
+        backgroundWorkerManager: workerManager,
         invocation,
         extensionPath: options.extensionPath ?? fileURLToPath(new URL("../../extensions/wechat-session-hub.ts", import.meta.url)),
         staleAfterMs: config.runtime.staleAfterMs,
@@ -190,7 +207,7 @@ export class GatewayRuntime extends EventEmitter {
         router,
         channel,
       );
-      await runtime.initialize();
+      await runtime.initialize(options.onControlReady);
       return runtime;
     } catch (error) {
       let cleanupFailed = false;
@@ -283,9 +300,12 @@ export class GatewayRuntime extends EventEmitter {
    *
    * @returns 无返回值。
    */
-  private async initialize(): Promise<void> {
+  private async initialize(
+    onControlReady?: (lease: GatewayLease, registry: ManagerRegistry) => Promise<void>,
+  ): Promise<void> {
     await this.registry.setGateway(this.toGatewayRecord("starting"));
     await this.uiWorkerManager.listen();
+    await onControlReady?.(this.lease, this.registry);
     await this.recoverRoutes();
     await this.channel.start((message) => this.router.acceptInbound(message));
     if (this.currentState === "starting") {
@@ -361,6 +381,23 @@ export class GatewayRuntime extends EventEmitter {
       state: await isPersistedSessionFile(session.sessionFile) ? "saved" as const : "pending" as const,
     })));
     await Promise.all(normalizedSessions.map((session) => this.registry.upsertSession(session)));
+
+    snapshot = await this.registry.readSnapshot();
+    const liveUiSessionIds = new Set(
+      Object.values(snapshot.instances)
+        .filter((instance) => instance.mode === "ui" && instance.state !== "stale" && instance.state !== "stopping")
+        .map((instance) => instance.sessionId),
+    );
+    const unownedUiSessions = Object.values(snapshot.sessions).filter((session) =>
+      session.mode === "ui" && !liveUiSessionIds.has(session.sessionId),
+    );
+    await Promise.all(unownedUiSessions.map(async (session) =>
+      this.registry.upsertSession({
+        ...session,
+        mode: "background",
+        state: await isPersistedSessionFile(session.sessionFile) ? "saved" : "pending",
+      }),
+    ));
 
     snapshot = await this.registry.readSnapshot();
     const routeAnalyses = await Promise.all(Object.entries(snapshot.routes).map(async ([routeId, route]) => {
@@ -495,7 +532,7 @@ export class GatewayRuntime extends EventEmitter {
     } catch {
       throw new GatewayRuntimeError(
         "worker_shutdown_failed",
-        "至少一个后台 Pi worker 未能优雅停止; Gateway lease 仍保留, 可重试 /wechat-manager stop。",
+        "至少一个后台 Pi worker 未能优雅停止; Gateway lease 仍保留, 可重试 /wx stop。",
       );
     }
 

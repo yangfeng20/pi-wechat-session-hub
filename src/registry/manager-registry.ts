@@ -54,12 +54,13 @@ export class ManagerRegistry {
    */
   async readSnapshot(): Promise<RegistrySnapshot> {
     return this.withWriteQueue(async () => {
-      const [gateway, instances, routes, sessions] = await Promise.all([
+      const [gateway, instances, routes, storedSessions] = await Promise.all([
         this.readJson<GatewayStatusRecord | null>("gateway.json", null),
         this.readJson<Record<string, WorkerInstanceRecord>>("instances.json", {}),
         this.readJson<Record<string, RouteRecord>>("routes.json", {}),
         this.readJson<Record<string, SessionIndexRecord>>("session-index.json", {}),
       ]);
+      const sessions = await this.ensurePublicSessionIndexes(storedSessions);
       return { gateway, instances, routes, sessions };
     });
   }
@@ -117,12 +118,20 @@ export class ManagerRegistry {
    * @param session session 元数据。
    * @returns 无返回值。
    */
-  async upsertSession(session: SessionIndexRecord): Promise<void> {
-    await this.updateRecord<SessionIndexRecord>(
-      "session-index.json",
-      session.sessionId,
-      session,
-    );
+  async upsertSession(session: SessionIndexRecord): Promise<SessionIndexRecord> {
+    return this.withWriteQueue(async () => {
+      await this.lease.assertOwned();
+      const records = await this.readJson<Record<string, SessionIndexRecord>>("session-index.json", {});
+      const indexedRecords = await this.ensurePublicSessionIndexes(records);
+      const existing = indexedRecords[session.sessionId];
+      const nextIndex = existing?.publicIndex ?? nextPublicIndex(indexedRecords);
+      const savedSession = { ...session, publicIndex: nextIndex };
+      await this.writeJsonUnlocked("session-index.json", {
+        ...indexedRecords,
+        [session.sessionId]: savedSession,
+      });
+      return savedSession;
+    });
   }
 
   /**
@@ -171,6 +180,63 @@ export class ManagerRegistry {
       }
       return event;
     });
+  }
+
+  /**
+   * 为历史 registry 分配稳定的用户可见会话索引。
+   *
+   * @param records 当前 session registry 记录。
+   * @returns 包含稳定索引的记录集合。
+   * @throws {RegistryCorruptionError} 已有索引重复或租约失效时抛出。
+   */
+  private async ensurePublicSessionIndexes(
+    records: Record<string, SessionIndexRecord>,
+  ): Promise<Record<string, SessionIndexRecord>> {
+    const usedIndexes = new Set<number>();
+    for (const [sessionId, value] of Object.entries(records)) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new RegistryCorruptionError(
+          join(this.directory, "session-index.json"),
+          `session ${sessionId} 记录格式无效, 已拒绝分配公开索引`,
+        );
+      }
+      const session = value as SessionIndexRecord;
+      if (!isValidPublicIndex(session.publicIndex)) {
+        continue;
+      }
+      if (usedIndexes.has(session.publicIndex)) {
+        throw new RegistryCorruptionError(
+          join(this.directory, "session-index.json"),
+          "session publicIndex 重复, 已拒绝继续写入",
+        );
+      }
+      usedIndexes.add(session.publicIndex);
+    }
+
+    const missing = Object.entries(records)
+      .filter(([, session]) => !isValidPublicIndex(session.publicIndex))
+      .sort(([leftId, left], [rightId, right]) => {
+        const leftActivity = typeof left.lastActivityAt === "string" ? left.lastActivityAt : "";
+        const rightActivity = typeof right.lastActivityAt === "string" ? right.lastActivityAt : "";
+        return leftActivity.localeCompare(rightActivity) || leftId.localeCompare(rightId);
+      });
+    if (missing.length === 0) {
+      return records;
+    }
+
+    await this.lease.assertOwned();
+    let nextIndex = nextPublicIndex(records);
+    const indexedRecords = { ...records };
+    for (const [sessionId, session] of missing) {
+      while (usedIndexes.has(nextIndex)) {
+        nextIndex += 1;
+      }
+      indexedRecords[sessionId] = { ...session, publicIndex: nextIndex };
+      usedIndexes.add(nextIndex);
+      nextIndex += 1;
+    }
+    await this.writeJsonUnlocked("session-index.json", indexedRecords);
+    return indexedRecords;
   }
 
   /**
@@ -364,6 +430,29 @@ function assertEventDataIsSafe(
     }
   }
   ancestors.delete(value);
+}
+
+/**
+ * 判断会话索引是否为正安全整数。
+ *
+ * @param value 待校验索引。
+ * @returns 合法时返回 true。
+ */
+function isValidPublicIndex(value: unknown): value is number {
+  return Number.isSafeInteger(value) && typeof value === "number" && value > 0;
+}
+
+/**
+ * 计算当前 registry 中尚未分配的最小递增索引。
+ *
+ * @param records 当前 session registry 记录。
+ * @returns 大于现有最大索引的下一个索引。
+ */
+function nextPublicIndex(records: Record<string, SessionIndexRecord>): number {
+  const maxIndex = Object.values(records).reduce((maximum, session) =>
+    isValidPublicIndex(session.publicIndex) ? Math.max(maximum, session.publicIndex) : maximum,
+  0);
+  return maxIndex + 1;
 }
 
 /**

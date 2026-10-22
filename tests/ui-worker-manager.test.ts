@@ -157,7 +157,10 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
   const backgroundManager = new BackgroundWorkerManager({
     projectService,
     registry,
-    invocation: { command: process.execPath, args: [process.execPath] },
+    invocation: {
+      command: process.execPath,
+      args: [join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs")],
+    },
   });
   const gatewayWorkerManager = new GatewayWorkerManager(backgroundManager, uiManager, registry);
   const queue = new DurableMessageQueue(managerDirectory, lease);
@@ -176,23 +179,23 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
 
   try {
     await server.listen();
-    const newResult = await router.receive({
-      messageId: "ui-create-message",
-      senderId: "wx-ui-route",
-      text: "/new --mode ui --project demo --name \"Fake TUI session\"",
-    });
-    assert.equal(newResult.state, "completed");
-    assert.equal(newResult.duplicate, false);
+    await uiManager.startNew("demo", "Fake TUI session");
     const firstSnapshot = await registry.readSnapshot();
-    const route = firstSnapshot.routes["wx-ui-route"];
-    assert.ok(route);
-    const created = firstSnapshot.sessions[route.sessionId];
-    assert.equal(created.mode, "ui");
-    assert.equal(created.sessionId, "fake-ui-session");
-    assert.equal(created.state, "active");
-    const firstOwner = firstSnapshot.instances[route.workerInstanceId];
+    const created = firstSnapshot.sessions["fake-ui-session"];
+    assert.ok(created);
+    const firstOwner = Object.values(firstSnapshot.instances).find((instance) =>
+      instance.sessionId === created.sessionId,
+    );
     assert.ok(firstOwner);
-    assert.match(replies[0].text, /可见 UI Pi session 已创建/);
+    await registry.setRoute("wx-ui-route", {
+      sessionId: created.sessionId,
+      workerInstanceId: firstOwner.instanceId,
+      generation: 1,
+      updatedAt: new Date().toISOString(),
+    });
+    assert.equal(created.mode, "ui");
+    assert.equal(created.state, "active");
+    assert.equal(replies.length, 0);
     assert.equal(await workers[0].bridge.canSwitchSession(created.sessionFile), true);
     assert.equal(
       await workers[0].bridge.canSwitchSession(join(sessionsDirectory, "unregistered.jsonl")),
@@ -235,7 +238,7 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
       text: "hello",
     });
     assert.equal(promptResult.state, "completed");
-    assert.equal(replies[1].text, "UI fake reply: hello");
+    assert.equal(replies[0].text, "UI fake reply: hello");
 
     const switchedSessionId = "fake-ui-session-switched";
     const switchedSessionFile = join(sessionsDirectory, `${switchedSessionId}.jsonl`);
@@ -267,18 +270,20 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
     assert.equal(switched.sessions[switchedSessionId].state, "active");
     assert.equal(switched.routes["wx-ui-route"].sessionId, switchedSessionId);
     assert.equal(switched.routes["wx-ui-route"].generation, 2);
+    const switchedIndex = switched.sessions[switchedSessionId].publicIndex;
+    assert.ok(switchedIndex);
     const switchedPrompt = await router.receive({
       messageId: "ui-switched-prompt",
       senderId: "wx-ui-route",
       text: "after switch",
     });
     assert.equal(switchedPrompt.state, "completed");
-    assert.equal(replies[2].text, "UI fake reply: after switch");
+    assert.equal(replies[1].text, "UI fake reply: after switch");
 
     const stopResult = await router.receive({
       messageId: "ui-stop-message",
       senderId: "wx-ui-route",
-      text: `/stop ${switchedSessionId}`,
+      text: `/stop ${switchedIndex}`,
     });
     assert.equal(stopResult.state, "completed");
     const stopped = await registry.readSnapshot();
@@ -289,17 +294,17 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
     const resumeResult = await router.receive({
       messageId: "ui-resume-message",
       senderId: "wx-ui-route",
-      text: `/resume ${switchedSessionId} --mode ui`,
+      text: `/resume ${switchedIndex}`,
     });
     assert.equal(resumeResult.state, "completed");
     const resumed = (await registry.readSnapshot()).sessions[switchedSessionId];
     assert.equal(resumed.sessionId, switchedSessionId);
-    assert.equal(resumed.mode, "ui");
+    assert.equal(resumed.mode, "background");
     assert.equal(resumed.state, "active");
     const stopResumedResult = await router.receive({
       messageId: "ui-stop-resumed-message",
       senderId: "wx-ui-route",
-      text: `/stop ${switchedSessionId}`,
+      text: `/stop ${switchedIndex}`,
     });
     assert.equal(stopResumedResult.state, "completed");
     assert.equal((await registry.readSnapshot()).sessions[switchedSessionId].state, "saved");

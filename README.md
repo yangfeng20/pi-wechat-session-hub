@@ -1,102 +1,79 @@
 # Pi 微信会话枢纽
 
-项目英文名: Pi WeChat Session Hub
-项目目录: `pi-wechat-session-hub`
+Pi WeChat Session Hub 是一个 Pi 扩展, 用微信管理本机多个 Pi 会话. Gateway 在独立后台进程中运行, 不依赖启动命令所在的 Pi TUI.
 
-## 当前实现范围
+## 架构与会话行为
 
-已完成以下基础模块:
-
-- 配置 schema 校验、默认值合并、未知字段保留、原子写入及 fail-closed 文件锁。
-- 项目 alias 增删、默认项目设置、真实路径解析和 `allowedProjectRoots` 越界拒绝。
-- `/projects`、`/status`、`/help` 和 `/wechat-manager` Pi 扩展命令。
-- Gateway 单实例 `manager.lock`, 包含 PID/进程启动标识检查与心跳更新。
-- JSON registry 快照: `gateway.json`、`instances.json`、`routes.json`、`session-index.json`; 审计事件追加到 `events.jsonl` 并拒绝消息正文、凭证、命令和输出字段。
-- Pi RPC JSONL 客户端与后台 worker manager, 支持 Pi 原生 session 新建、保存后的恢复、prompt、优雅停止和单 owner 拒绝双开。
-- `GatewayCommandRouter` 支持 `/new`、`/projects`、`/sessions`、`/resume`、`/stop`、`/retry ... --confirm`、`/status`、`/help`; sender allowlist 在入队前检查。
-- route 分片 durable FIFO queue, 支持 `messageId` 去重、队列上限、processing 中断阻塞、显式重试和完成后正文压缩。
-- iLink `getupdates` / `sendmessage` API client、同步游标存储和长轮询 adapter 已实现; `getconfig` / `sendtyping` 用于原生处理中提示, 不阻塞最终回复。adapter 使用注入的独立 token, 可以将 `context_token` 随 pending queue 消息持久化, 完成后删除。
-
-Gateway runtime 已通过 `/wechat-manager start|stop|status` 显式启停, 并连接 router、durable queue、background Pi RPC worker 与 iLink poller。`/wechat-manager login` 提供独立的微信 QR 授权流程: 只提交空的 `local_token_list`, 不导入其他应用的凭证; 扫码确认后, 以 create-only 方式把授权凭证写入 Hub 自有的 `credentials.json` 并设置授权 userId。Windows UI worker 也已接入: `/new --mode ui` 使用受控 PowerShell launcher 启动 Windows Terminal 新 tab, 通过一次性 launch ticket 和 named pipe 注册 Pi 原生 session。Pi 扩展加载时不会自动联网; Gateway 仍须显式启动。独立 24/7 Windows service 属于可选后续阶段。完整设计基线见 [`docs/implementation-spec.md`](docs/implementation-spec.md)。回复上下文持久化决策见 [`docs/decisions/0001-ilink-context-token-queue.md`](docs/decisions/0001-ilink-context-token-queue.md)。
-
-**空 session 语义:** Pi 刚启动时会返回 sessionId 和预期 sessionFile, 但 transcript 首次写入前 JSONL 文件可能不存在。registry 将其标为 `pending`; 没有文件的 session 不会被伪装成可恢复历史。收到实际用户消息并由 Pi 写入 transcript 后, 才能作为保存会话恢复。
-
-## Pi 版本兼容
-
-兼容策略使用 Pi 0.85.1 到 Pi 1.x 的公共扩展 API 与 CLI/RPC JSONL 协议, 不依赖 Pi 内部模块。本轮兼容矩阵已在 `0.85.1`、`1.0.0`、`1.3.0` 全部通过类型检查、66 项单测(65 pass, 1 项 ACL 条件测试跳过)和 Pi RPC 启动/停止 smoke。Windows ACL 条件测试已单独启用并通过。Pi package 的 `peerDependencies` 按官方约定使用 `*`; 支持范围和验证版本另记在 `package.json` 的 `piCompatibility` 字段中。
-
-Pi 1.3.0 要求 Node.js `>=22.19.0`; 本机 Node.js `v22.22.3` 满足要求。
-
-## 微信回复与命令行为
-
-- Gateway 开始处理一条已授权消息时, 通过 iLink `getconfig` 获取 `typing_ticket`, 再用 `sendtyping` 显示微信原生“正在输入”; 处理结束后发送取消状态. 该提示 best-effort, API 失败不会阻断 Pi 回复.
-- Pi Hub 当前仍在 `agent_settled` 后发送一条完整最终文本, 不做 token 级实时流式回传. iLink `sendmessage` 是离散消息接口; 分块输出属于客户端应用层行为, 不能视为已验证的 iLink 原生流式或单条消息原位更新.
-- 微信端只接受 Hub 显式定义的管理命令; 未知 slash command fail-closed, 不透传任意 Pi 内置命令. `/name` 目前尚未映射, 会返回未知命令.
-
-## 运行要求
-
-- Pi CLI 支持范围见上方兼容说明; Node.js 需满足 `package.json` 中的最低版本。
-- UI 模式需要 Windows 和 Windows Terminal; background 模式由 Pi RPC worker 运行。
-- iLink 授权在本机完成; 仓库不包含任何账号凭证或用户授权 ID。
-
-## 本地开发与验证
-
-```bash
-npm install
-npm run typecheck
-npm test
-npm run test:pi-runtime
+```text
+任意 Pi TUI
+  /wx start|status|stop|restart
+          │ 本机 HMAC IPC
+          ▼
+独立 Hub daemon
+  ├─ 微信 iLink 长轮询、鉴权、route、持久队列
+  └─ 每个会话唯一 writer
+       ├─ Pi TUI 正在打开该会话: 消息进入前台并回显
+       └─ 没有活跃 TUI owner: Pi RPC 后台处理
 ```
 
-`npm test` 覆盖配置、凭证隔离/ACL 策略、registry/queue、background 和 UI worker 生命周期、session switch 单 writer guard、Windows Terminal argv 构造、fake iLink QR 授权、typing indicator、create-only 凭证写入、session 恢复及 Gateway → Pi worker 全链路。UI 和 QR 测试使用 fake bridge/transport, 不启动真实 Windows Terminal、微信网络或模型.
+- `/wx start` 启动共享 daemon, 不绑定当前 Pi session. 关闭所有 Pi TUI 后, daemon 仍可通过微信收发消息.
+- 每条微信 route 指向同一 Pi session. 在 Pi TUI 中 `/resume` 恢复 Hub 管理的会话时, 扩展通过 IPC 将 owner 从后台 RPC 安全切换到前台 TUI; 同一会话的微信消息和回复会在该 TUI 中显示. TUI 关闭后, route 返回后台 RPC.
+- 新建微信会话默认在后台, 不自动打开 Windows Terminal tab. route、session JSONL 和稳定会话索引保留.
+- 同一 session 同一时刻只允许一个 runtime writer. 只有登记在 Hub 且位于授权项目范围内的 Pi TUI session 会出现在微信会话清单中.
 
-`npm run test:pi-runtime` 使用隔离配置启动 Pi RPC, 发送 `/status` 和 `/wechat-manager status` 验证扩展加载; 不调用模型、不读写真实 Pi 配置或凭证。上面的三个 Pi 版本均已单独运行该 smoke test。
+## 安装和首次使用
 
-安全审计: `npm audit --omit=dev` 为 0 vulnerabilities。全量审计的告警来自 Pi CLI 的开发依赖树: Pi `0.85.1` 报 3 项, `1.0.0` 安装审计报 1 项, `1.3.0` 为 0; 本扩展不把 Pi CLI 打包为生产依赖。
-
-可选的 Windows ACL 实测只使用 fake token, 在 `%USERPROFILE%\.pi\agent` 下创建并清理唯一临时目录, 不访问网络:
-
-```bash
-PI_WECHAT_VERIFY_WINDOWS_ACL=1 node --experimental-transform-types --test --test-name-pattern="Windows manager ACL integration" tests/credential-store.test.ts
-```
-
-验证不同 Pi 版本时, 覆盖安装只变更 `node_modules`, 不改 `package.json` 和 lockfile:
-
-```bash
-npm install --no-save --ignore-scripts --package-lock=false @earendil-works/pi-coding-agent@1.3.0
-npm run typecheck
-npm test
-npm run test:pi-runtime
-```
-
-恢复本机版本的开发依赖:
-
-```bash
-npm install --no-save --ignore-scripts --package-lock=false @earendil-works/pi-coding-agent@0.85.1
-```
-
-`.github/workflows/pi-compat.yml` 会对 `0.85.1`、`1.0.0`、`1.3.0` 运行类型检查、单元测试和 RPC 冒烟测试。
-
-## 安装到 Pi 中试用
-
-在项目根目录执行:
+Node.js 需要满足 `package.json` 中的最低版本. 开发时可从项目目录临时加载:
 
 ```bash
 pi --extension ./extensions/wechat-session-hub.ts
 ```
 
-可运行:
+作为 Pi package 安装后, 扩展会在 Pi 会话中注册 `/wx` 命令. 首次配置顺序:
 
-- `/help` 查看 Pi 扩展命令。
-- `/projects` 查看和管理项目 alias。
-- `/status` 查看扩展状态。
-- `/wechat-manager` 查看 Gateway 控制帮助。
-- `/wechat-manager login` 在本地 TUI 展示二维码; 扫码确认后只创建 Hub 专属凭证, 不导入其他客户端凭证。
-- `/wechat-manager start` 显式启动 Gateway 并开始 iLink 轮询; 若账号正在被其他客户端轮询, 先停止冲突轮询器。
-- `/wechat-manager status` 查看当前 Pi 扩展实例的 Gateway 状态。
-- `/wechat-manager stop` 停止轮询, 等待 route queue drain 和后台 turn 完成后关闭 background worker; 不会隐式 abort 模型 turn, UI worker tab 保持打开并可在下次 Gateway 启动时重连。
+1. 在全局配置中设置 `allowedProjectRoots`.
+2. 使用 `/projects add <alias> --name <名称> --path <绝对路径>` 登记项目, 必要时用 `/projects default <alias>` 设置默认项目.
+3. 在 Pi TUI 执行 `/wx login` 扫码授权.
+4. 在任意 Pi TUI 执行 `/wx start` 启动后台服务.
 
-Gateway 默认不会启动。启动后, 微信端可运行 `/new --mode background|ui`, `/resume <session-id> [--mode background|ui]`, `/sessions` 和 `/stop`; Pi session shutdown 时扩展会尝试优雅停止本实例 Gateway。
+配置和授权凭证保存在用户专属 Hub 目录, 仓库不包含账号凭证或授权 ID.
+
+## 本机命令
+
+输入 `/wx` 并回车会打开交互式操作菜单; 输入 `/wx ` 可补全子命令. `/wechat-manager` 是兼容别名.
+
+| 命令 | 行为 |
+|---|---|
+| `/wx login` | 在本地 TUI 扫码, create-only 写入 Hub 自己的凭证 |
+| `/wx start` | 幂等启动独立后台 Gateway |
+| `/wx status` | 在任意 Pi session 查询真实后台连接、PID 和前后台会话数 |
+| `/wx stop` | 弹出二次确认; 确认后停止接收新消息并安全收尾 |
+| `/wx restart` | 安全停止并重启 daemon; 服务已停止时启动服务 |
+| `/wx autostart on` | 开启 Windows 当前用户登录后自动连接 |
+| `/wx autostart off` | 关闭并移除 Windows 登录任务 |
+
+停止时, daemon 先停止接收新微信消息, 再 drain 已入队 route 工作并等待正在处理的 Pi turn 收尾. 本机命令会立即返回“正在停止”, 可用 `/wx status` 查询进度. 如果 daemon 非正常退出, durable queue 会保留未完成项并阻断后续 FIFO, 需要显式 `/retry <message-id> --confirm`.
+
+Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使用已保存授权连接. 它不在 Windows 登录桌面前运行, 也不会在启动时弹出扫码窗口. 如果尚未完成微信授权或授权失效, 需要先在 Pi TUI 执行 `/wx login`.
+
+## 微信端命令
+
+未知 slash command fail-closed, 不会任意透传 Pi 内置命令, 也不接受用户提供的 shell 或文件路径.
+
+```text
+/new [--mode background|ui] [--project <alias>] [--name <名称>]
+/sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>]
+/resume <会话索引|名称>
+/stop [会话索引|名称]
+/retry <message-id> --confirm
+/status
+/projects
+/help
+```
+
+`/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 每行显示稳定索引、名称、项目、运行模式和状态; 不再要求复制长 session ID. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 索引在会话排序变化后保持不变, 不因列表重排而复用.
+
+Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果选中的是 Hub 管理的会话, extension 会安全完成前后台 owner 交接.
 
 ## 配置
 
@@ -106,12 +83,12 @@ Gateway 默认不会启动。启动后, 微信端可运行 `/new --mode backgrou
 %USERPROFILE%\.pi\agent\wechat-session-manager.json
 ```
 
-若设置了 `PI_CODING_AGENT_DIR`, 则配置保存在该目录下。首次启动不会自动创建全局配置。可先手动创建如下配置, 再使用 `/projects add`:
+如果设置了 `PI_CODING_AGENT_DIR`, 配置保存在该目录. 首次启动不会自动创建全局配置. 示例:
 
 ```json
 {
   "schemaVersion": 1,
-  "defaultMode": "background",
+  "autoStartOnWindowsLogon": false,
   "allowedProjectRoots": [
     "D:\\Projects"
   ],
@@ -122,19 +99,36 @@ Gateway 默认不会启动。启动后, 微信端可运行 `/new --mode backgrou
 }
 ```
 
-未提供的 `runtime` 字段会补入默认值。`wechat.credentialFile` 必须指向 manager 数据目录中的固定 `credentials.json`; reader 会拒绝目录外路径、符号链接、未知 schema 和授权 userId 不匹配。首次使用先登记 `allowedProjectRoots` 和项目 alias, 然后在本地 Pi TUI 执行 `/wechat-manager login`. 扫码确认后, Hub 会从 iLink 响应取得授权 userId, 仅在 `credentials.json` 不存在时创建凭证, 再填入 `wechat.authorizedUserId`.
+缺省字段会使用安全默认值. 历史配置中的 `defaultMode` 字段为兼容旧配置保留, 微信端 `/new` 固定创建后台会话. `wechat.credentialFile` 固定指向 manager 数据目录中的 `credentials.json`; reader 拒绝目录外路径、符号链接、未知 schema 或授权用户不匹配. QR 凭证只在文件不存在时 create-only 写入, 不读取或覆盖其他应用数据.
 
-Windows 首次创建空 manager 目录时会关闭继承 ACL, 仅授权当前用户、SYSTEM 和 Administrators; 已有非空目录不会自动改权限, 登录和启动时都会检查整个目录树。agent 父目录允许其他主体只读, 但不允许其写入; manager 目录及其文件仅接受上述三个主体。POSIX 要求 manager 目录与文件无 group/other 权限, 且父目录不能被 group/other 写入。权限无法验证时 fail-closed。
+Windows 首次创建空 manager 目录时会关闭继承 ACL, 仅授权当前用户、SYSTEM 和 Administrators; 已有非空目录不会自动修改权限, 登录和启动时会验证目录树. POSIX 要求 manager 目录和凭证文件无 group/other 权限, 且父目录不能被 group/other 写入. 权限无法验证时 fail-closed.
 
-## 安全约束与后续阶段
+## 安全与运行边界
 
-- Pi session JSONL 是对话历史事实源; Gateway 不直接编辑 session 文件。
-- 项目路径启动前重新解析真实路径, 并检查仍位于授权根目录内。
-- 每个 session 同时只允许一个 registry owner; 状态不明确时 fail-closed。
-- `events.jsonl` 不记录消息正文、模型输出或凭证。queue 只在未完成期间保存原消息正文和 `replyContext`; 完成后会压缩移除 payload, 并仅保留最近 1000 个 messageId 的 SHA-256 摘要用于去重。
-- UI `session_start` 以一次性票据向本机 named pipe 注册, 单 session 单 owner; route 到 UI worker 时通过 Pi `sendUserMessage()` 把微信消息写入该 TUI 原生 transcript。
-- UI `session_before_switch` 会通过 Gateway IPC 检查目标 session owner; 未登记、路径未授权或仍由其他 Pi runtime 持有时拒绝切换。
-- Gateway shutdown 会断开 UI pipe 但保留仍运行的 TUI owner; 下次启动等待其重新认证, 失败时 fail-closed, 不会自动双开。
-- `/wechat-manager login` 在用户确认后通过空 `local_token_list` 申请 Pi Hub 独立 iLink 授权; `credentials.json` 采用 create-only, 已存在时不覆盖, 且不从其他应用导入凭证。
-- Windows ACL 实现依赖 PowerShell 7/.NET 和系统 `icacls.exe`; 使用 fake token 的专属目录 ACL 集成测试已通过。真实账号授权和设备验收需在使用者自己的环境中完成。
-- 自动化验证已覆盖 Pi 版本矩阵、Gateway 与 worker 生命周期、iLink fake transport 和 typing indicator; 具体验证命令见上方。24/7 Windows service/计划任务仍是可选后续阶段。
+- Pi session JSONL 是对话历史事实源; Gateway 不直接编辑 transcript.
+- Gateway 通过 `manager.lock` 保证单实例. control IPC 使用当前 lease token 完成 HMAC challenge, UI attach 使用 manager 目录 ACL 保护的稳定随机 key; 在线状态由活跃 IPC 校验, 不依赖过期 `gateway.json`.
+- route 绑定、会话索引和 worker owner 持久保存; session 恢复前重新验证项目路径是否仍位于 `allowedProjectRoots`.
+- 审计事件不记录消息正文、模型输出或凭证. 队列只在未完成期间保存原消息及 `replyContext`; 完成后压缩移除 payload, 并保留最近 1000 个 messageId 的 SHA-256 摘要用于去重.
+- iLink `sendtyping` 仅提供 best-effort “正在输入”提示. Pi turn settled 后 Hub 发送一条完整最终回复, 不做 token 级微信流式回传.
+- 关闭服务后不会自动登录或生成 QR. 自动启动仅由 `autoStartOnWindowsLogon` 和当前用户登录计划任务控制.
+
+## 开发与验证
+
+```bash
+npm install
+npm run typecheck
+npm test
+npm run test:pi-runtime
+```
+
+当前自动化测试覆盖配置/索引迁移、Gateway IPC 和 detached daemon 启动失败保护、Windows 登录任务参数、前后台 session handoff、durable queue、iLink fake transport、typing indicator、凭证隔离和 worker 生命周期. `npm test` 使用 fake Pi/iLink, 不访问真实微信服务、不启动真实 Windows Terminal, 也不调用模型. 条件 ACL 集成测试默认跳过, 可单独启用:
+
+```bash
+PI_WECHAT_VERIFY_WINDOWS_ACL=1 node --experimental-transform-types --test --test-name-pattern="Windows manager ACL integration" tests/credential-store.test.ts
+```
+
+Pi RPC smoke 使用隔离配置检查扩展命令注册, 不访问真实账号凭证. 版本兼容范围和 CI 矩阵见 `package.json` 的 `piCompatibility` 与 `.github/workflows/pi-compat.yml`.
+
+## 许可证
+
+本仓库目前未指定开源许可证. 公开发布前需选择并添加许可证文件.

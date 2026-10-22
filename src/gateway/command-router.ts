@@ -1,5 +1,5 @@
 import { ConfigurationStore } from "../config/store.ts";
-import type { ManagerConfiguration } from "../config/types.ts";
+import type { ManagerConfiguration, RuntimeMode } from "../config/types.ts";
 import type { GatewayInboundMessage, IlinkReplyContext } from "./channel-types.ts";
 import { ProjectService, ProjectServiceError } from "../projects/project-service.ts";
 import { parseProjectCommand, ProjectCommandParseError } from "../commands/project-command-parser.ts";
@@ -434,10 +434,10 @@ export class GatewayCommandRouter {
   }
 
   /**
-   * 创建 background 或 UI Pi session 并原子切换当前 route 绑定。
+   * 创建后台或可见 UI Pi session 并原子切换当前 route 绑定。
    *
    * @param routeId 微信 route ID。
-   * @param mode 用户指定模式。
+   * @param mode 新会话运行模式, 缺省为后台。
    * @param projectAlias 用户指定项目 alias。
    * @param name 可选 session 名称。
    * @param config 当前配置快照。
@@ -445,12 +445,12 @@ export class GatewayCommandRouter {
    */
   private async handleNew(
     routeId: string,
-    mode: "background" | "ui" | undefined,
+    mode: RuntimeMode | undefined,
     projectAlias: string | undefined,
     name: string | undefined,
     config: ManagerConfiguration,
   ): Promise<string> {
-    const requestedMode = mode ?? config.defaultMode;
+    const requestedMode = mode ?? "background";
     const alias = projectAlias ?? config.defaultProject;
     if (!alias) {
       return "尚未设置 defaultProject。请先通过 /projects default <alias> 选择项目。";
@@ -462,6 +462,7 @@ export class GatewayCommandRouter {
       : undefined;
     const session = await this.workerManager.startNew(alias, name, requestedMode);
     const newSnapshot = await this.registry.readSnapshot();
+    const indexedSession = newSnapshot.sessions[session.sessionId];
     const owner = Object.values(newSnapshot.instances).find((instance) =>
       instance.sessionId === session.sessionId,
     );
@@ -484,9 +485,9 @@ export class GatewayCommandRouter {
       await this.workerManager.stop(session.sessionId).catch(() => undefined);
       throw error;
     }
+    const stateText = indexedSession?.state === "pending" ? "等待首条 transcript 写入" : "活跃";
     const modeText = requestedMode === "ui" ? "可见 UI" : "后台";
-    const stateText = session.state === "pending" ? "pending, 等待首条 transcript 写入" : "active";
-    return `${modeText} Pi session 已创建: ${session.name ?? session.sessionId.slice(0, 8)} (${alias}, ${stateText})。`;
+    return `${modeText} Pi session 已创建: ${indexedSession?.name ?? `#${indexedSession?.publicIndex ?? "?"}`} (${alias}, ${stateText})。`;
   }
 
   /**
@@ -532,18 +533,19 @@ export class GatewayCommandRouter {
     }
     const pageSessions = sessions.slice((page - 1) * pageSize, page * pageSize);
     if (pageSessions.length === 0) {
-      return "没有匹配的 session。";
+      return "没有匹配的会话。";
     }
     return [
-      `Sessions (${page}/${pageCount}):`,
+      `会话列表 (${page}/${pageCount}):`,,
       ...pageSessions.map((session) => {
-          const projectName = Object.hasOwn(config.projects, session.projectAlias)
-            ? config.projects[session.projectAlias].displayName
-            : session.projectAlias;
-          const status = activeSessionIds.has(session.sessionId)
-            ? session.state === "pending" ? "pending (worker online)" : "active"
-            : session.state === "pending" ? "pending" : session.state === "active" ? "stale" : "saved";
-          return `${session.sessionId.slice(0, 8)} | ${session.name ?? "未命名"} | ${projectName} | ${session.mode} | ${status}`;
+        const projectName = Object.hasOwn(config.projects, session.projectAlias)
+          ? config.projects[session.projectAlias].displayName
+          : session.projectAlias;
+        const status = activeSessionIds.has(session.sessionId)
+          ? session.state === "pending" ? "等待首条记录" : "活跃"
+          : session.state === "pending" ? "等待首条记录" : "已保存";
+        const mode = activeSessionIds.has(session.sessionId) && session.mode === "ui" ? "前台" : "后台";
+        return `#${session.publicIndex ?? "?"} | ${session.name ?? "未命名"} | ${projectName} | ${mode} | ${status}`;
       }),
     ].join("\n");
   }
@@ -559,10 +561,9 @@ export class GatewayCommandRouter {
   private async handleResume(
     routeId: string,
     selector: string,
-    mode: "background" | "ui" | undefined,
   ): Promise<string> {
     const session = await this.resolveSessionSelector(selector);
-    const resumed = await this.workerManager.resume(session.sessionId, mode);
+    await this.workerManager.resume(session.sessionId);
     const snapshot = await this.registry.readSnapshot();
     const owner = Object.values(snapshot.instances).find((instance) =>
       instance.sessionId === session.sessionId,
@@ -574,12 +575,12 @@ export class GatewayCommandRouter {
       );
     }
     await this.registry.setRoute(routeId, {
-      sessionId: resumed.sessionId,
+      sessionId: session.sessionId,
       workerInstanceId: owner.instanceId,
       generation: (Object.hasOwn(snapshot.routes, routeId) ? snapshot.routes[routeId].generation : 0) + 1,
       updatedAt: new Date().toISOString(),
     });
-    return `已恢复 session ${resumed.name ?? resumed.sessionId.slice(0, 8)} (${resumed.projectAlias})。`;
+    return `已恢复会话 #${session.publicIndex ?? "?"} ${session.name ?? "未命名"} (${session.projectAlias})。`;
   }
 
   /**
@@ -608,8 +609,8 @@ export class GatewayCommandRouter {
     }
     const stoppedSession = (await this.registry.readSnapshot()).sessions[session.sessionId];
     return stoppedSession?.state === "pending"
-      ? `session ${session.sessionId.slice(0, 8)} 已停止, 但尚无 transcript 文件, 因此不能恢复。`
-      : `session ${session.sessionId.slice(0, 8)} 已停止并保存。`;
+      ? `会话 #${session.publicIndex ?? "?"} 已停止, 但尚无 transcript 文件, 因此不能恢复。`
+      : `会话 #${session.publicIndex ?? "?"} 已停止并保存。`;
   }
 
   /**
@@ -625,7 +626,7 @@ export class GatewayCommandRouter {
       ? snapshot.routes[routeId]
       : undefined;
     if (!binding) {
-      return "当前没有活动 session。请先使用 /new --mode background|ui --project <alias> 创建 session。";
+      return "当前没有活动会话。请先使用 /new --project <alias> 创建后台会话, 再用 /resume <索引> 切换。";
     }
     const session = Object.hasOwn(snapshot.sessions, binding.sessionId)
       ? snapshot.sessions[binding.sessionId]
@@ -637,7 +638,7 @@ export class GatewayCommandRouter {
       ? snapshot.instances[binding.workerInstanceId]
       : undefined;
     if (!worker || worker.state === "stale" || worker.state === "stopping") {
-      return "当前 route 没有可用的 Pi worker; 请使用 /resume <session-id> 重连。";
+      return "当前 route 没有可用的 Pi worker; 请使用 /resume <索引> 重连。";
     }
     return this.workerManager.prompt(binding.sessionId, text);
   }
@@ -667,7 +668,7 @@ export class GatewayCommandRouter {
     const projectCount = Object.keys(config.projects).length;
     return [
       `Gateway: ${snapshot.gateway?.state ?? "offline"}`,
-      `微信 route: ${session ? `${session.name ?? session.sessionId.slice(0, 8)} (${session.projectAlias})` : "未绑定"}`,
+      `微信 route: ${session ? `#${session.publicIndex ?? "?"} ${session.name ?? "未命名"} (${session.projectAlias})` : "未绑定"}`,
       `Worker: ${instance ? `${instance.mode}/${instance.state} PID ${instance.pid}` : "none"}`,
       `Queue: ${pendingQueueCount}`,
       `项目 alias: ${projectCount}`,
@@ -675,7 +676,7 @@ export class GatewayCommandRouter {
   }
 
   /**
-   * 按 sessionId 前缀或名称查找唯一 session。
+   * 按稳定数字索引或名称查找唯一 session。
    *
    * @param selector 用户输入选择器。
    * @returns 唯一匹配 session。
@@ -683,15 +684,23 @@ export class GatewayCommandRouter {
   private async resolveSessionSelector(selector: string): Promise<SessionIndexRecord> {
     const snapshot = await this.registry.readSnapshot();
     const normalized = selector.toLowerCase();
+    if (/^[1-9]\d*$/.test(normalized)) {
+      const publicIndex = Number(normalized);
+      const indexedSession = Object.values(snapshot.sessions).find((session) =>
+        session.publicIndex === publicIndex,
+      );
+      if (indexedSession) {
+        return indexedSession;
+      }
+    }
     const matches = Object.values(snapshot.sessions).filter((session) =>
-      session.sessionId.toLowerCase().startsWith(normalized) ||
       session.name?.toLowerCase() === normalized,
     );
     if (matches.length === 0) {
-      throw new BackgroundWorkerManagerError("session_not_found", `未找到 session: ${selector}。`);
+      throw new BackgroundWorkerManagerError("session_not_found", `未找到会话索引或名称: ${selector}。`);
     }
     if (matches.length > 1) {
-      throw new GatewayCommandParseError(`session selector 匹配到多个结果: ${selector}; 请使用更长 ID。`);
+      throw new GatewayCommandParseError(`会话名称匹配到多个结果: ${selector}; 请使用数字索引。`);
     }
     return matches[0];
   }
@@ -747,7 +756,7 @@ export class GatewayCommandRouter {
         case "sessions":
           return await this.formatSessions(command.projectAlias, command.state, command.page, config);
         case "resume":
-          return await this.handleResume(routeId, command.selector, command.mode);
+          return await this.handleResume(routeId, command.selector);
         case "stop":
           return await this.handleStop(routeId, command.selector);
         case "retry":
@@ -796,9 +805,9 @@ export class GatewayCommandRouter {
 const GATEWAY_HELP_TEXT = [
   "/new [--mode background|ui] [--project <alias>] [--name <名称>]",
   "/projects [add <alias> --name <名称> --path <绝对路径> | remove <alias> | default <alias>]",
-  "/sessions [--project <alias>] [--state default|active|saved|pending|all] [--page <n>]",
-  "/resume <session-id-or-name> [--mode background|ui]",
-  "/stop [session-id-or-name]",
+  "/sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>]",
+  "/resume <会话索引|名称>",
+  "/stop [会话索引|名称]",
   "/retry <message-id> --confirm - 显式重试失败/中断消息; 会重新执行, 可能重复产生副作用",
   "/status",
   "/help",

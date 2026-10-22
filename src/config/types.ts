@@ -22,6 +22,7 @@ export interface RuntimeConfiguration {
 
 export interface ManagerConfiguration {
   schemaVersion: 1;
+  autoStartOnWindowsLogon: boolean;
   defaultMode: RuntimeMode;
   defaultProject?: string;
   allowedProjectRoots: string[];

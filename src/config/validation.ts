@@ -65,6 +65,9 @@ export function validateConfiguration(
   if (candidate.schemaVersion !== 1) {
     throw new ConfigurationValidationError("配置 schemaVersion 必须为 1。");
   }
+  if (typeof candidate.autoStartOnWindowsLogon !== "boolean") {
+    throw new ConfigurationValidationError("autoStartOnWindowsLogon 必须是布尔值。");
+  }
 
   if (candidate.defaultMode !== "background" && candidate.defaultMode !== "ui") {
     throw new ConfigurationValidationError("defaultMode 只能是 background 或 ui。");

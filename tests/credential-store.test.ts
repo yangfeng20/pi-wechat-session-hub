@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { GatewayLease } from "../src/registry/gateway-lease.ts";
+import { readOrCreateUiWorkerAttachToken } from "../src/gateway/ui-worker-ipc.ts";
 import {
   createIlinkCredentialFile,
   IlinkCredentialStore,
@@ -84,6 +85,7 @@ test(
         token: "fake-test-token",
         baseUrl: "https://ilinkai.weixin.qq.com",
       });
+      await readOrCreateUiWorkerAttachToken(managerDirectory);
       const credential = await new IlinkCredentialStore(managerDirectory, credentialFile)
         .load(AUTHORIZED_USER_ID);
       assert.equal(credential.token, "fake-test-token");

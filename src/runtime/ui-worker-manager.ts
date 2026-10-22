@@ -13,6 +13,7 @@ import {
 } from "../gateway/ui-worker-ipc.ts";
 import type { UiWorkerLaunchRecord, UiWorkerRegistration } from "../gateway/ui-worker-types.ts";
 import type { PiCliInvocation } from "./pi-cli.ts";
+import type { BackgroundWorkerManager } from "./background-worker-manager.ts";
 import { WindowsTerminalLaunchError, WindowsTerminalLauncher } from "../gateway/windows-terminal-launcher.ts";
 
 export type UiWorkerManagerErrorCode =
@@ -53,6 +54,7 @@ export class UiWorkerManager {
   private readonly connections = new Map<string, UiWorkerIpcConnection>();
   private readonly disconnectWaiters = new Map<string, Set<() => void>>();
   private readonly staleTimers = new Map<string, NodeJS.Timeout>();
+  private readonly explicitStops = new Set<string>();
   private readonly maxStaleMs: number;
 
   /**
@@ -68,6 +70,7 @@ export class UiWorkerManager {
     launcher?: Pick<WindowsTerminalLauncher, "launch">;
     invocation: PiCliInvocation;
     extensionPath: string;
+    backgroundWorkerManager?: BackgroundWorkerManager;
     staleAfterMs?: number;
     registrationTimeoutMs?: number;
     shutdownTimeoutMs?: number;
@@ -275,6 +278,7 @@ export class UiWorkerManager {
         throw new UiWorkerManagerError("worker_shutdown_timeout", "UI worker 未确认 abort; session owner 仍保留。 ");
       }
     }
+    this.explicitStops.add(sessionId);
     const stopped = new Promise<void>((resolveStopped, rejectStopped) => {
       const waiters = this.disconnectWaiters.get(instance.instanceId) ?? new Set<() => void>();
       const resolveOnce = (): void => {
@@ -308,6 +312,8 @@ export class UiWorkerManager {
         );
       }
       throw new UiWorkerManagerError("worker_shutdown_timeout", "UI worker shutdown request 未完成。 ");
+    } finally {
+      this.explicitStops.delete(sessionId);
     }
   }
 
@@ -379,12 +385,26 @@ export class UiWorkerManager {
       throw new UiWorkerManagerError("worker_launch_failed", "UI worker cwd 与受控 launch project 不匹配。 ");
     }
     const canonicalCwd = resolvedProject.path;
-    const snapshot = await this.options.registry.readSnapshot();
-    const otherOwner = Object.values(snapshot.instances).find((instance) =>
+    let snapshot = await this.options.registry.readSnapshot();
+    let otherOwner = Object.values(snapshot.instances).find((instance) =>
       instance.sessionId === registration.sessionId &&
       instance.instanceId !== registration.instanceId &&
       ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
     );
+    if (
+      otherOwner?.mode === "background" &&
+      this.options.backgroundWorkerManager &&
+      otherOwner.state !== "stale" &&
+      otherOwner.state !== "stopping"
+    ) {
+      await this.options.backgroundWorkerManager.stop(registration.sessionId);
+      snapshot = await this.options.registry.readSnapshot();
+      otherOwner = Object.values(snapshot.instances).find((instance) =>
+        instance.sessionId === registration.sessionId &&
+        instance.instanceId !== registration.instanceId &&
+        ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+      );
+    }
     if (otherOwner) {
       throw new UiWorkerManagerError(
         "session_owned_by_other_process",
@@ -432,30 +452,78 @@ export class UiWorkerManager {
       }
     } else {
       previousInstance = snapshot.instances[registration.instanceId];
-      if (
-        !previousInstance ||
-        previousInstance.mode !== "ui" ||
-        previousInstance.launchId !== registration.launchId ||
-        previousInstance.pid !== registration.pid ||
-        previousInstance.processBirthId !== registration.processBirthId ||
-        previousInstance.ipcAuthHash !== authHash
-      ) {
-        throw new UiWorkerManagerError("session_owned_by_other_process", "UI worker 重连身份不匹配。 ");
-      }
-      const previousSession = snapshot.sessions[previousInstance.sessionId];
-      if (!previousSession) {
-        throw new UiWorkerManagerError("registry_inconsistent", "UI worker owner 缺少 session registry。 ");
-      }
-      if (previousSession.sessionId !== registration.sessionId) {
-        await this.options.registry.upsertSession({
-          ...previousSession,
-          state: await isPersistedSessionFile(previousSession.sessionFile) ? "saved" : "pending",
-          lastActivityAt: new Date().toISOString(),
-        });
-        const nextExisting = snapshot.sessions[registration.sessionId];
-        if (nextExisting) {
+      if (!previousInstance) {
+        const existing = snapshot.sessions[registration.sessionId];
+        if (existing && !samePath(existing.sessionFile, registration.sessionFile)) {
+          throw new UiWorkerManagerError("session_owned_by_other_process", "Pi UI session transcript 与已有 session 索引不匹配。 ");
+        }
+        const baseSession: SessionIndexRecord = existing
+          ? {
+              ...existing,
+              sessionFile: registration.sessionFile,
+              cwd: canonicalCwd,
+              projectAlias: registration.projectAlias,
+              mode: "ui",
+              state: await isPersistedSessionFile(registration.sessionFile) ? "active" : "pending",
+              lastActivityAt: new Date().toISOString(),
+            }
+          : {
+              sessionId: registration.sessionId,
+              sessionFile: registration.sessionFile,
+              cwd: canonicalCwd,
+              projectAlias: registration.projectAlias,
+              mode: "ui",
+              state: await isPersistedSessionFile(registration.sessionFile) ? "active" : "pending",
+              lastActivityAt: new Date().toISOString(),
+            };
+        session = applySessionName(baseSession, registration.name, clearName);
+      } else {
+        if (
+          previousInstance.mode !== "ui" ||
+          previousInstance.launchId !== registration.launchId ||
+          previousInstance.pid !== registration.pid ||
+          previousInstance.processBirthId !== registration.processBirthId ||
+          previousInstance.ipcAuthHash !== authHash
+        ) {
+          throw new UiWorkerManagerError("session_owned_by_other_process", "UI worker 重连身份不匹配。 ");
+        }
+        const previousSession = snapshot.sessions[previousInstance.sessionId];
+        if (!previousSession) {
+          throw new UiWorkerManagerError("registry_inconsistent", "UI worker owner 缺少 session registry。 ");
+        }
+        if (previousSession.sessionId !== registration.sessionId) {
+          await this.options.registry.upsertSession({
+            ...previousSession,
+            state: await isPersistedSessionFile(previousSession.sessionFile) ? "saved" : "pending",
+            lastActivityAt: new Date().toISOString(),
+          });
+          const nextExisting = snapshot.sessions[registration.sessionId];
+          if (nextExisting) {
+            session = applySessionName({
+              ...nextExisting,
+              sessionFile: registration.sessionFile,
+              cwd: canonicalCwd,
+              projectAlias: registration.projectAlias,
+              mode: "ui",
+              state: await isPersistedSessionFile(registration.sessionFile) ? "active" : "pending",
+              lastActivityAt: new Date().toISOString(),
+            }, registration.name, clearName);
+          } else {
+            session = {
+              sessionId: registration.sessionId,
+              sessionFile: registration.sessionFile,
+              cwd: canonicalCwd,
+              projectAlias: registration.projectAlias,
+              ...(registration.name ? { name: registration.name } : {}),
+              mode: "ui",
+              state: await isPersistedSessionFile(registration.sessionFile) ? "active" : "pending",
+              lastActivityAt: new Date().toISOString(),
+            };
+          }
+          await this.rebindRoutes(previousInstance.instanceId, previousSession.sessionId, session.sessionId);
+        } else {
           session = applySessionName({
-            ...nextExisting,
+            ...previousSession,
             sessionFile: registration.sessionFile,
             cwd: canonicalCwd,
             projectAlias: registration.projectAlias,
@@ -463,29 +531,7 @@ export class UiWorkerManager {
             state: await isPersistedSessionFile(registration.sessionFile) ? "active" : "pending",
             lastActivityAt: new Date().toISOString(),
           }, registration.name, clearName);
-        } else {
-          session = {
-            sessionId: registration.sessionId,
-            sessionFile: registration.sessionFile,
-            cwd: canonicalCwd,
-            projectAlias: registration.projectAlias,
-            ...(registration.name ? { name: registration.name } : {}),
-            mode: "ui",
-            state: await isPersistedSessionFile(registration.sessionFile) ? "active" : "pending",
-            lastActivityAt: new Date().toISOString(),
-          };
         }
-        await this.rebindRoutes(previousInstance.instanceId, previousSession.sessionId, session.sessionId);
-      } else {
-        session = applySessionName({
-          ...previousSession,
-          sessionFile: registration.sessionFile,
-          cwd: canonicalCwd,
-          projectAlias: registration.projectAlias,
-          mode: "ui",
-          state: await isPersistedSessionFile(registration.sessionFile) ? "active" : "pending",
-          lastActivityAt: new Date().toISOString(),
-        }, registration.name, clearName);
       }
     }
 
@@ -505,6 +551,18 @@ export class UiWorkerManager {
     };
     await this.options.registry.upsertSession(session);
     await this.options.registry.upsertInstance(instance);
+    const routeSnapshot = await this.options.registry.readSnapshot();
+    const reboundRoutes = Object.entries(routeSnapshot.routes).filter(([, route]) =>
+      route.sessionId === session.sessionId && route.workerInstanceId !== instance.instanceId,
+    );
+    await Promise.all(reboundRoutes.map(([routeId, route]) =>
+      this.options.registry.setRoute(routeId, {
+        ...route,
+        workerInstanceId: instance.instanceId,
+        generation: route.generation + 1,
+        updatedAt: new Date().toISOString(),
+      }),
+    ));
     if (!previousInstance) {
       await this.options.registry.appendEvent("worker.ui_registered", {
         sessionId: session.sessionId,
@@ -563,7 +621,7 @@ export class UiWorkerManager {
     if (typeof params.sessionFile !== "string" || !isAbsolute(params.sessionFile)) {
       return { allowed: false, reason: "invalid_session_file" };
     }
-    const snapshot = await this.options.registry.readSnapshot();
+    let snapshot = await this.options.registry.readSnapshot();
     const target = Object.values(snapshot.sessions).find((session) =>
       samePath(session.sessionFile, params.sessionFile as string),
     );
@@ -575,11 +633,29 @@ export class UiWorkerManager {
     } catch {
       return { allowed: false, reason: "project_path_denied" };
     }
-    const competingOwner = Object.values(snapshot.instances).find((instance) =>
+    let competingOwner = Object.values(snapshot.instances).find((instance) =>
       instance.sessionId === target.sessionId &&
       instance.instanceId !== connection.registration.instanceId &&
       ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
     );
+    if (
+      competingOwner?.mode === "background" &&
+      competingOwner.state !== "stale" &&
+      competingOwner.state !== "stopping" &&
+      this.options.backgroundWorkerManager
+    ) {
+      try {
+        await this.options.backgroundWorkerManager.stop(target.sessionId);
+      } catch {
+        return { allowed: false, reason: "background_handoff_failed" };
+      }
+      snapshot = await this.options.registry.readSnapshot();
+      competingOwner = Object.values(snapshot.instances).find((instance) =>
+        instance.sessionId === target.sessionId &&
+        instance.instanceId !== connection.registration.instanceId &&
+        ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+      );
+    }
     if (competingOwner) {
       return { allowed: false, reason: "session_owned_by_other_process" };
     }
@@ -687,6 +763,10 @@ export class UiWorkerManager {
     if (!instance || instance.mode !== "ui") {
       return;
     }
+    if (!isProcessAlive(instance.pid)) {
+      await this.markStopped(instanceId);
+      return;
+    }
     await this.options.registry.upsertInstance({
       ...instance,
       state: "stale",
@@ -696,10 +776,10 @@ export class UiWorkerManager {
   }
 
   /**
-   * 将已退出 UI worker 的 session 标为 saved/pending 并移除 route owner。
+   * 将已退出 UI owner 的 session 保存, 并把关联 route 安全交给后台 RPC worker。
    *
    * @param instanceId UI worker instance ID。
-   * @returns 无返回值。
+   * @returns route 已交接或无须交接后正常结束。
    */
   private async markStopped(instanceId: string): Promise<void> {
     this.cancelStaleTimer(instanceId);
@@ -711,19 +791,54 @@ export class UiWorkerManager {
       return;
     }
     const session = snapshot.sessions[instance.sessionId];
+    const routes = Object.entries(snapshot.routes).filter(([, route]) =>
+      route.sessionId === instance.sessionId && route.workerInstanceId === instanceId,
+    );
+    const explicitStop = this.explicitStops.has(instance.sessionId);
+    const transcriptExists = session ? await isPersistedSessionFile(session.sessionFile) : false;
     if (session) {
       await this.options.registry.upsertSession({
         ...session,
-        state: await isPersistedSessionFile(session.sessionFile) ? "saved" : "pending",
+        mode: explicitStop ? session.mode : "background",
+        state: transcriptExists ? "saved" : "pending",
         lastActivityAt: new Date().toISOString(),
       });
     }
-    const routes = Object.entries(snapshot.routes).filter(([, route]) => route.workerInstanceId === instanceId);
-    await Promise.all(routes.map(([routeId]) => this.options.registry.setRoute(routeId, null)));
     await this.options.registry.removeInstance(instanceId);
+
+    if (explicitStop || routes.length === 0 || !session || !this.options.backgroundWorkerManager) {
+      await Promise.all(routes.map(([routeId]) => this.options.registry.setRoute(routeId, null)));
+    } else {
+      try {
+        const backgroundSession = transcriptExists
+          ? await this.options.backgroundWorkerManager.resume(session.sessionId, "background")
+          : await this.options.backgroundWorkerManager.startNew(session.projectAlias, session.name);
+        const afterHandoff = await this.options.registry.readSnapshot();
+        const backgroundOwner = Object.values(afterHandoff.instances).find((candidate) =>
+          candidate.sessionId === backgroundSession.sessionId &&
+          candidate.mode === "background" &&
+          candidate.state !== "stale" &&
+          candidate.state !== "stopping",
+        );
+        if (!backgroundOwner) {
+          throw new UiWorkerManagerError("registry_inconsistent", "后台 owner 注册后未出现在 session registry。 ");
+        }
+        await Promise.all(routes.map(([routeId, route]) => this.options.registry.setRoute(routeId, {
+          ...route,
+          sessionId: backgroundSession.sessionId,
+          workerInstanceId: backgroundOwner.instanceId,
+          generation: route.generation + 1,
+          updatedAt: new Date().toISOString(),
+        })));
+      } catch {
+        await Promise.all(routes.map(([routeId]) => this.options.registry.setRoute(routeId, null)));
+      }
+    }
+
     await this.options.registry.appendEvent("worker.ui_stopped", {
       sessionId: instance.sessionId,
       instanceId,
+      routeHandoff: !explicitStop && routes.length > 0,
     });
     this.resolveDisconnectWaiters(instanceId);
   }

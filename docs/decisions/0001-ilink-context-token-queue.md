@@ -38,4 +38,4 @@ Bot 登录 token 仍只允许放在独立 `credentialFile` 中; 本决策不会�
 
 ## 实施边界
 
-当前代码实现了 `replyContext` 的 pending queue 持久化和完成后清理、注入凭证的 iLink API/poller adapter、固定路径只读 credential provider、独立 `/wechat-manager login` QR 授权和显式 `/wechat-manager start|stop|status` Gateway runtime. QR 登录只提交空 `local_token_list`, 并以 create-only 写入 Hub 自有 `credentials.json`; 不读取、复制、覆盖或删除其他客户端凭证. 自动化测试使用 fake QR/credentials/transport; Windows ACL 使用 fake credential 隔离验证, 真实账号和设备验收由使用者在本机完成.
+当前代码实现了 `replyContext` 的 pending queue 持久化和完成后清理、注入凭证的 iLink API/poller adapter、固定路径只读 credential provider、独立 `/wx login` QR 授权和 detached Gateway daemon. `/wx start|status|stop|restart` 通过本机 HMAC control IPC 操作共享 daemon; 普通 Pi TUI 通过稳定 attach key 注册可见 session owner, TUI 关闭后 route 切回 background RPC. `/sessions` 使用持久会话索引, Windows 登录自动启动默认关闭并由 `/wx autostart on|off` 管理当前用户计划任务. QR 登录只提交空 `local_token_list`, 并以 create-only 写入 Hub 自有 `credentials.json`; 不读取、复制、覆盖或删除其他客户端凭证. 自动化测试使用 fake QR/credentials/transport 和 fake scheduler; 真实计划任务、账号和设备验收由使用者在本机完成.

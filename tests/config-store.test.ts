@@ -26,6 +26,7 @@ test("配置文件不存在时返回默认配置且不落盘", async () => {
     assert.equal(snapshot.exists, false);
     assert.deepEqual(snapshot.config.projects, {});
     assert.deepEqual(snapshot.config.allowedProjectRoots, []);
+    assert.equal(snapshot.config.autoStartOnWindowsLogon, false);
     await assert.rejects(readFile(configPath), { code: "ENOENT" });
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -102,6 +103,10 @@ test("活动配置锁会阻止写入, 不强行覆盖锁文件", async () => {
 test("拒绝未知 schema 版本和不安全的配置值", () => {
   assert.throws(
     () => validateConfiguration({ schemaVersion: 2 }),
+    ConfigurationValidationError,
+  );
+  assert.throws(
+    () => validateConfiguration({ schemaVersion: 1, autoStartOnWindowsLogon: "true" }),
     ConfigurationValidationError,
   );
   assert.throws(
