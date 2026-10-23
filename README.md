@@ -19,7 +19,7 @@ Pi WeChat Session Hub 是一个 Pi 扩展, 用微信管理本机多个 Pi 会话
 - `/wx start` 启动共享 daemon, 不绑定当前 Pi session. 关闭所有 Pi TUI 后, daemon 仍可通过微信收发消息.
 - 每条微信 route 指向同一 Pi session. 在 Pi TUI 中 `/resume` 恢复 Hub 管理的会话时, 扩展通过 IPC 将 owner 从后台 RPC 安全切换到前台 TUI; 同一会话的微信消息和回复会在该 TUI 中显示. TUI 关闭后, route 返回后台 RPC.
 - 新建微信会话默认在后台, 不自动打开 Windows Terminal tab. route、session JSONL 和稳定会话索引保留.
-- 同一 session 同一时刻只允许一个 runtime writer. 只有登记在 Hub 且位于授权项目范围内的 Pi TUI session 会出现在微信会话清单中.
+- 同一 session 同一时刻只允许一个 runtime writer. Pi TUI session 的 cwd 位于 `allowedProjectRoots` 内时会自动登记并纳入 Hub; 授权根外的会话仍可在本机使用, 但不接入微信管理.
 
 ## 安装和首次使用
 
@@ -29,28 +29,34 @@ Node.js 需要满足 `package.json` 中的最低版本. 开发时可从项目目
 pi --extension ./extensions/wechat-session-hub.ts
 ```
 
-作为 Pi package 安装后, 扩展会在 Pi 会话中注册 `/wx` 命令. 首次配置顺序:
+作为 Pi package 安装后, 扩展只注册 `/wx` 本机命令, `/wechat-manager` 保留为兼容别名. 首次使用顺序:
 
-1. 在全局配置中设置 `allowedProjectRoots`.
-2. 使用 `/projects add <alias> --name <名称> --path <绝对路径>` 登记项目, 必要时用 `/projects default <alias>` 设置默认项目.
-3. 在 Pi TUI 执行 `/wx login` 扫码授权.
-4. 在任意 Pi TUI 执行 `/wx start` 启动后台服务.
+1. 在 Pi TUI 执行 `/wx login` 扫码授权.
+2. 在 Pi TUI 执行 `/wx start` 启动后台服务. 如果 `allowedProjectRoots` 为空, Hub 会将当前 session 的 cwd 设为初始授权根, 并自动建立项目记录和默认项目.
+3. 授权根内打开的 Pi session 会按当前文件夹名自动识别, 不需要逐个 `/projects add`. 如果后续要授权其他目录, 在本机 TUI 执行 `/wx roots add-current`, 或用 `/wx roots add <绝对路径>` 添加工作区根目录.
+
+盘符根目录和用户主目录等过宽范围会要求本机确认. 授权根外的 Pi session 仍可在本机使用, 但不会接入 Hub; TUI 会提示如何添加授权根. Hub 不会扫描其他 session 文件.
 
 配置和授权凭证保存在用户专属 Hub 目录, 仓库不包含账号凭证或授权 ID.
 
 ## 本机命令
 
-输入 `/wx` 并回车会打开交互式操作菜单; 输入 `/wx ` 可补全子命令. `/wechat-manager` 是兼容别名.
+输入 `/wx` 并回车会打开交互式操作菜单; 输入 `/wx ` 可补全子命令. `/wechat-manager` 是兼容别名. Pi 本机的 Hub 命令统一位于 `/wx` 下, 不会注册全局 `/help`、`/projects` 或 `/status`.
 
 | 命令 | 行为 |
 |---|---|
 | `/wx login` | 在本地 TUI 扫码, create-only 写入 Hub 自己的凭证 |
-| `/wx start` | 幂等启动独立后台 Gateway |
-| `/wx status` | 在任意 Pi session 查询真实后台连接、PID 和前后台会话数 |
+| `/wx start` | 幂等启动独立后台 Gateway; 首次使用时初始化当前目录授权 |
+| `/wx status` | 查询后台连接、PID、会话数、项目和授权根目录 |
+| `/wx roots` | 查看本机授权根目录 |
+| `/wx roots add-current` | 授权当前 Pi session 目录及其子目录, 并接入当前会话 |
+| `/wx roots add <绝对路径>` | 在本地 TUI 授权一个工作区根目录 |
+| `/wx projects` | 查看自动识别和手动登记的项目 |
 | `/wx stop` | 弹出二次确认; 确认后停止接收新消息并安全收尾 |
 | `/wx restart` | 安全停止并重启 daemon; 服务已停止时启动服务 |
 | `/wx autostart on` | 开启 Windows 当前用户登录后自动连接 |
 | `/wx autostart off` | 关闭并移除 Windows 登录任务 |
+| `/wx help` | 查看本机命令帮助 |
 
 停止时, daemon 先停止接收新微信消息, 再 drain 已入队 route 工作并等待正在处理的 Pi turn 收尾. 本机命令会立即返回“正在停止”, 可用 `/wx status` 查询进度. 如果 daemon 非正常退出, durable queue 会保留未完成项并阻断后续 FIFO, 需要显式 `/retry <message-id> --confirm`.
 
@@ -73,7 +79,7 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 
 `/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 并在表格中标明列含义及当前微信 route. 标题优先显示 session name; 未命名时显示 Pi `/resume` 使用的首条用户文本, 最长 40 个 Unicode 字符, 超出部分以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 索引在会话排序变化后保持不变, 不因列表重排而复用.
 
-Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果选中的是 Hub 管理的会话, extension 会安全完成前后台 owner 交接.
+Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果目标是 Hub 会话, extension 会安全完成前后台 owner 交接. 未登记 session 不再因缺少 Hub 记录而阻止 Pi 原生恢复; 恢复后仅当 cwd 位于授权根内才自动接入 Hub.
 
 ## 配置
 
@@ -83,15 +89,13 @@ Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果选中�
 %USERPROFILE%\.pi\agent\wechat-session-manager.json
 ```
 
-如果设置了 `PI_CODING_AGENT_DIR`, 配置保存在该目录. 首次启动不会自动创建全局配置. 示例:
+如果设置了 `PI_CODING_AGENT_DIR`, 配置保存在该目录下的 `wechat-session-manager.json`. 首次在 Pi TUI 执行 `/wx start` 时, Hub 会自动创建缺省配置并初始化当前 session 的授权根和项目记录. `allowedProjectRoots` 是安全边界, 一个根目录覆盖其子目录. 授权范围内的当前 Pi session 会按 cwd 文件夹名自动登记, 不需要逐个添加项目 alias, 也不会扫描其他目录或 Pi session 文件. 后续授权新工作区时, 可在本机 TUI 执行 `/wx roots add-current` 或 `/wx roots add <绝对路径>`. 示例:
 
 ```json
 {
   "schemaVersion": 1,
   "autoStartOnWindowsLogon": false,
-  "allowedProjectRoots": [
-    "D:\\Projects"
-  ],
+  "allowedProjectRoots": [],
   "projects": {},
   "wechat": {
     "authorizedUserId": ""
@@ -99,7 +103,7 @@ Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果选中�
 }
 ```
 
-缺省字段会使用安全默认值. 历史配置中的 `defaultMode` 字段为兼容旧配置保留, 微信端 `/new` 固定创建后台会话. `wechat.credentialFile` 固定指向 manager 数据目录中的 `credentials.json`; reader 拒绝目录外路径、符号链接、未知 schema 或授权用户不匹配. QR 凭证只在文件不存在时 create-only 写入, 不读取或覆盖其他应用数据.
+缺省字段会使用安全默认值. 历史配置中的 `defaultMode` 字段为兼容旧配置保留, 不决定微信端 `/new` 的运行模式; `/new` 默认创建后台会话, 也可通过 `--mode ui` 显式创建可见 UI 会话. `wechat.credentialFile` 固定指向 manager 数据目录中的 `credentials.json`; reader 拒绝目录外路径、符号链接、未知 schema 或授权用户不匹配. QR 凭证只在文件不存在时 create-only 写入, 不读取或覆盖其他应用数据.
 
 Windows 首次创建空 manager 目录时会关闭继承 ACL, 仅授权当前用户、SYSTEM 和 Administrators; 已有非空目录不会自动修改权限, 登录和启动时会验证目录树. POSIX 要求 manager 目录和凭证文件无 group/other 权限, 且父目录不能被 group/other 写入. 权限无法验证时 fail-closed.
 

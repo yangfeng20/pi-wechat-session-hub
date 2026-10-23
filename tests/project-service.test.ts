@@ -18,6 +18,78 @@ async function createProjectFixture(): Promise<{ temporaryDirectory: string; all
   return { temporaryDirectory, allowedRoot };
 }
 
+test("首次初始化自动授权当前目录, 并按文件夹名称登记项目", async () => {
+  const { temporaryDirectory, allowedRoot } = await createProjectFixture();
+  try {
+    const projectPath = join(allowedRoot, "DeltaForce Insight");
+    const childPath = join(projectPath, "src");
+    await mkdir(childPath, { recursive: true });
+    const service = new ProjectService(
+      new ConfigurationStore(join(temporaryDirectory, "manager.json")),
+    );
+
+    const initialized = await service.initializeFromCurrentCwd(projectPath);
+    assert.equal(initialized.rootAdded, true);
+    assert.equal(initialized.project.displayName, "DeltaForce Insight");
+    assert.equal(initialized.project.path, projectPath);
+    assert.deepEqual((await service.list()).config.allowedProjectRoots, [projectPath]);
+    assert.equal((await service.list()).config.defaultProject, initialized.alias);
+
+    const childProject = await service.ensureProjectForCwd(childPath);
+    assert.equal(childProject.project.displayName, "src");
+    assert.equal(childProject.project.path, childPath);
+    assert.equal((await service.list()).projects.length, 2);
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("允许根中的目录自动登记且重复登记复用同一项目", async () => {
+  const { temporaryDirectory, allowedRoot } = await createProjectFixture();
+  try {
+    const projectPath = join(allowedRoot, "workspace", "deltaforce-insight");
+    await mkdir(projectPath, { recursive: true });
+    const store = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+    await store.update((config) => ({
+      ...config,
+      allowedProjectRoots: [allowedRoot],
+    }));
+    const service = new ProjectService(store);
+
+    const first = await service.ensureProjectForCwd(projectPath);
+    const second = await service.ensureProjectForCwd(projectPath);
+
+    assert.equal(first.alias, second.alias);
+    assert.equal(first.project.displayName, "deltaforce-insight");
+    assert.equal((await service.list()).projects.length, 1);
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("添加授权根目录支持子目录且不会重复写入", async () => {
+  const { temporaryDirectory, allowedRoot } = await createProjectFixture();
+  try {
+    const nestedRoot = join(allowedRoot, "workspace");
+    await mkdir(join(nestedRoot, "project"), { recursive: true });
+    const service = new ProjectService(
+      new ConfigurationStore(join(temporaryDirectory, "manager.json")),
+    );
+
+    assert.equal(await service.addAllowedRoot(nestedRoot), nestedRoot);
+    assert.equal(await service.addAllowedRoot(nestedRoot), nestedRoot);
+    await assert.rejects(
+      service.addAllowedRoot("relative-root"),
+      (error: unknown) => error instanceof ProjectServiceError && error.code === "project_path_denied",
+    );
+    const project = await service.ensureProjectForCwd(join(nestedRoot, "project"));
+    assert.equal(project.project.displayName, "project");
+    assert.deepEqual((await service.list()).config.allowedProjectRoots, [nestedRoot]);
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
 test("仅允许登记授权根目录内存在的项目路径", async () => {
   const { temporaryDirectory, allowedRoot } = await createProjectFixture();
   try {

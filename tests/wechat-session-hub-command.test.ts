@@ -23,6 +23,10 @@ test("/wx 回车打开操作菜单, 兼容别名使用同一菜单", async () =>
     registerWechatSessionHub(pi);
     assert.equal(commands.has("wx"), true);
     assert.equal(commands.has("wechat-manager"), true);
+    assert.equal(commands.has("help"), false);
+    assert.equal(commands.has("projects"), false);
+    assert.equal(commands.has("status"), false);
+    assert.deepEqual([...commands.keys()].sort(), ["wechat-manager", "wx"]);
     const context = {
       mode: "tui",
       hasUI: true,

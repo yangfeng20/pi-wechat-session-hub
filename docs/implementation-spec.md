@@ -6,7 +6,7 @@
 
 ## 1. 目标行为
 
-1. 插件安装后, 用户只需在任意 Pi TUI 执行一次 `/wx start`; Gateway 随后由独立 daemon 持有, 不绑定当前 Pi 进程或 session.
+1. 插件安装后, 用户在任意 Pi TUI 执行 `/wx start`; 授权根为空时, Hub 使用当前 session cwd 初始化授权根并建立默认项目. Gateway 随后由独立 daemon 持有, 不绑定当前 Pi 进程或 session.
 2. 所有 Pi TUI 退出后, Hub daemon 和后台 RPC workers 继续提供微信收发.
 3. 任意 Pi TUI 中 `/wx status|stop|restart` 控制同一后台服务. `/wx stop` 必须由可见 UI 二次确认.
 4. Windows 用户登录自动启动是可选项, 配置默认关闭. 开启后使用之前的 Hub 微信授权, 不在登录任务中打开 QR UI.
@@ -14,7 +14,8 @@
    - 有可见 Pi TUI owner 时, 微信消息进入该 TUI transcript, assistant 最终回复同时回到微信.
    - TUI 关闭后, 已路由 session 安全交给后台 Pi RPC worker.
    - 本机 Pi `/resume` 已由后台处理的 Hub session 时, background writer 先退出, 再由 TUI 接管同一 session.
-6. 微信端 `/sessions` 默认列出 Hub 管理的全部活跃前台和后台 sessions. `/resume` 与 `/stop` 接受稳定会话索引或名称, 不要求复制长 session ID.
+   - 未登记 session 可由 Pi 原生 `/resume` 恢复; 仅当 cwd 位于授权根内时才自动接入 Hub.
+6. `allowedProjectRoots` 是授权边界, 根内 TUI session 自动登记, 项目展示名使用当前 cwd 文件夹名称. 微信端 `/sessions` 列出 Hub 管理的活跃 sessions.
 
 ## 2. 总体架构
 
@@ -48,6 +49,8 @@ Hub daemon 本身是独立后台 Node 进程, 负责 Gateway、poller 和 sessio
 
 Daemon 在 Gateway runtime 初始化时取得 `GatewayLease`, 启动 UI owner IPC server 后开放 control IPC, 然后恢复 route 和启动 iLink poller. `/wx start` 不等待所有模型 turn; daemon ready 后返回启动状态. 重复 `start` 幂等, 不会建立第二个 poller.
 
+首次在 Pi TUI 执行 `/wx start` 时, 若 `allowedProjectRoots` 为空, Hub 将当前 session cwd 设为初始授权根并按文件夹名称建立默认项目. 若路径为磁盘根或用户主目录等过宽范围, 会在本机要求确认. 后续可通过 `/wx roots add-current` 或 `/wx roots add <绝对路径>` 增加授权根; 微信端不开放这些配置操作.
+
 ### 3.2 状态与控制
 
 control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `manager.lock` 中的 lease token 完成 HMAC challenge-response. 只接受 `status`、`stop`、`restart` 固定动作, 不接受路径、命令或任意数据.
@@ -60,19 +63,21 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 
 ## 4. 前台/后台 owner 交接
 
-每个可见 Pi TUI 在 `session_start` 后尝试连接 Gateway UI IPC. 连接使用 manager lease token HMAC; 当前 session 必须能唯一匹配已登记项目, 且 cwd 仍位于 `allowedProjectRoots`.
+每个可见 Pi TUI 在 `session_start` 后尝试连接 Gateway UI IPC. `allowedProjectRoots` 负责安全授权; cwd 位于授权根时, extension 按 cwd 文件夹名自动建立或复用项目记录, 不要求预先逐个添加 alias. cwd 超出授权范围时, session 仍可本机使用, TUI 会提示 `/wx roots add-current` 等本机授权入口.
 
 ```text
 后台 RPC owner -- Pi /resume / UI attach --> 前台 TUI owner
 前台 TUI owner -- session shutdown -------> 后台 RPC owner
 ```
 
-- UI 接管时, IPC server 验证 Pi session file、项目 alias 和 lease; 如果现有 owner 是 Hub 的 background worker, 先优雅停止该 worker, 再注册 UI owner, 并更新 route generation.
+- UI 接管时, IPC server 验证 Pi session file、授权根范围和 lease; 项目记录按 cwd 文件夹名自动创建或复用. 如果现有 owner 是 Hub 的 background worker, 先优雅停止该 worker, 再注册 UI owner, 并更新 route generation.
 - UI owner 收到微信消息时, extension 用 Pi 原生 `sendUserMessage()` 注入消息. `agent_settled` 后将完整最终 assistant 文本交给 Gateway, 再由 iLink 发回微信.
 - UI TUI 正常关闭时, 移除前台 owner; 有 route 的 session 交给后台 RPC worker, route 和 session ID 不变.
 - `/wx stop` 会断开 Gateway IPC, 但仍运行的 TUI 保持本地会话. 下次 `start` 时, UI extension 会重连并恢复 owner.
 - Hub 启动时, 曾标记为 UI 但已没有活跃 UI owner 的 saved route 改由后台 RPC 恢复, 不自动打开 Windows Terminal tab.
-- 所有 owner 转换都受单 writer 检查保护. writer 或 session 状态不明确时拒绝切换, 不覆盖 transcript.
+- 未登记目标的 Pi 原生 `/resume` 不因缺少 Hub registry 记录而被取消. 如果目标 transcript 没有活跃或状态不明的 Hub owner, 允许 Pi 恢复; 恢复后 cwd 在授权根内则自动登记并接入, 否则只保留本机使用.
+- 已登记 session 若由其他活跃 UI owner 持有, 或旧 owner 状态不明且进程仍存活, 拒绝第二 writer. 后台 owner 则尝试安全停止并交接; 停止或交接失败时拒绝恢复.
+- 未登记 transcript 不会触发本机 session 文件扫描; 仅通过用户当前 Pi 的 `/resume` 选择单个目标.
 
 ## 5. 微信端会话和索引
 
@@ -92,11 +97,13 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 
 ## 6. Pi 本机控制命令
 
-- `/wx` 回车打开 `ctx.ui.select()` 操作菜单.
-- `/wx ` 使用 Pi `getArgumentCompletions` 提供 `login`、`start`、`status`、`stop`、`restart` 和 `autostart on|off`.
-- `/wechat-manager` 保留为同一处理器的兼容别名.
+- Pi 扩展只注册 `/wx` 和兼容别名 `/wechat-manager`; 不占用 Pi 全局 `/help`、`/projects` 或 `/status` 命令.
+- `/wx` 回车打开 `ctx.ui.select()` 操作菜单; `/wx help` 展示本机 Hub 帮助.
+- `/wx projects` 管理项目别名; 新打开的授权范围内 session 会自动创建以 cwd 文件夹名为 displayName 的项目记录.
+- `/wx roots` 查看授权根; `/wx roots add-current` 或 `/wx roots add <绝对路径>` 仅可在本机可见 TUI 修改授权根.
+- `/wx ` 使用 Pi `getArgumentCompletions` 提供本机子命令补全.
 - `stop` 在可见 UI 中调用 `ctx.ui.confirm()`. 无 UI 的调用 fail-closed, 不停止服务.
-- `/status` 同样读取共享 daemon 状态, 不查看本 Pi extension 实例里的局部内存字段.
+- `/wx status` 读取共享 daemon 状态及配置项目计数, 不查看本 Pi extension 实例里的局部内存字段.
 
 ## 7. Windows 用户登录自动启动
 
@@ -116,7 +123,8 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 
 ## 9. 安全与数据约束
 
-- 微信不可传任意 shell 命令、Pi 内置 slash command、项目路径或 transcript 文件路径.
+- `allowedProjectRoots` 是本机 Hub 的会话接入边界. 根内打开的 Pi session 会按需登记; 根外 session 仍可在 Pi 本机恢复和使用, 但不能进入 Hub registry 或微信管理.
+- 微信不可传任意 shell 命令、Pi 内置 slash command、项目路径或 transcript 文件路径. 本机 `/wx roots` 命令不暴露给微信端.
 - 项目 alias 和真实路径每次启动/恢复时重新校验; 项目移出授权根后拒绝路由.
 - IPC challenge 使用 Gateway lease token HMAC; 普通 Pi TUI attach 使用 manager 目录 ACL 保护的稳定随机 `ui-attachment.key`. manager 目录及凭证使用当前用户专属 ACL/mode.
 - iLink QR 登录只写 Hub 自己的凭证, create-only; 不读取、复制、覆盖或删除其他客户端凭证.

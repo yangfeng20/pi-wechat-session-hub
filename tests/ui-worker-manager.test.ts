@@ -197,10 +197,22 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
     assert.equal(created.state, "active");
     assert.equal(replies.length, 0);
     assert.equal(await workers[0].bridge.canSwitchSession(created.sessionFile), true);
-    assert.equal(
-      await workers[0].bridge.canSwitchSession(join(sessionsDirectory, "unregistered.jsonl")),
-      false,
-    );
+    const unregisteredSessionFile = join(sessionsDirectory, "unregistered.jsonl");
+    assert.equal(await workers[0].bridge.canSwitchSession(unregisteredSessionFile), true);
+    await registry.upsertInstance({
+      instanceId: "orphaned-unregistered-owner",
+      pid: process.pid,
+      processBirthId: `${process.pid}:orphaned-owner`,
+      sessionId: "orphaned-unregistered-session",
+      sessionFile: unregisteredSessionFile,
+      cwd: projectPath,
+      projectAlias: "demo",
+      mode: "ui",
+      state: "idle",
+      heartbeatAt: new Date().toISOString(),
+    });
+    assert.equal(await workers[0].bridge.canSwitchSession(unregisteredSessionFile), false);
+    await registry.removeInstance("orphaned-unregistered-owner");
     const backgroundSessionId = "busy-background-session";
     const backgroundSessionFile = join(sessionsDirectory, `${backgroundSessionId}.jsonl`);
     await writeFile(backgroundSessionFile, `${JSON.stringify({ id: backgroundSessionId })}\n`, "utf8");

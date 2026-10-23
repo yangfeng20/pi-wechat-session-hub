@@ -1,3 +1,6 @@
+import { CommandTokenizeError, tokenizeCommandArguments } from "./tokenizer.ts";
+import { parseProjectCommand, type ProjectCommand, ProjectCommandParseError } from "./project-command-parser.ts";
+
 export type WechatManagerCommand =
   | { action: "help" }
   | { action: "login" }
@@ -5,7 +8,9 @@ export type WechatManagerCommand =
   | { action: "stop" }
   | { action: "restart" }
   | { action: "status" }
-  | { action: "autostart"; enabled: boolean };
+  | { action: "autostart"; enabled: boolean }
+  | { action: "projects"; command: ProjectCommand }
+  | { action: "roots"; operation: "list" | "add-current" | "add"; path?: string };
 
 export interface WechatManagerCommandCompletion {
   value: string;
@@ -21,17 +26,23 @@ const COMMAND_COMPLETIONS: WechatManagerCommandCompletion[] = [
   { value: "restart", label: "restart", description: "重启后台连接" },
   { value: "autostart on", label: "autostart on", description: "登录 Windows 后自动连接" },
   { value: "autostart off", label: "autostart off", description: "关闭登录后自动连接" },
+  { value: "projects", label: "projects", description: "查看和管理项目" },
+  { value: "projects add", label: "projects add", description: "手动登记项目" },
+  { value: "projects default", label: "projects default", description: "设置默认项目" },
+  { value: "roots", label: "roots", description: "查看授权根目录" },
+  { value: "roots add-current", label: "roots add-current", description: "授权当前目录及其子目录" },
+  { value: "roots add", label: "roots add", description: "添加一个授权根目录" },
   { value: "help", label: "help", description: "查看命令说明" },
 ];
 
 /**
- * 表示 /wechat-manager 参数不符合受支持的控制命令。
+ * 表示 /wx 参数不符合受支持的控制命令.
  */
 export class WechatManagerCommandParseError extends Error {
   /**
-   * 创建命令参数错误。
+   * 创建命令参数错误.
    *
-   * @param message 可安全显示的中文用法说明。
+   * @param message 可安全显示的中文用法说明.
    */
   constructor(message: string) {
     super(message);
@@ -40,16 +51,40 @@ export class WechatManagerCommandParseError extends Error {
 }
 
 /**
- * 解析 Hub 本地登录、启停和自启动命令, 不接受路径、shell 命令或其他参数。
+ * 解析 Hub 本机命令, 不接受 shell 命令或未声明的参数.
  *
- * @param args 命令前缀后的原始字符串。
- * @returns 已验证的本地控制动作。
- * @throws {WechatManagerCommandParseError} 出现未知动作或额外参数时抛出。
+ * @param args /wx 命令前缀后的原始字符串.
+ * @returns 已验证的本机控制动作.
+ * @throws {WechatManagerCommandParseError} 出现未知动作或额外参数时抛出.
  */
 export function parseWechatManagerCommand(args: string): WechatManagerCommand {
-  const tokens = args.trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) {
+  const trimmed = args.trim();
+  if (!trimmed) {
     return { action: "help" };
+  }
+  const projectsMatch = trimmed.match(/^projects(?:\s+([\s\S]*))?$/i);
+  if (projectsMatch) {
+    try {
+      return {
+        action: "projects",
+        command: parseProjectCommand(projectsMatch[1] ?? ""),
+      };
+    } catch (error) {
+      if (error instanceof ProjectCommandParseError) {
+        throw new WechatManagerCommandParseError(error.message);
+      }
+      throw error;
+    }
+  }
+
+  let tokens: string[];
+  try {
+    tokens = tokenizeCommandArguments(trimmed);
+  } catch (error) {
+    if (error instanceof CommandTokenizeError) {
+      throw new WechatManagerCommandParseError(`${error.message}\n${COMMAND_USAGE}`);
+    }
+    throw error;
   }
   if (tokens.length === 1) {
     switch (tokens[0]) {
@@ -60,10 +95,21 @@ export function parseWechatManagerCommand(args: string): WechatManagerCommand {
       case "status":
       case "help":
         return { action: tokens[0] };
+      case "roots":
+        return { action: "roots", operation: "list" };
       default:
-        throw new WechatManagerCommandParseError(
-          "未知 /wx 动作; 用法: /wx [login|start|stop|restart|status|autostart on|autostart off]。",
-        );
+        break;
+    }
+  }
+  if (tokens[0] === "roots") {
+    if (tokens.length === 2 && tokens[1] === "list") {
+      return { action: "roots", operation: "list" };
+    }
+    if (tokens.length === 2 && tokens[1] === "add-current") {
+      return { action: "roots", operation: "add-current" };
+    }
+    if (tokens.length === 3 && tokens[1] === "add" && tokens[2].trim()) {
+      return { action: "roots", operation: "add", path: tokens[2] };
     }
   }
   if (tokens.length === 2 && tokens[0] === "autostart") {
@@ -74,16 +120,14 @@ export function parseWechatManagerCommand(args: string): WechatManagerCommand {
       return { action: "autostart", enabled: false };
     }
   }
-  throw new WechatManagerCommandParseError(
-    "用法: /wx [login|start|stop|restart|status|autostart on|autostart off]。",
-  );
+  throw new WechatManagerCommandParseError(COMMAND_USAGE);
 }
 
 /**
- * 提供短前缀命令的 Pi 参数补全项。
+ * 提供 /wx 命令参数补全项.
  *
- * @param prefix 当前光标前的命令参数前缀。
- * @returns 匹配项, 无匹配时返回 null。
+ * @param prefix 当前光标前的命令参数前缀.
+ * @returns 匹配项, 无匹配时返回 null.
  */
 export function getWechatManagerCommandCompletions(
   prefix: string,
@@ -94,3 +138,6 @@ export function getWechatManagerCommandCompletions(
   );
   return matches.length > 0 ? matches.map((completion) => ({ ...completion })) : null;
 }
+
+const COMMAND_USAGE =
+  "用法: /wx [login|start|stop|restart|status|projects|roots|autostart on|autostart off|help]";

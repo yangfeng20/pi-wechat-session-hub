@@ -32,8 +32,10 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
   const projectRoot = join(root, "projects");
   const projectPath = join(projectRoot, "demo");
   const unregisteredPath = join(projectRoot, "unregistered");
+  const outsidePath = join(root, "outside-project");
   await mkdir(projectPath, { recursive: true });
   await mkdir(unregisteredPath, { recursive: true });
+  await mkdir(outsidePath, { recursive: true });
   const configStore = new ConfigurationStore(join(agentDirectory, "wechat-session-manager.json"));
   await configStore.update((config) => ({
     ...config,
@@ -132,8 +134,22 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     });
 
     bridge = new UiWorkerExtensionBridge(undefined, projectService, managerDirectory);
-    await assert.rejects(bridge.attach(pi, context), /未登记/);
+    uiState.cwd = outsidePath;
+    uiState.sessionFile = join(outsidePath, "outside-ui-session.jsonl");
+    await assert.rejects(bridge.attach(pi, context), /\/wx roots add-current/);
+    uiState.cwd = unregisteredPath;
+    uiState.sessionFile = join(unregisteredPath, "unregistered-ui-session.jsonl");
+    const autoRegistered = new Promise<void>((resolveRegistered) => {
+      server.once("worker_registered", () => resolveRegistered());
+    });
+    await bridge.attach(pi, context);
+    await autoRegistered;
+    const autoSession = (await registry.readSnapshot()).sessions[uiState.sessionId];
+    assert.ok(autoSession);
+    assert.equal(autoSession.projectAlias, "unregistered");
+    assert.equal((await projectService.list()).config.projects.unregistered.displayName, "unregistered");
     assert.equal(await bridge.canSwitchSession(session.sessionFile), true);
+    await bridge.onSessionShutdown({ reason: "resume" });
     uiState.sessionId = session.sessionId;
     uiState.sessionFile = session.sessionFile;
     uiState.cwd = projectPath;
@@ -147,7 +163,7 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     const otherBackgroundSession = await backgroundManager.startNew("demo", "后台会话");
     assert.equal(
       (await registry.readSnapshot()).sessions[otherBackgroundSession.sessionId].publicIndex,
-      2,
+      3,
     );
     const foreground = await registry.readSnapshot();
     const foregroundOwnerId = foreground.routes["wx-owner-test"].workerInstanceId;
@@ -158,11 +174,11 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     const firstList = await router.receive({
       messageId: "wx-sessions-foreground",
       senderId: "wx-owner-test",
-      text: "/sessions",
+      text: "/sessions --state active",
     });
     assert.equal(firstList.state, "completed");
     assert.match(sessionListReplies.at(-1) ?? "", /#1 \| 前后台切换测试 \| 测试项目 \| 前台 \| 活跃/);
-    assert.match(sessionListReplies.at(-1) ?? "", /#2 \| 后台会话 \| 测试项目 \| 后台 \| 等待首条记录/);
+    assert.match(sessionListReplies.at(-1) ?? "", /#3 \| 后台会话 \| 测试项目 \| 后台 \| 等待首条记录/);
     assert.equal(await gatewayWorkerManager.prompt(session.sessionId, "桌面可见回复"), "UI 回复: 桌面可见回复");
 
     await bridge.onSessionShutdown({ reason: "quit" });
@@ -175,11 +191,11 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     const secondList = await router.receive({
       messageId: "wx-sessions-background",
       senderId: "wx-owner-test",
-      text: "/sessions",
+      text: "/sessions --state active",
     });
     assert.equal(secondList.state, "completed");
     assert.match(sessionListReplies.at(-1) ?? "", /#1 \| 前后台切换测试 \| 测试项目 \| 后台 \| 活跃/);
-    assert.match(sessionListReplies.at(-1) ?? "", /#2 \| 后台会话 \| 测试项目 \| 后台 \| 等待首条记录/);
+    assert.match(sessionListReplies.at(-1) ?? "", /#3 \| 后台会话 \| 测试项目 \| 后台 \| 等待首条记录/);
     assert.equal(await gatewayWorkerManager.prompt(session.sessionId, "微信仍可回复"), "测试回复: 微信仍可回复");
   } finally {
     await bridge?.onSessionShutdown({ reason: "quit" }).catch(() => undefined);

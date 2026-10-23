@@ -626,7 +626,14 @@ export class UiWorkerManager {
       samePath(session.sessionFile, params.sessionFile as string),
     );
     if (!target) {
-      return { allowed: false, reason: "session_not_registered" };
+      const unindexedOwner = Object.values(snapshot.instances).find((instance) =>
+        samePath(instance.sessionFile, params.sessionFile as string) &&
+        instance.instanceId !== connection.registration.instanceId &&
+        ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+      );
+      return unindexedOwner
+        ? { allowed: false, reason: "session_owned_by_other_process" }
+        : { allowed: true, reason: "session_not_registered" };
     }
     try {
       await this.options.projectService.resolveSession(target.projectAlias, target.cwd);

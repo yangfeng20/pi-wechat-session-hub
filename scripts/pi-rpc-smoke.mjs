@@ -33,15 +33,22 @@ try {
     record.method === "notify" &&
     record.message?.includes("微信连接: 已停止"),
   );
+  const helpNotices = records.filter((record) =>
+    record.type === "extension_ui_request" &&
+    record.method === "notify" &&
+    record.message?.includes("Pi 微信会话枢纽命令:") &&
+    record.message?.includes("/wx roots"),
+  );
   const promptResponses = records.filter((record) =>
     record.type === "response" &&
     record.command === "prompt" &&
     record.success === true &&
-    ["compat-status-smoke", "compat-wx-smoke", "compat-manager-smoke"].includes(record.id),
+    ["wx-status-smoke", "wx-help-smoke", "compat-manager-smoke"].includes(record.id),
   );
 
-  assert.equal(statusNotices.length, 3, `Pi RPC 未收到三个共享服务状态通知: ${JSON.stringify(records)}\n${output.stderr}`);
-  assert.equal(promptResponses.length, 3, `Pi RPC 未接受 /status、/wx status 和兼容别名命令: ${JSON.stringify(records)}\n${output.stderr}`);
+  assert.equal(statusNotices.length, 2, `Pi RPC 未收到两个 /wx status 通知: ${JSON.stringify(records)}\n${output.stderr}`);
+  assert.equal(helpNotices.length, 1, `Pi RPC 未收到 /wx help 通知: ${JSON.stringify(records)}\n${output.stderr}`);
+  assert.equal(promptResponses.length, 3, `Pi RPC 未接受 /wx status、/wx help 和兼容别名命令: ${JSON.stringify(records)}\n${output.stderr}`);
   process.stdout.write(`Pi ${packageManifest.version} 扩展 RPC smoke test 通过。\n`);
 } finally {
   await rm(temporaryDirectory, { recursive: true, force: true });
@@ -86,7 +93,7 @@ function runRpcSmoke(cliPath, extensionPath, temporaryDirectory) {
     let stdout = "";
     let stderr = "";
     let pendingOutputLine = "";
-    const expectedResponseIds = new Set(["compat-status-smoke", "compat-wx-smoke", "compat-manager-smoke"]);
+    const expectedResponseIds = new Set(["wx-status-smoke", "wx-help-smoke", "compat-manager-smoke"]);
     const completedResponseIds = new Set();
     const timeout = setTimeout(() => {
       child.kill();
@@ -135,8 +142,8 @@ function runRpcSmoke(cliPath, extensionPath, temporaryDirectory) {
       resolveOutput({ stdout, stderr });
     });
     child.stdin.write([
-      { id: "compat-status-smoke", type: "prompt", message: "/status" },
-      { id: "compat-wx-smoke", type: "prompt", message: "/wx status" },
+      { id: "wx-status-smoke", type: "prompt", message: "/wx status" },
+      { id: "wx-help-smoke", type: "prompt", message: "/wx help" },
       { id: "compat-manager-smoke", type: "prompt", message: "/wechat-manager status" },
     ].map((request) => JSON.stringify(request)).join("\n") + "\n");
   });

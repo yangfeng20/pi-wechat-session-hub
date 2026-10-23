@@ -5,7 +5,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { ProjectService } from "../projects/project-service.ts";
+import { ProjectService, ProjectServiceError } from "../projects/project-service.ts";
 import {
   createStableNamedPipe,
   readOrCreateUiWorkerAttachToken,
@@ -122,7 +122,7 @@ export class UiWorkerExtensionBridge {
         const result = await this.client.request("can_switch_session", { sessionFile }, 10000);
         return isRecord(result) && result.allowed === true;
       } catch {
-        return false;
+        return !(await this.hasLiveSessionOwner(sessionFile));
       }
     }
 
@@ -370,10 +370,13 @@ export class UiWorkerExtensionBridge {
     try {
       canonicalCwd = await realpath(cwd);
     } catch {
-      if (!this.launchRecord) {
-        throw new UiWorkerIpcError("project_not_registered", "当前 Pi TUI 项目目录不可用, 未接入 Hub。 ");
+      if (this.launchRecord) {
+        throw new UiWorkerIpcError("handshake_rejected", "UI worker 项目目录不可用。 ");
       }
-      throw new UiWorkerIpcError("handshake_rejected", "UI worker 项目目录不可用。 ");
+      throw new UiWorkerIpcError(
+        "project_not_registered",
+        "当前 Pi TUI 工作目录不可用, 本机会话保持可用, 但未接入 Hub。",
+      );
     }
     if (
       this.launchRecord &&
@@ -383,30 +386,21 @@ export class UiWorkerExtensionBridge {
       await this.projectService.resolveSession(this.launchRecord.projectAlias, canonicalCwd);
       return this.launchRecord.projectAlias;
     }
-    const { config } = await this.projectService.list();
-    const matches = await Promise.all(Object.entries(config.projects).map(async ([alias, project]) => {
-      try {
-        return samePath(await realpath(project.path), canonicalCwd) ? alias : undefined;
-      } catch {
-        return undefined;
-      }
-    }));
-    const aliases = matches.filter((alias): alias is string => alias !== undefined);
-    if (aliases.length !== 1) {
-      throw new UiWorkerIpcError(
-        this.launchRecord ? "handshake_rejected" : "project_not_registered",
-        "当前 Pi TUI 项目未登记为 Hub 项目, 该 session 不会接入微信管理。",
-      );
-    }
     try {
-      await this.projectService.resolveSession(aliases[0], canonicalCwd);
+      return (await this.projectService.ensureProjectForCwd(canonicalCwd)).alias;
     } catch (error) {
-      if (!this.launchRecord) {
-        throw new UiWorkerIpcError("project_not_registered", "当前 Pi TUI 项目不在 Hub 授权范围内。 ");
+      if (this.launchRecord || !(error instanceof ProjectServiceError)) {
+        throw error;
       }
-      throw error;
+      if (error.code !== "project_path_denied") {
+        throw new UiWorkerIpcError("project_not_registered", error.message);
+      }
+      const { config } = await this.projectService.list();
+      const notice = config.allowedProjectRoots.length === 0
+        ? "尚未初始化 Hub 项目授权. 执行 /wx start 可将当前目录设为授权根, 或执行 /wx roots add-current 手动授权。"
+        : "当前目录不在 Hub 授权根内. 本机会话保持可用, 但未接入 Hub. 执行 /wx roots add-current 可授权当前目录及其子目录。";
+      throw new UiWorkerIpcError("project_not_registered", notice);
     }
-    return aliases[0];
   }
 
   /**
@@ -658,6 +652,25 @@ export function isUiWorkerBridgeActive(): boolean {
 }
 
 /**
+ * 在 Pi 本机命令修改授权配置后, 重新尝试接入当前可见 session.
+ *
+ * @param pi 当前 Pi extension API.
+ * @param context 当前本机 session context.
+ * @returns session 已通过授权验证并开始注册时正常结束.
+ * @throws {UiWorkerIpcError} 当前进程尚未建立 UI worker bridge 时抛出.
+ */
+export async function attachCurrentUiWorkerSession(
+  pi: ExtensionAPI,
+  context: ExtensionContext,
+): Promise<void> {
+  const bridge = bridgeProcess.piWechatUiWorkerBridge;
+  if (!bridge) {
+    throw new UiWorkerIpcError("worker_disconnected", "当前 Pi TUI 尚未建立 Hub session bridge, 请重新打开 session 后重试。");
+  }
+  await bridge.attach(pi, context);
+}
+
+/**
  * 注册所有可见 Pi TUI 的 Hub session owner bridge。
  *
  * @param pi Pi extension API。
@@ -672,9 +685,15 @@ export function registerUiWorkerBridgeHooks(
 ): void {
   let bridge = bridgeProcess.piWechatUiWorkerBridge;
 
-  pi.on("session_start", async (_event, sessionContext) => {
+  pi.on("session_start", async (event, sessionContext) => {
     if (sessionContext.mode !== "tui") {
       return;
+    }
+    if (event.reason === "reload" && bridge) {
+      if (bridgeProcess.piWechatUiWorkerBridge === bridge) {
+        delete bridgeProcess.piWechatUiWorkerBridge;
+      }
+      bridge = undefined;
     }
     const configuredManagerDirectory = process.env.PI_WECHAT_MANAGER_DIR;
     if (configuredManagerDirectory && !samePath(configuredManagerDirectory, managerDirectory)) {
@@ -707,9 +726,13 @@ export function registerUiWorkerBridgeHooks(
       await bridge.attach(pi, sessionContext);
     } catch (error) {
       if (error instanceof UiWorkerIpcError && error.code === "project_not_registered") {
+        sessionContext.ui.notify(error.message, "warning");
         return;
       }
-      sessionContext.ui.notify("无法准备当前 Pi TUI session registration; Hub route 未建立。", "error");
+      sessionContext.ui.notify(
+        `无法准备当前 Pi TUI session registration; Hub route 未建立. ${error instanceof Error ? error.message : "原因未知."}`,
+        "error",
+      );
     }
   });
 
@@ -727,7 +750,7 @@ export function registerUiWorkerBridgeHooks(
     const allowed = await bridge.canSwitchSession(event.targetSessionFile);
     if (!allowed) {
       sessionContext.ui.notify(
-        "Gateway 拒绝切换到未登记或仍由其他 Pi runtime 持有的 session, 以避免双 writer。",
+        "Gateway 检测到目标 session 仍由其他 Pi runtime 持有或 owner 状态不明, 为避免双 writer 已拒绝恢复。",
         "warning",
       );
       return { cancel: true };

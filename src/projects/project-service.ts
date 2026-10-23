@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { ConfigurationStore } from "../config/store.ts";
 import { assertProjectAlias } from "../config/validation.ts";
 import type { ManagerConfiguration, ProjectDefinition } from "../config/types.ts";
@@ -57,6 +58,101 @@ export class ProjectService {
       left.localeCompare(right),
     );
     return { config, projects };
+  }
+
+  /**
+   * 添加一个授权根目录, 后续该目录及其子目录可自动接入 Hub.
+   *
+   * @param rootPath 用户明确授权的目录.
+   * @returns 已规范化的根目录.
+   * @throws {ProjectServiceError} 目录不存在或不是绝对路径时抛出.
+   */
+  async addAllowedRoot(rootPath: string): Promise<string> {
+    if (!isAbsolute(rootPath)) {
+      throw new ProjectServiceError("project_path_denied", "授权根目录必须是绝对路径.");
+    }
+    const canonicalRoot = await getCanonicalDirectory(rootPath, "allowed_root_not_found");
+    await this.store.update(async (config) => {
+      const canonicalRoots = await Promise.all(config.allowedProjectRoots.map((root) =>
+        getCanonicalDirectory(root, "allowed_root_not_found"),
+      ));
+      if (canonicalRoots.some((root) => isWithinDirectory(root, canonicalRoot))) {
+        return config;
+      }
+      return {
+        ...config,
+        allowedProjectRoots: [...config.allowedProjectRoots, canonicalRoot],
+      };
+    });
+    return canonicalRoot;
+  }
+
+  /**
+   * 首次从当前 Pi cwd 建立授权根和默认项目.
+   *
+   * @param cwd 当前 Pi session 工作目录.
+   * @returns 根目录是否由本次初始化添加, 以及当前项目记录.
+   * @throws {ProjectServiceError} 当前目录已不在已有授权根内时抛出.
+   */
+  async initializeFromCurrentCwd(cwd: string): Promise<{
+    rootAdded: boolean;
+    alias: string;
+    project: ProjectDefinition;
+  }> {
+    const { config } = await this.store.load();
+    const rootAdded = config.allowedProjectRoots.length === 0;
+    if (rootAdded) {
+      await this.addAllowedRoot(cwd);
+    }
+    const project = await this.ensureProjectForCwd(cwd);
+    return { rootAdded, ...project };
+  }
+
+  /**
+   * 在授权根内自动创建或复用当前 cwd 对应的项目记录.
+   *
+   * @param cwd 当前 Pi session 工作目录.
+   * @returns 稳定 alias 和以 cwd 文件夹名作为展示名的项目记录.
+   * @throws {ProjectServiceError} cwd 不在已授权根目录内时抛出.
+   */
+  async ensureProjectForCwd(cwd: string): Promise<{
+    alias: string;
+    project: ProjectDefinition;
+  }> {
+    let resolved: { alias: string; project: ProjectDefinition } | undefined;
+    await this.store.update(async (config) => {
+      const canonicalPath = await validateProjectDirectory(cwd, config.allowedProjectRoots);
+      for (const [alias, project] of Object.entries(config.projects)) {
+        try {
+          const projectPath = await getCanonicalDirectory(project.path, "project_directory_not_found");
+          if (samePath(projectPath, canonicalPath)) {
+            resolved = { alias, project: { ...project, path: projectPath } };
+            return config.defaultProject ? config : { ...config, defaultProject: alias };
+          }
+        } catch (error) {
+          if (!(error instanceof ProjectServiceError)) {
+            throw error;
+          }
+        }
+      }
+
+      const displayName = basename(canonicalPath) || canonicalPath;
+      const alias = createProjectAlias(config.projects, displayName, canonicalPath);
+      const project = { displayName, path: canonicalPath };
+      resolved = { alias, project };
+      return {
+        ...config,
+        defaultProject: config.defaultProject ?? alias,
+        projects: {
+          ...config.projects,
+          [alias]: project,
+        },
+      };
+    });
+    if (!resolved) {
+      throw new ProjectServiceError("project_alias_not_found", "无法为当前目录建立项目记录.");
+    }
+    return resolved;
   }
 
   /**
@@ -312,7 +408,64 @@ function isWithinDirectory(root: string, target: string): boolean {
 }
 
 /**
- * 将配置校验错误转换为项目服务稳定错误代码。
+ * 比较两个规范化目录路径, 在 Windows 上忽略大小写.
+ *
+ * @param left 左侧路径.
+ * @param right 右侧路径.
+ * @returns 两条路径指向同一规范化位置时返回 true.
+ */
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+/**
+ * 根据文件夹名生成稳定且无冲突的项目 alias.
+ *
+ * @param projects 当前项目记录.
+ * @param displayName 当前文件夹名称.
+ * @param projectPath 已规范化的项目路径.
+ * @returns 满足配置 schema 的唯一 alias.
+ */
+function createProjectAlias(
+  projects: Record<string, ProjectDefinition>,
+  displayName: string,
+  projectPath: string,
+): string {
+  const base = displayName
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+    .replace(/-+$/g, "") || "project";
+  if (!Object.hasOwn(projects, base)) {
+    return base;
+  }
+
+  const pathHash = createHash("sha256")
+    .update(process.platform === "win32" ? projectPath.toLowerCase() : projectPath)
+    .digest("hex")
+    .slice(0, 8);
+  const prefix = base.slice(0, 19).replace(/-+$/g, "") || "project";
+  const withHash = `${prefix}-${pathHash}`;
+  if (!Object.hasOwn(projects, withHash)) {
+    return withHash;
+  }
+  let index = 2;
+  let candidate = `${prefix}-${pathHash}-${index}`;
+  while (Object.hasOwn(projects, candidate)) {
+    index += 1;
+    candidate = `${prefix}-${pathHash}-${index}`;
+  }
+  return candidate;
+}
+
+/**
+ * 将配置校验错误转换为项目服务稳定错误代码.
  *
  * @param alias 待校验 alias。
  * @returns 无返回值。

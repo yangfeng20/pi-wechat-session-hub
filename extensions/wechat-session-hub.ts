@@ -1,4 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { parse as parsePath, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   ConfigurationBusyError,
@@ -6,7 +8,6 @@ import {
   type ConfigurationStore,
 } from "../src/config/store.ts";
 import { ConfigurationValidationError } from "../src/config/validation.ts";
-import { parseProjectCommand, ProjectCommandParseError } from "../src/commands/project-command-parser.ts";
 import { IlinkQrLoginComponent } from "../src/commands/ilink-qr-login-component.ts";
 import {
   getWechatManagerCommandCompletions,
@@ -17,7 +18,7 @@ import { getManagerDataDirectory } from "../src/config/paths.ts";
 import { GatewayControlError } from "../src/gateway/gateway-control-ipc.ts";
 import { GatewayServiceController, type GatewayDaemonLaunchSpec, type GatewayServiceStatus } from "../src/runtime/gateway-service-controller.ts";
 import { WindowsLogonTaskManager, WindowsLogonTaskManagerError } from "../src/runtime/windows-logon-task-manager.ts";
-import { registerUiWorkerBridgeHooks } from "../src/gateway/ui-worker-extension-bridge.ts";
+import { registerUiWorkerBridgeHooks, attachCurrentUiWorkerSession } from "../src/gateway/ui-worker-extension-bridge.ts";
 import { UiWorkerIpcError } from "../src/gateway/ui-worker-ipc.ts";
 import { IlinkApiError } from "../src/gateway/wechat-ilink/api-client.ts";
 import { IlinkCredentialStoreError } from "../src/gateway/credential-store.ts";
@@ -29,20 +30,15 @@ import { ProjectService, ProjectServiceError } from "../src/projects/project-ser
 
 const HELP_TEXT = [
   "Pi 微信会话枢纽命令:",
-  "/projects - 查看已登记项目",
-  "/projects add <alias> --name <名称> --path <绝对路径> - 登记项目",
-  "/projects remove <alias> - 移除登记, 不删除目录",
-  "/projects default <alias> - 设置默认项目",
-  "/wx [login|start|stop|restart|status|autostart on|autostart off] - 管理后台微信连接",
+  "/wx [login|start|stop|restart|status|projects|roots|autostart on|autostart off|help] - 管理 Hub",
+  "/wx projects [add <alias> --name <名称> --path <绝对路径>|remove <alias>|default <alias>] - 管理项目",
+  "/wx roots [list|add-current|add <绝对路径>] - 管理本机授权根目录",
   "  login - 使用独立二维码授权 Pi Hub",
-  "  start - 启动独立后台连接, 不绑定当前 Pi 会话",
-  "  stop - 二次确认后停止后台连接",
-  "  restart - 重启后台连接",
-  "  status - 查看后台连接和前后台会话数量",
-  "  autostart on|off - 管理 Windows 用户登录后的自动连接",
+  "  start - 启动后台连接; 首次启动时授权当前 session 目录",
+  "  status - 查看连接、项目和授权根目录状态",
+  "  roots add-current - 授权当前目录及其子目录并接入当前会话",
+  "  help - 查看命令说明",
   "/wechat-manager - /wx 的兼容别名",
-  "/status - 查看后台管理器状态",
-  "/help - 查看命令帮助",
 ].join("\n");
 
 /**
@@ -138,6 +134,32 @@ function formatGatewayServiceStatus(
 }
 
 /**
+ * 比较路径, 在 Windows 上忽略大小写.
+ *
+ * @param left 左侧路径.
+ * @param right 右侧路径.
+ * @returns 两条路径相同时返回 true.
+ */
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+/**
+ * 判断授权目录是否为盘符根目录或当前用户主目录.
+ *
+ * @param directory 待授权目录.
+ * @returns 目录范围过宽时返回 true.
+ */
+function isBroadAuthorizationRoot(directory: string): boolean {
+  const normalized = resolve(directory);
+  return samePath(normalized, parsePath(normalized).root) || samePath(normalized, homedir());
+}
+
+/**
  * 注册 Pi 微信会话枢纽的本地管理命令。
  *
  * @param pi Pi 扩展 API。
@@ -147,91 +169,6 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
   const store = createDefaultConfigurationStore();
   const projectService = new ProjectService(store);
   registerUiWorkerBridgeHooks(pi, projectService, getManagerDataDirectory());
-
-
-  pi.registerCommand("projects", {
-    description: "查看和管理 Pi 微信会话枢纽的项目 alias",
-    handler: async (args, ctx) => {
-      try {
-        const command = parseProjectCommand(args);
-        if (command.action === "list") {
-          const { config, projects } = await projectService.list();
-          const lines = projects.length === 0
-            ? [
-                "尚无已登记项目。",
-                config.allowedProjectRoots.length === 0
-                  ? "请先在配置文件中设置 allowedProjectRoots。"
-                  : "可使用 /projects add 登记项目。",
-              ]
-            : [
-                "已登记项目:",
-                ...projects.map(([alias, project]) => {
-                  const defaultMark = config.defaultProject === alias ? " (默认)" : "";
-                  return `${alias}${defaultMark}: ${project.displayName} - ${project.path}`;
-                }),
-              ];
-          ctx.ui.notify(lines.join("\n"), "info");
-          return;
-        }
-
-        if (command.action === "add") {
-          const project = await projectService.add(
-            command.alias,
-            command.displayName,
-            command.path,
-          );
-          ctx.ui.notify(
-            `项目已登记: ${command.alias} - ${project.displayName}`,
-            "info",
-          );
-          return;
-        }
-
-        if (command.action === "remove") {
-          await projectService.remove(command.alias);
-          ctx.ui.notify(`已移除项目登记: ${command.alias}; 项目目录未删除。`, "info");
-          return;
-        }
-
-        await projectService.setDefault(command.alias);
-        ctx.ui.notify(`默认项目已设置为: ${command.alias}`, "info");
-      } catch (error) {
-        ctx.ui.notify(toUserMessage(error), "error");
-      }
-    },
-  });
-
-  pi.registerCommand("status", {
-    description: "查看 Pi 微信会话枢纽状态",
-    handler: async (_args, ctx) => {
-      try {
-        const snapshot = await store.load();
-        const serviceStatus = await createGatewayServiceController().status();
-        const projectCount = Object.keys(snapshot.config.projects).length;
-        const defaultProject = snapshot.config.defaultProject ?? "未设置";
-        ctx.ui.notify(
-          [
-            "Pi 微信会话枢纽状态:",
-            formatGatewayServiceStatus(serviceStatus, snapshot.config.autoStartOnWindowsLogon),
-            `配置: ${snapshot.exists ? "已加载" : "尚未创建"}`,
-            `项目 alias: ${projectCount}`,
-            `默认项目: ${defaultProject}`,
-          ].join("\n"),
-          "info",
-        );
-      } catch (error) {
-        ctx.ui.notify(toUserMessage(error), "error");
-      }
-    },
-  });
-
-  pi.registerCommand("help", {
-    description: "查看 Pi 微信会话枢纽命令帮助",
-    handler: async (_args, ctx) => {
-      ctx.ui.notify(HELP_TEXT, "info");
-    },
-  });
-
   const handleWechatManagerCommand = async (
     args: string,
     ctx: ExtensionCommandContext,
@@ -247,11 +184,13 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
           "login | 微信扫码授权",
           "start | 启动后台连接",
           "status | 查看连接状态",
+          "projects | 查看已识别项目",
+          "roots | 查看授权根目录",
           "stop | 确认后停止连接",
           "restart | 重启后台连接",
           "autostart on | 登录 Windows 后自动连接",
           "autostart off | 关闭登录后自动连接",
-          "help | 查看帮助",
+          "help | 查看命令说明",
         ]);
         if (!selected) {
           return;
@@ -262,6 +201,86 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
       const command = parseWechatManagerCommand(commandArguments);
       if (command.action === "help") {
         ctx.ui.notify(HELP_TEXT, "info");
+        return;
+      }
+      if (command.action === "projects") {
+        const projectCommand = command.command;
+        if (projectCommand.action === "list") {
+          const { config, projects } = await projectService.list();
+          const lines = projects.length === 0
+            ? ["当前暂无项目记录. 在授权目录中打开 Pi session 后会自动识别项目."]
+            : [
+                "已识别项目:",
+                ...projects.map(([alias, project]) => {
+                  const defaultMark = config.defaultProject === alias ? " (默认)" : "";
+                  return `${alias}${defaultMark}: ${project.displayName} - ${project.path}`;
+                }),
+              ];
+          ctx.ui.notify(lines.join("\n"), "info");
+          return;
+        }
+        if (projectCommand.action === "add") {
+          const project = await projectService.add(
+            projectCommand.alias,
+            projectCommand.displayName,
+            projectCommand.path,
+          );
+          ctx.ui.notify(`项目已登记: ${projectCommand.alias} - ${project.displayName}`, "info");
+          return;
+        }
+        if (projectCommand.action === "remove") {
+          await projectService.remove(projectCommand.alias);
+          ctx.ui.notify(`已移除项目登记: ${projectCommand.alias}; 项目目录未删除.`, "info");
+          return;
+        }
+        await projectService.setDefault(projectCommand.alias);
+        ctx.ui.notify(`默认项目已设置为: ${projectCommand.alias}`, "info");
+        return;
+      }
+      if (command.action === "roots") {
+        if (ctx.mode !== "tui") {
+          ctx.ui.notify("授权根目录只能在本机 Pi TUI 中管理.", "error");
+          return;
+        }
+        if (command.operation === "list") {
+          const { config } = await projectService.list();
+          ctx.ui.notify(
+            config.allowedProjectRoots.length === 0
+              ? "尚未设置授权根目录. 首次执行 /wx start 会授权当前目录."
+              : ["Hub 授权根目录:", ...config.allowedProjectRoots].join("\n"),
+            "info",
+          );
+          return;
+        }
+        const currentCwd = ctx.sessionManager.getCwd();
+        const requestedRoot = command.operation === "add-current" ? currentCwd : command.path!;
+        if (isBroadAuthorizationRoot(requestedRoot)) {
+          const confirmed = await ctx.ui.confirm(
+            "确认较宽的 Hub 授权范围",
+            `授权根目录 ${requestedRoot} 会允许其下所有 Pi session 接入 Hub. 是否继续?`,
+          );
+          if (!confirmed) {
+            ctx.ui.notify("已取消授权根目录添加.", "info");
+            return;
+          }
+        }
+        const canonicalRoot = await projectService.addAllowedRoot(requestedRoot);
+        let currentSessionAttached = false;
+        try {
+          await projectService.ensureProjectForCwd(currentCwd);
+          await attachCurrentUiWorkerSession(pi, ctx);
+          currentSessionAttached = true;
+        } catch (error) {
+          if (!(error instanceof ProjectServiceError && error.code === "project_path_denied")) {
+            throw error;
+          }
+        }
+        ctx.ui.notify(
+          currentSessionAttached
+            ? `授权根已添加: ${canonicalRoot}\n当前 Pi session 已接入 Hub.`
+            : `授权根已添加: ${canonicalRoot}\n当前 session 不在该授权范围内; 它会在授权范围内启动后自动接入.`,
+          "info",
+        );
         return;
       }
       if (command.action === "login") {
@@ -324,12 +343,69 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
       if (command.action === "status") {
         const snapshot = await store.load();
         const status = await serviceController.status();
-        ctx.ui.notify(formatGatewayServiceStatus(status, snapshot.config.autoStartOnWindowsLogon), "info");
+        ctx.ui.notify(
+          [
+            formatGatewayServiceStatus(status, snapshot.config.autoStartOnWindowsLogon),
+            `配置: ${snapshot.exists ? "已加载" : "尚未创建"}`,
+            `授权根目录: ${snapshot.config.allowedProjectRoots.length}`,
+            `项目: ${Object.keys(snapshot.config.projects).length}`,
+            `默认项目: ${snapshot.config.defaultProject ?? "未设置"}`,
+          ].join("\n"),
+          "info",
+        );
         return;
       }
       if (command.action === "start") {
+        let initializedProject: { rootAdded: boolean; alias: string; project: { displayName: string; path: string } } | undefined;
+        let initializationNotice: string | undefined;
+        if (ctx.mode === "tui") {
+          const currentCwd = ctx.sessionManager.getCwd();
+          const { config } = await store.load();
+          if (config.allowedProjectRoots.length === 0 && isBroadAuthorizationRoot(currentCwd)) {
+            const confirmed = await ctx.ui.confirm(
+              "确认 Hub 首次授权范围",
+              `首次启动将授权当前目录 ${currentCwd} 及其所有子目录. 是否继续?`,
+            );
+            if (!confirmed) {
+              initializationNotice = "未授权当前目录; 后台连接仍可启动, 但当前 session 不会接入 Hub.";
+            }
+          }
+          if (!initializationNotice) {
+            if (config.allowedProjectRoots.length === 0) {
+              initializedProject = await projectService.initializeFromCurrentCwd(currentCwd);
+            } else {
+              try {
+                initializedProject = {
+                  rootAdded: false,
+                  ...await projectService.ensureProjectForCwd(currentCwd),
+                };
+              } catch (error) {
+                if (!(error instanceof ProjectServiceError && error.code === "project_path_denied")) {
+                  throw error;
+                }
+                initializationNotice = "当前目录不在 Hub 授权根内; 后台连接仍可启动, 可执行 /wx roots add-current 授权当前目录.";
+              }
+            }
+          }
+        }
         const status = await serviceController.start();
-        ctx.ui.notify(`后台微信连接: ${status.state === "online" ? "已连接" : "启动中"}.`, "info");
+        if (initializedProject && ctx.mode === "tui") {
+          try {
+            await attachCurrentUiWorkerSession(pi, ctx);
+          } catch (error) {
+            initializationNotice = `后台连接已启动, 但当前 session 尚未接入 Hub: ${toUserMessage(error)}`;
+          }
+        }
+        const notices = [
+          `后台微信连接: ${status.state === "online" ? "已连接" : "启动中"}.`,
+          ...(initializedProject?.rootAdded
+            ? [`首次启动已授权当前目录及其子目录: ${initializedProject.project.path}`]
+            : initializedProject
+              ? [`当前项目已接入 Hub: ${initializedProject.project.displayName}`]
+              : []),
+          ...(initializationNotice ? [initializationNotice] : []),
+        ];
+        ctx.ui.notify(notices.join("\n"), "info");
         return;
       }
       if (command.action === "stop") {
@@ -382,7 +458,6 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
 
 function toUserMessage(error: unknown): string {
   if (
-    error instanceof ProjectCommandParseError ||
     error instanceof ProjectServiceError ||
     error instanceof ConfigurationBusyError ||
     error instanceof ConfigurationValidationError ||
