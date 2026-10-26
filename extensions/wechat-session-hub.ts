@@ -134,6 +134,44 @@ function formatGatewayServiceStatus(
 }
 
 /**
+ * 格式化 start、stop、restart 完成后的最终提示.
+ *
+ * @param action 当前 Gateway 生命周期操作.
+ * @param status 后台 Gateway 返回的最终状态.
+ * @returns 用户可直接理解的提示文字和通知级别.
+ */
+function formatGatewayLifecycleResult(
+  action: "start" | "stop" | "restart",
+  status: GatewayServiceStatus,
+): { message: string; level: "info" | "warning" | "error" } {
+  if (status.state === "online") {
+    if (action === "stop") {
+      return { message: "后台微信连接仍在线, 未确认停止。", level: "warning" };
+    }
+    const message = action === "restart"
+      ? "后台微信连接已恢复并就绪。"
+      : "后台微信连接已启动并就绪。";
+    return { message, level: "info" };
+  }
+  if (status.state === "auth_required") {
+    return {
+      message: "后台服务已启动, 但微信授权需要重新登录; 请执行 /wx login。",
+      level: "warning",
+    };
+  }
+  if (status.state === "offline") {
+    return action === "stop"
+      ? { message: "后台微信连接已停止。", level: "info" }
+      : { message: "后台微信连接未启动; 请执行 /wx status 检查状态。", level: "error" };
+  }
+  const stateText = status.state === "starting" ? "仍在启动" : "仍在停止";
+  return {
+    message: `后台微信连接${stateText}; 请执行 /wx status 查看当前状态。`,
+    level: "warning",
+  };
+}
+
+/**
  * 比较路径, 在 Windows 上忽略大小写.
  *
  * @param left 左侧路径.
@@ -388,6 +426,7 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
             }
           }
         }
+        ctx.ui.notify("正在启动后台微信连接, 请稍候...", "info");
         const status = await serviceController.start();
         if (initializedProject && ctx.mode === "tui") {
           try {
@@ -396,8 +435,9 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
             initializationNotice = `后台连接已启动, 但当前 session 尚未接入 Hub: ${toUserMessage(error)}`;
           }
         }
+        const lifecycleNotice = formatGatewayLifecycleResult("start", status);
         const notices = [
-          `后台微信连接: ${status.state === "online" ? "已连接" : "启动中"}.`,
+          lifecycleNotice.message,
           ...(initializedProject?.rootAdded
             ? [`首次启动已授权当前目录及其子目录: ${initializedProject.project.path}`]
             : initializedProject
@@ -405,7 +445,7 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
               : []),
           ...(initializationNotice ? [initializationNotice] : []),
         ];
-        ctx.ui.notify(notices.join("\n"), "info");
+        ctx.ui.notify(notices.join("\n"), lifecycleNotice.level);
         return;
       }
       if (command.action === "stop") {
@@ -426,13 +466,17 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
           ctx.ui.notify("已取消停止, 后台微信连接保持运行。", "info");
           return;
         }
+        ctx.ui.notify("正在停止后台微信连接, 等待当前任务收尾...", "info");
         const status = await serviceController.stop();
-        ctx.ui.notify(`后台微信连接: ${status.state === "offline" ? "已停止" : "正在停止"}.`, "info");
+        const lifecycleNotice = formatGatewayLifecycleResult("stop", status);
+        ctx.ui.notify(lifecycleNotice.message, lifecycleNotice.level);
         return;
       }
       if (command.action === "restart") {
+        ctx.ui.notify("正在重启后台微信连接, 等待新服务就绪...", "info");
         const status = await serviceController.restart();
-        ctx.ui.notify(`后台微信连接: ${status.state === "online" ? "已连接" : "正在重启"}.`, "info");
+        const lifecycleNotice = formatGatewayLifecycleResult("restart", status);
+        ctx.ui.notify(lifecycleNotice.message, lifecycleNotice.level);
         return;
       }
       if (command.action === "autostart") {
@@ -457,6 +501,9 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
 }
 
 function toUserMessage(error: unknown): string {
+  if (error instanceof GatewayControlError && error.code === "timeout") {
+    return "后台操作尚未确认完成; 请执行 /wx status 查看当前状态。";
+  }
   if (
     error instanceof ProjectServiceError ||
     error instanceof ConfigurationBusyError ||

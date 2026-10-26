@@ -1,15 +1,26 @@
+import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { ConfigurationStore } from "../config/store.ts";
 import { ManagerRegistry } from "../registry/manager-registry.ts";
 import { ProjectService } from "../projects/project-service.ts";
 import { GatewayRuntime } from "../gateway/gateway-runtime.ts";
-import { GatewayControlServer, type GatewayControlAction } from "../gateway/gateway-control-ipc.ts";
+import {
+  GatewayControlClient,
+  GatewayControlError,
+  GatewayControlServer,
+  type GatewayControlAction,
+} from "../gateway/gateway-control-ipc.ts";
 import {
   decodeGatewayDaemonLaunchSpec,
   launchDetachedGatewayDaemon,
   type GatewayDaemonLaunchSpec,
   type GatewayServiceState,
+  type GatewayServiceStatus,
 } from "./gateway-service-controller.ts";
+import {
+  completePendingGatewayLifecycleOperations,
+  writeGatewayLifecycleOperationReceipt,
+} from "./gateway-lifecycle-operation.ts";
 
 interface GatewayDaemonProcessChannel {
   send?: (message: unknown, callback?: (error: Error | null) => void) => boolean;
@@ -40,39 +51,9 @@ export async function runGatewayDaemon(): Promise<void> {
   let runtime: GatewayRuntime | undefined;
   let controlServer: GatewayControlServer | undefined;
   let registry: ManagerRegistry | undefined;
-  let shutdownTask: Promise<void> | undefined;
-  let restartRequested = false;
+  let restartOperationId: string | undefined;
+  let restartTask: Promise<void> | undefined;
   let readySent = false;
-
-  const beginShutdown = (restart: boolean): void => {
-    restartRequested = restartRequested || restart;
-    if (shutdownTask) {
-      return;
-    }
-    serviceState = "stopping";
-    shutdownTask = (async () => {
-      try {
-        const currentRuntime = runtime ?? await runtimeStart;
-        await currentRuntime?.stop();
-      } catch {
-        serviceState = runtime ? toGatewayServiceState(runtime.status) : "starting";
-        shutdownTask = undefined;
-        return;
-      }
-      await controlServer?.close();
-      controlServer = undefined;
-      if (restartRequested) {
-        try {
-          await launchDetachedGatewayDaemon(launchSpec);
-        } catch {
-          process.exitCode = 1;
-        }
-      }
-    })();
-    void shutdownTask.catch(() => {
-      process.exitCode = 1;
-    });
-  };
 
   runtimeStart = GatewayRuntime.start({
     dataDirectory: managerDirectory,
@@ -84,7 +65,19 @@ export async function runGatewayDaemon(): Promise<void> {
     onControlReady: async (lease, gatewayRegistry) => {
       registry = gatewayRegistry;
       controlServer = new GatewayControlServer(managerDirectory, lease, {
-        handleAction: async (action) => handleControlAction(action),
+        handleAction: async (action, operationId) => handleControlAction(action, operationId),
+        afterActionResponse: async (action, operationId) => {
+          if (action === "stop" && serviceState === "offline") {
+            const currentControlServer = controlServer;
+            controlServer = undefined;
+            await currentControlServer?.close();
+          } else if (action === "restart") {
+            const currentOperationId = operationId ?? restartOperationId;
+            if (currentOperationId) {
+              await beginRestart(currentOperationId);
+            }
+          }
+        },
       });
       await controlServer.listen();
     },
@@ -92,22 +85,22 @@ export async function runGatewayDaemon(): Promise<void> {
 
   try {
     runtime = await runtimeStart;
-    if (shutdownTask) {
-      serviceState = "stopping";
-    } else {
-      serviceState = toGatewayServiceState(runtime.status);
-    }
+    serviceState = toGatewayServiceState(runtime.status);
     runtime.on("status_change", (state: string) => {
-      serviceState = shutdownTask ? "stopping" : toGatewayServiceState(state);
+      serviceState = toGatewayServiceState(state);
     });
-    if (shutdownTask) {
-      beginShutdown(false);
-    } else {
-      serviceState = toGatewayServiceState(runtime.status);
-      readySent = true;
-      notifyParent({ kind: "ready" });
-    }
+    await completePendingGatewayLifecycleOperations(managerDirectory, {
+      state: serviceState,
+      pid: process.pid,
+    }).catch(() => undefined);
+    readySent = true;
+    notifyParent({ kind: "ready" });
   } catch (error) {
+    await completePendingGatewayLifecycleOperations(
+      managerDirectory,
+      { state: "offline" },
+      toSafeStartupMessage(error),
+    ).catch(() => undefined);
     if (!readySent) {
       notifyParent({ kind: "failed", message: toSafeStartupMessage(error) });
     }
@@ -116,12 +109,97 @@ export async function runGatewayDaemon(): Promise<void> {
     process.exitCode = 1;
   }
 
-  async function handleControlAction(action: GatewayControlAction): Promise<unknown> {
-    if (action === "stop" || action === "restart") {
-      beginShutdown(action === "restart");
-      return buildStatus("stopping");
+  async function handleControlAction(
+    action: GatewayControlAction,
+    operationId?: string,
+  ): Promise<unknown> {
+    if (action === "stop") {
+      if (restartOperationId || serviceState === "stopping") {
+        throw new GatewayControlError("request_failed", "后台 Gateway 正在执行其他生命周期操作, 请稍后重试。");
+      }
+      serviceState = "stopping";
+      const currentRuntime = runtime ?? await runtimeStart;
+      try {
+        await currentRuntime?.stop();
+      } catch {
+        serviceState = currentRuntime ? toGatewayServiceState(currentRuntime.status) : "offline";
+        throw new GatewayControlError(
+          "request_failed",
+          "后台 Gateway 未能安全停止; 请执行 /wx status 查看当前状态。",
+        );
+      }
+      runtime = undefined;
+      serviceState = "offline";
+      return { state: "offline" };
+    }
+    if (action === "restart") {
+      if (restartOperationId || serviceState === "stopping") {
+        throw new GatewayControlError("request_failed", "后台 Gateway 正在执行其他生命周期操作, 请稍后重试。");
+      }
+      const currentOperationId = operationId ?? randomUUID();
+      if (!operationId) {
+        await writeGatewayLifecycleOperationReceipt(managerDirectory, {
+          action: "restart",
+          operationId: currentOperationId,
+          state: "pending",
+        });
+      }
+      restartOperationId = currentOperationId;
+      serviceState = "stopping";
+      return { state: "stopping", operationId: currentOperationId };
+    }
+    if (serviceState === "stopping" || serviceState === "offline") {
+      return { state: serviceState, pid: process.pid };
     }
     return buildStatus(serviceState);
+  }
+
+  async function beginRestart(operationId: string): Promise<void> {
+    if (restartTask) {
+      return restartTask;
+    }
+    restartTask = (async () => {
+      let oldControlServerClosed = false;
+      try {
+        const currentRuntime = runtime ?? await runtimeStart;
+        await currentRuntime?.stop();
+        runtime = undefined;
+        serviceState = "offline";
+        const currentControlServer = controlServer;
+        controlServer = undefined;
+        await currentControlServer?.close();
+        oldControlServerClosed = true;
+        await launchDetachedGatewayDaemon(launchSpec);
+        const serviceStatus = await new GatewayControlClient(managerDirectory).request("status") as GatewayServiceStatus;
+        serviceState = serviceStatus.state;
+        await completePendingGatewayLifecycleOperations(
+          managerDirectory,
+          serviceStatus,
+          undefined,
+          operationId,
+        );
+      } catch (error) {
+        const message = error instanceof GatewayControlError
+          ? error.message
+          : "后台 Gateway 重启失败; 请执行 /wx status 查看当前状态。";
+        const serviceStatus: GatewayServiceStatus = oldControlServerClosed
+          ? { state: "offline" }
+          : { state: serviceState };
+        await completePendingGatewayLifecycleOperations(
+          managerDirectory,
+          serviceStatus,
+          message,
+          operationId,
+        ).catch(() => undefined);
+        if (oldControlServerClosed) {
+          process.exitCode = 1;
+        }
+      } finally {
+        restartOperationId = undefined;
+        restartTask = undefined;
+      }
+    })();
+    return restartTask;
   }
 
   async function buildStatus(state: GatewayServiceState): Promise<Record<string, unknown>> {

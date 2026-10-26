@@ -1,6 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { PiCliInvocation } from "./pi-cli.ts";
 import { GatewayControlClient, GatewayControlError } from "../gateway/gateway-control-ipc.ts";
+import {
+  watchGatewayLifecycleOperation,
+  writeGatewayLifecycleOperationReceipt,
+} from "./gateway-lifecycle-operation.ts";
+
+const LIFECYCLE_RESPONSE_TIMEOUT_MS = 300000;
 
 export type GatewayServiceState = "offline" | "starting" | "online" | "auth_required" | "stopping";
 
@@ -96,7 +103,7 @@ export class GatewayServiceController {
   /**
    * 请求后台 Gateway 在安全停止窗口内优雅退出。
    *
-   * @returns 服务开始停止后的状态。
+   * @returns Gateway 停止并释放控制租约后的最终状态。
    * @throws {GatewayControlError} Gateway 离线或无法认证时抛出。
    */
   async stop(): Promise<GatewayServiceStatus> {
@@ -104,13 +111,15 @@ export class GatewayServiceController {
     if (current.state === "offline") {
       return current;
     }
-    return parseServiceStatus(await this.controlClient.request("stop"));
+    return parseServiceStatus(await this.controlClient.request("stop", {
+      responseTimeoutMs: LIFECYCLE_RESPONSE_TIMEOUT_MS,
+    }));
   }
 
   /**
-   * 请求后台 Gateway 安全停止并由 daemon 重新启动自身。
+   * 请求后台 Gateway 安全停止当前 daemon 并启动新 daemon, 等待新服务就绪。
    *
-   * @returns daemon 接受重启请求后的状态。
+   * @returns 新 Gateway 启动就绪后的最终状态。
    * @throws {GatewayControlError} Gateway 离线或无法认证时抛出。
    */
   async restart(): Promise<GatewayServiceStatus> {
@@ -118,7 +127,49 @@ export class GatewayServiceController {
     if (current.state === "offline") {
       return this.start();
     }
-    return parseServiceStatus(await this.controlClient.request("restart"));
+
+    const operationId = randomUUID();
+    const watcher = await watchGatewayLifecycleOperation(this.managerDirectory, operationId);
+    let operationAccepted = false;
+    let receiptRead = false;
+    try {
+      await writeGatewayLifecycleOperationReceipt(this.managerDirectory, {
+        action: "restart",
+        operationId,
+        state: "pending",
+      });
+      const accepted = await this.controlClient.request("restart", { operationId });
+      if (
+        !isRecord(accepted) ||
+        accepted.state !== "stopping" ||
+        (accepted.operationId !== undefined && accepted.operationId !== operationId)
+      ) {
+        throw new GatewayControlError("protocol_error", "后台 Gateway 未确认重启操作。 ");
+      }
+      operationAccepted = true;
+      const receipt = await watcher.wait(LIFECYCLE_RESPONSE_TIMEOUT_MS).catch((error: unknown) => {
+        throw new GatewayControlError(
+          "timeout",
+          error instanceof Error ? error.message : "等待后台 Gateway 重启结果超时。",
+        );
+      });
+      receiptRead = true;
+      if (receipt.state === "failed") {
+        throw new GatewayControlError(
+          "request_failed",
+          receipt.message ?? "后台 Gateway 重启失败; 请执行 /wx status 查看当前状态。",
+        );
+      }
+      if (!receipt.serviceStatus) {
+        throw new GatewayControlError("protocol_error", "后台 Gateway 重启结果缺少最终状态。 ");
+      }
+      return parseServiceStatus(receipt.serviceStatus);
+    } finally {
+      watcher.close();
+      if (receiptRead || !operationAccepted) {
+        await watcher.removeReceipt().catch(() => undefined);
+      }
+    }
   }
 }
 

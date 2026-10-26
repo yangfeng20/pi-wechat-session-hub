@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { GatewayControlServer } from "../src/gateway/gateway-control-ipc.ts";
 import { GatewayServiceController, launchDetachedGatewayDaemon } from "../src/runtime/gateway-service-controller.ts";
+import {
+  completePendingGatewayLifecycleOperations,
+  watchGatewayLifecycleOperation,
+  writeGatewayLifecycleOperationReceipt,
+} from "../src/runtime/gateway-lifecycle-operation.ts";
 import { GatewayLease } from "../src/registry/gateway-lease.ts";
 
 /**
@@ -15,6 +21,33 @@ import { GatewayLease } from "../src/registry/gateway-lease.ts";
 async function createTemporaryDirectory(): Promise<string> {
   return mkdtemp(join(tmpdir(), "pi-wechat-service-controller-"));
 }
+
+test("Gateway ready 事件完成 pending 重启通知, watcher 不轮询", async () => {
+  const directory = await createTemporaryDirectory();
+  const operationId = randomUUID();
+  const watcher = await watchGatewayLifecycleOperation(directory, operationId);
+  let completion: ReturnType<typeof watcher.wait> | undefined;
+
+  try {
+    await writeGatewayLifecycleOperationReceipt(directory, {
+      action: "restart",
+      operationId,
+      state: "pending",
+    });
+    completion = watcher.wait(5000);
+    await completePendingGatewayLifecycleOperations(directory, { state: "online", pid: process.pid });
+    const receipt = await completion;
+    assert.equal(receipt.operationId, operationId);
+    assert.equal(receipt.state, "completed");
+    assert.ok(receipt.serviceStatus);
+    assert.equal(receipt.serviceStatus.state, "online");
+  } finally {
+    watcher.close();
+    await completion?.catch(() => undefined);
+    await watcher.removeReceipt();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("detached daemon 在授权未完成时通过启动 IPC fail-closed", { timeout: 15000 }, async () => {
   const directory = await createTemporaryDirectory();
@@ -91,11 +124,40 @@ test("Gateway 离线时 start 只启动一次并等待控制通道 ready", async
   }
 });
 
-test("stop 和 restart 通过共享 Gateway 控制通道转发", async () => {
+test("stop 和 restart 等待 Gateway 返回生命周期终态", { timeout: 15000 }, async () => {
   const directory = await createTemporaryDirectory();
   const lease = await GatewayLease.acquire(directory);
-  const server = new GatewayControlServer(directory, lease, {
-    handleAction: async (action) => ({ action, state: action === "stop" ? "stopping" : "starting" }),
+  let notifyRestartStarted!: () => void;
+  let finishRestart!: () => void;
+  const restartStarted = new Promise<void>((resolveStarted) => {
+    notifyRestartStarted = resolveStarted;
+  });
+  const restartGate = new Promise<void>((resolveRestart) => {
+    finishRestart = resolveRestart;
+  });
+  let server!: GatewayControlServer;
+  server = new GatewayControlServer(directory, lease, {
+    handleAction: async (action, operationId) => {
+      if (action === "restart") {
+        notifyRestartStarted();
+        return { state: "stopping", operationId };
+      }
+      return { state: action === "stop" ? "offline" : "online" };
+    },
+    afterActionResponse: async (action, operationId) => {
+      if (action === "restart" && operationId) {
+        await restartGate;
+        await writeGatewayLifecycleOperationReceipt(directory, {
+          action: "restart",
+          operationId,
+          state: "completed",
+          serviceStatus: { state: "online" },
+        });
+      }
+      if (action === "stop") {
+        await server.close();
+      }
+    },
   });
   try {
     await server.listen();
@@ -105,8 +167,17 @@ test("stop 和 restart 通过共享 Gateway 控制通道转发", async () => {
       daemonEntry: join(directory, "daemon.ts"),
       piInvocation: { command: process.execPath, args: ["pi.js"] },
     });
-    assert.deepEqual(await controller.stop(), { action: "stop", state: "stopping" });
-    assert.deepEqual(await controller.restart(), { action: "restart", state: "starting" });
+    let restartFinished = false;
+    const restartTask = controller.restart().then((status) => {
+      restartFinished = true;
+      return status;
+    });
+    await restartStarted;
+    assert.equal(restartFinished, false);
+    finishRestart();
+    assert.deepEqual(await restartTask, { state: "online" });
+    assert.deepEqual(await controller.stop(), { state: "offline" });
+    assert.equal((await controller.status()).state, "offline");
   } finally {
     await server.close();
     await lease.release();

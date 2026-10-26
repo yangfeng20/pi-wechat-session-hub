@@ -54,12 +54,12 @@ pi --extension ./extensions/wechat-session-hub.ts
 | `/wx roots add <绝对路径>` | 在本地 TUI 授权一个工作区根目录 |
 | `/wx projects` | 查看自动识别和手动登记的项目 |
 | `/wx stop` | 弹出二次确认; 确认后停止接收新消息并安全收尾 |
-| `/wx restart` | 安全停止并重启 daemon; 服务已停止时启动服务 |
+| `/wx restart` | 安全重启后台 Gateway, 等待新服务就绪; 服务已停止时启动服务 |
 | `/wx autostart on` | 开启 Windows 当前用户登录后自动连接 |
 | `/wx autostart off` | 关闭并移除 Windows 登录任务 |
 | `/wx help` | 查看本机命令帮助 |
 
-停止时, daemon 先停止接收新微信消息, 再 drain 已入队 route 工作并等待正在处理的 Pi turn 收尾. 本机命令会立即返回“正在停止”, 可用 `/wx status` 查询进度. 如果 daemon 非正常退出, durable queue 会保留未完成项并阻断后续 FIFO, 需要显式 `/retry <message-id> --confirm`.
+停止时, Gateway 先停止接收新微信消息, 再 drain 已入队 route 工作并等待正在处理的 Pi turn 收尾. `/wx stop` 在后台收尾期间提示“正在停止”, 完成后再通知最终状态. `/wx restart` 会安全停止旧后台进程并启动新进程, 等待新服务就绪或报告失败; 它不会启动新旧并行 poller. 如果 daemon 非正常退出, durable queue 会保留未完成项并阻断后续 FIFO, 需要显式 `/retry <message-id> --confirm`.
 
 Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使用已保存授权连接. 它不在 Windows 登录桌面前运行, 也不会在启动时弹出扫码窗口. 如果尚未完成微信授权或授权失效, 需要先在 Pi TUI 执行 `/wx login`.
 

@@ -8,7 +8,21 @@ import type { GatewayLease } from "../registry/gateway-lease.ts";
 export type GatewayControlAction = "status" | "stop" | "restart";
 
 export interface GatewayControlHandlers {
-  handleAction(action: GatewayControlAction): Promise<unknown>;
+  /**
+   * 执行一个固定控制动作并返回其结果.
+   *
+   * @param action Gateway 控制动作.
+   * @returns 动作结果.
+   */
+  handleAction(action: GatewayControlAction, operationId?: string): Promise<unknown>;
+  /**
+   * 在控制结果已发出并关闭当前请求连接后执行生命周期收尾.
+   *
+   * @param action 已完成的控制动作.
+   * @param operationId restart 动作的完成关联 ID.
+   * @returns 收尾完成后正常结束.
+   */
+  afterActionResponse?(action: GatewayControlAction, operationId?: string): Promise<void>;
 }
 
 interface GatewayLeaseCredential {
@@ -141,6 +155,8 @@ export class GatewayControlServer {
    */
   private async handleConnection(socket: Socket): Promise<void> {
     const peer = new GatewayControlPeer(socket);
+    let completedAction: GatewayControlAction | undefined;
+    let completedOperationId: string | undefined;
     try {
       const nonce = randomBytes(32).toString("base64url");
       peer.send({ kind: "challenge", nonce });
@@ -150,6 +166,14 @@ export class GatewayControlServer {
       }
       const requestId = typeof request.requestId === "string" ? request.requestId : "";
       const action = parseAction(request.action);
+      const operationId = typeof request.operationId === "string" ? request.operationId : undefined;
+      const operationProof = typeof request.operationProof === "string" ? request.operationProof : undefined;
+      if (
+        (operationId !== undefined && (!isOperationId(operationId) || action !== "restart" || !operationProof)) ||
+        (operationId === undefined && operationProof !== undefined)
+      ) {
+        throw new GatewayControlError("protocol_error", "Gateway 控制请求 operationId 字段无效。");
+      }
       const proof = typeof request.proof === "string" ? request.proof : "";
       if (!/^[a-f0-9-]{36}$/i.test(requestId) || !proof) {
         throw new GatewayControlError("protocol_error", "控制请求缺少有效身份字段。");
@@ -157,10 +181,22 @@ export class GatewayControlServer {
       await this.lease.assertOwned();
       const credential = await readGatewayLeaseCredential(this.managerDirectory);
       await this.lease.assertOwned();
-      if (!verifyProof(credential.token, nonce, requestId, action, proof)) {
+      if (
+        !verifyProof(credential.token, nonce, requestId, action, proof) ||
+        (operationId !== undefined && !verifyOperationProof(
+          credential.token,
+          nonce,
+          requestId,
+          action,
+          operationId,
+          operationProof!,
+        ))
+      ) {
         throw new GatewayControlError("authentication_failed", "后台控制客户端身份校验失败。");
       }
-      const result = await this.handlers.handleAction(action);
+      const result = await this.handlers.handleAction(action, operationId);
+      completedAction = action;
+      completedOperationId = operationId;
       peer.send({ kind: "response", requestId, ok: true, result });
     } catch (error) {
       const message = error instanceof GatewayControlError
@@ -169,6 +205,9 @@ export class GatewayControlServer {
       peer.send({ kind: "response", requestId: "", ok: false, message });
     } finally {
       peer.close();
+      if (completedAction) {
+        await Promise.resolve(this.handlers.afterActionResponse?.(completedAction, completedOperationId)).catch(() => undefined);
+      }
     }
   }
 
@@ -225,10 +264,19 @@ export class GatewayControlClient {
    * 向已运行 Gateway 发送状态、停止或重启请求。
    *
    * @param action 固定控制动作。
+   * @param options 可选操作 ID 和响应等待时限。
    * @returns Gateway 返回的数据。
    * @throws {GatewayControlError} Gateway 离线、认证失败或响应无效时抛出。
    */
-  async request(action: GatewayControlAction): Promise<unknown> {
+  async request(
+    action: GatewayControlAction,
+    options: { operationId?: string; responseTimeoutMs?: number } = {},
+  ): Promise<unknown> {
+    const operationId = options.operationId;
+    const responseTimeoutMs = options.responseTimeoutMs ?? this.timeoutMs;
+    if (operationId !== undefined && (!isOperationId(operationId) || action !== "restart")) {
+      throw new GatewayControlError("protocol_error", "Gateway 控制请求 operationId 字段无效。");
+    }
     const credential = await readGatewayLeaseCredential(this.managerDirectory).catch((error: unknown) => {
       throw error instanceof GatewayControlError
         ? error
@@ -246,9 +294,15 @@ export class GatewayControlClient {
         kind: "request",
         requestId,
         action,
+        ...(operationId
+          ? {
+              operationId,
+              operationProof: createOperationProof(credential.token, challenge.nonce, requestId, action, operationId),
+            }
+          : {}),
         proof: createProof(credential.token, challenge.nonce, requestId, action),
       });
-      const response = await peer.nextMessage(this.timeoutMs);
+      const response = await peer.nextMessage(responseTimeoutMs);
       if (
         !isRecord(response) ||
         response.kind !== "response" ||
@@ -367,6 +421,65 @@ function verifyProof(
   const expected = Buffer.from(createProof(token, nonce, requestId, action), "base64url");
   const actual = Buffer.from(proof, "base64url");
   return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+/**
+ * 为 restart 操作 ID 生成兼容旧 control client 的附加 HMAC.
+ *
+ * @param token Gateway lease 随机令牌.
+ * @param nonce 服务端随机 challenge.
+ * @param requestId 本次 request UUID.
+ * @param action Gateway 控制动作.
+ * @param operationId restart 操作 ID.
+ * @returns 绑定 operationId 的 base64url HMAC.
+ */
+function createOperationProof(
+  token: string,
+  nonce: string,
+  requestId: string,
+  action: GatewayControlAction,
+  operationId: string,
+): string {
+  return createHmac("sha256", token)
+    .update(`${nonce}\n${JSON.stringify({ requestId, action, operationId })}`, "utf8")
+    .digest("base64url");
+}
+
+/**
+ * 校验 restart 操作 ID 的附加 HMAC.
+ *
+ * @param token Gateway lease 随机令牌.
+ * @param nonce 服务端随机 challenge.
+ * @param requestId 本次 request UUID.
+ * @param action Gateway 控制动作.
+ * @param operationId restart 操作 ID.
+ * @param proof 客户端提供的附加 proof.
+ * @returns proof 有效时返回 true.
+ */
+function verifyOperationProof(
+  token: string,
+  nonce: string,
+  requestId: string,
+  action: GatewayControlAction,
+  operationId: string,
+  proof: string,
+): boolean {
+  const expected = Buffer.from(
+    createOperationProof(token, nonce, requestId, action, operationId),
+    "base64url",
+  );
+  const actual = Buffer.from(proof, "base64url");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+/**
+ * 判断值是否为本次 Gateway 生命周期操作的 UUID.
+ *
+ * @param value 待校验 ID.
+ * @returns UUID 格式有效时返回 true.
+ */
+function isOperationId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 /**

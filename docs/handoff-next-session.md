@@ -11,7 +11,7 @@
   - `2f7d7c8 feat: 恢复会话后回显最近回复`.
   - `de9b13c fix: 优化微信帮助命令换行`.
 - 上述提交均为本地提交, 尚未 push.
-- 本交接文档已提交; 当前工作区包含尚未提交的微信命令回复可读性优化.
+- 本交接文档已提交; 当前工作区包含尚未提交的微信命令回复可读性和 Gateway 生命周期完成通知优化.
 
 ## 产品目标与重要约束
 
@@ -91,19 +91,22 @@ Gateway 是常驻 daemon, 已运行进程不会自动加载磁盘上的新代码
 - 微信 `/help` 按会话、项目、Hub 状态分组并缩短长语法行.
 - 微信 `/status` 使用中文状态摘要, 不暴露 PID 或内部技术字段.
 - 空闲会话 `/resume` 回复最多 800 个 Unicode 字符的最近回复预览, 超长时显示开头并说明完整内容仍在 transcript.
+- `/wx start`、`/wx stop`、`/wx restart` 先显示进度, 完成后再通知最终状态. `/wx stop` 的控制请求等待 runtime 安全收尾; `/wx restart` 通过 operationId 和 lifecycle receipt 等待新 daemon ready, Pi 端用本地文件事件唤醒, 不循环轮询网络.
+- `tests/gateway-service-controller.test.ts` 覆盖异步 lifecycle receipt 和 final status; `tests/wechat-session-hub-command.test.ts` 覆盖 restart 进度与完成通知.
 - `tests/gateway-command-router.test.ts` 增加会话卡片、稳定索引、当前 route 标记、分页、状态摘要、帮助分组和恢复预览截断回归测试.
 
 **文档不一致提醒:** README 配置说明中仍有旧句子称微信 `/new` 固定创建后台会话; 实现现在支持显式 `--mode ui`. 后续可顺手修正文案.
 
 ## 验证状态
 
-最近一次完整验证, 在本机 Pi 开发依赖 `0.85.1` 下:
+最近一次验证, 在本机 Pi 开发依赖 `0.85.1` 下:
 
 - `npm run typecheck`: 通过.
-- `npm test`: 90 项, 89 pass, 1 项条件 Windows ACL 测试 skip.
-- `git diff --check`: 通过, 有 Windows CRLF 转换提示.
+- `npm test`: 92 项, 91 pass, 1 项条件 Windows ACL 测试 skip.
+- `git diff --check`: 通过.
+- Gateway restart 的完成通知通过隔离控制 IPC、异步 lifecycle receipt 和 fake TUI notification 测试; 未对真实微信连接执行 `/wx restart`.
 
-Pi `0.85.1`、`1.0.0`、`1.3.0` 完整兼容矩阵在较早的实现阶段已跑通; 最近的微信回复格式优化目前只在 `0.85.1` 完整验证, 尚未重新跑全部版本矩阵. Windows ACL 专项测试在较早验证时通过. 最近一次 `npm audit --omit=dev` 遇 npm registry `503`; 依赖锁文件未变, 但该次未完成新审计.
+Pi `0.85.1`、`1.0.0`、`1.3.0` 完整兼容矩阵在较早的实现阶段已跑通; 最近的微信回复和生命周期通知优化只在 `0.85.1` 完整验证, 尚未重新跑全部版本矩阵. Windows ACL 专项测试在较早验证时通过. 最近一次 `npm audit --omit=dev` 遇 npm registry `503`; 依赖锁文件未变, 但该次未完成新审计.
 
 ## 建议下一会话优先确认
 

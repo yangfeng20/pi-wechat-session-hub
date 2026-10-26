@@ -53,13 +53,13 @@ Daemon 在 Gateway runtime 初始化时取得 `GatewayLease`, 启动 UI owner IP
 
 ### 3.2 状态与控制
 
-control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `manager.lock` 中的 lease token 完成 HMAC challenge-response. 只接受 `status`、`stop`、`restart` 固定动作, 不接受路径、命令或任意数据.
+control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `manager.lock` 中的 lease token 完成 HMAC challenge-response. 只接受 `status`、`stop`、`restart` 固定动作; `restart` 可携带经过 UUID 校验并由附加 HMAC 保护的操作 ID, 不接受路径、命令或任意数据.
 
 `status` 通过活跃 IPC 和 Gateway runtime 快照读取在线状态、PID、前台/后台 owner 数和 route 数. 仅有 `gateway.json` 的旧状态不视为在线.
 
-`stop` 收到确认后立即返回 `stopping` 状态, daemon 停止新 poll, 收尾当前已入队工作, 关闭 background workers, 断开 UI IPC 并释放 lease. 队列仍是 durable; Gateway 停止期间不会接收新消息. 若 worker 无法安全停止, lease 保留, 状态保持可诊断, 避免启动第二个 owner.
+`stop` 收到确认后显示“正在停止”, 并等待 daemon 停止新 poll、收尾当前已入队工作、关闭 background workers、断开 UI IPC 并释放 lease 后返回 `offline` 终态. 队列仍是 durable; Gateway 停止期间不会接收新消息. 若 worker 无法安全停止, lease 保留, 状态保持可诊断, 避免启动第二个 owner.
 
-`restart` 由 daemon 完成停止、释放 lease、关闭旧 control endpoint 后再 detached 启动新 daemon. 先释放 lease, 再启动新进程, 避免新旧 poller 重叠. 服务已经离线时, `restart` 等同于 `start`.
+`restart` 会先通过 control IPC 确认生命周期操作并返回操作 ID; 当前 daemon 安全停止 Gateway runtime, 释放 lease 并关闭旧 control endpoint, 再 detached 启动新 daemon. 新 daemon 就绪后写入操作结果, Pi TUI 通过本地文件系统事件等待最终状态, 不循环轮询网络或服务状态. 服务已经离线时, `restart` 等同于 `start`.
 
 ## 4. 前台/后台 owner 交接
 

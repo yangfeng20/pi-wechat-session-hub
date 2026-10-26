@@ -165,6 +165,12 @@ test("Gateway runtime 启停 poller, 持久化状态并释放 lease", async () =
     assert.equal(runtime.status, "stopped");
     await assert.rejects(readFile(join(fixture.managerDirectory, "manager.lock")), { code: "ENOENT" });
     await assert.rejects(readFile(join(fixture.managerDirectory, "gateway.json")), { code: "ENOENT" });
+
+    const restartedRuntime = await GatewayRuntime.start(runtimeOptions(fixture, fetcher));
+    assert.equal(restartedRuntime.status, "online");
+    await restartedRuntime.stop();
+    assert.equal(restartedRuntime.status, "stopped");
+    await assert.rejects(readFile(join(fixture.managerDirectory, "manager.lock")), { code: "ENOENT" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
