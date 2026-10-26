@@ -63,7 +63,7 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 
 ## 4. 前台/后台 owner 交接
 
-每个可见 Pi TUI 在 `session_start` 后尝试连接 Gateway UI IPC. `allowedProjectRoots` 负责安全授权; cwd 位于授权根时, extension 按 cwd 文件夹名自动建立或复用项目记录, 不要求预先逐个添加 alias. cwd 超出授权范围时, session 仍可本机使用, TUI 会提示 `/wx roots add-current` 等本机授权入口.
+- 每个可见 Pi TUI 在 `session_start` 后尝试连接 Gateway UI IPC. `allowedProjectRoots` 负责安全授权; cwd 位于授权根时, extension 按 cwd 文件夹名自动建立或复用项目记录, 不要求预先逐个添加 alias. cwd 超出授权范围时, session 仍可本机使用, TUI 会提示 `/wx roots add-current` 等本机授权入口. UI worker 连接成功后, Pi footer 扩展状态行显示 `🟢 微信: 已接入`; 连接重建期间显示 `🟡 微信: 连接中`.
 
 ```text
 后台 RPC owner -- Pi /resume / UI attach --> 前台 TUI owner
@@ -77,6 +77,7 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 - Hub 启动时, 曾标记为 UI 但已没有活跃 UI owner 的 saved route 改由后台 RPC 恢复, 不自动打开 Windows Terminal tab.
 - 未登记目标的 Pi 原生 `/resume` 不因缺少 Hub registry 记录而被取消. 如果目标 transcript 没有活跃或状态不明的 Hub owner, 允许 Pi 恢复; 恢复后 cwd 在授权根内则自动登记并接入, 否则只保留本机使用.
 - 已登记 session 若由其他活跃 UI owner 持有, 或旧 owner 状态不明且进程仍存活, 拒绝第二 writer. 后台 owner 则尝试安全停止并交接; 停止或交接失败时拒绝恢复.
+- Gateway 重启时, 已标记为 `stale` 或 `stopping` 的 UI owner 不会阻塞 Gateway 启动, 也不会被自动改为 background writer; 其 route 保留并等待原 TUI 重新接入. 只有进程已确认退出后, 下一次恢复才会清理 owner 并按安全规则交接.
 - 未登记 transcript 不会触发本机 session 文件扫描; 仅通过用户当前 Pi 的 `/resume` 选择单个目标.
 
 ## 5. 微信端会话和索引
@@ -89,7 +90,7 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 /retry <message-id> --confirm
 ```
 
-`/new` 默认在后台创建 session, 不接受任意工作目录或 shell 参数; 用户可显式指定 `--mode ui` 请求在新 Windows Terminal tab 中打开可见 session. 若 route 后续通过本机 Pi TUI `/resume` 打开该 session, owner 会自动切换为 UI.
+`/new` 默认在后台创建 session, 不接受任意工作目录或 shell 参数; 用户可显式指定 `--mode ui` 请求在新 Windows Terminal tab 中打开可见 session. 若 route 后续通过本机 Pi TUI `/resume` 打开该 session, owner 会自动切换为 UI. 微信端 `/resume` 切换到已停止或 idle 的 session 时, 回复会附上 transcript 中最近一条 assistant 文本; 若目标 agent 正在运行, 则只确认 route 切换.
 
 `/sessions` 默认状态为 `active`, active 集合由当前 UI 和 background owner 共同构成. 需要查看已保存/待启动 session 时可使用 `--state all` 或相应过滤项. 表头标注索引、标题、项目、模式、状态和微信 route; 当前 route 绑定的 session 标记为“当前”. 标题优先使用 session name, 未命名时读取 Pi `/resume` 同样使用的首条 user 文本, 并在 40 个 Unicode 字符后以 `...` 省略.
 

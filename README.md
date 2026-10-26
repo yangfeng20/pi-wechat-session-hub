@@ -20,6 +20,7 @@ Pi WeChat Session Hub 是一个 Pi 扩展, 用微信管理本机多个 Pi 会话
 - 每条微信 route 指向同一 Pi session. 在 Pi TUI 中 `/resume` 恢复 Hub 管理的会话时, 扩展通过 IPC 将 owner 从后台 RPC 安全切换到前台 TUI; 同一会话的微信消息和回复会在该 TUI 中显示. TUI 关闭后, route 返回后台 RPC.
 - 新建微信会话默认在后台, 不自动打开 Windows Terminal tab. route、session JSONL 和稳定会话索引保留.
 - 同一 session 同一时刻只允许一个 runtime writer. Pi TUI session 的 cwd 位于 `allowedProjectRoots` 内时会自动登记并纳入 Hub; 授权根外的会话仍可在本机使用, 但不接入微信管理.
+- 当前 Pi TUI 已成功接入 Hub 时, footer 的扩展状态行会在 MCP 状态后显示 `🟢 微信: 已接入`; Gateway 重启或连接恢复期间显示 `🟡 微信: 连接中`.
 
 ## 安装和首次使用
 
@@ -77,7 +78,7 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 /help
 ```
 
-`/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 并在表格中标明列含义及当前微信 route. 标题优先显示 session name; 未命名时显示 Pi `/resume` 使用的首条用户文本, 最长 40 个 Unicode 字符, 超出部分以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 索引在会话排序变化后保持不变, 不因列表重排而复用.
+`/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 并在表格中标明列含义及当前微信 route. 标题优先显示 session name; 未命名时显示 Pi `/resume` 使用的首条用户文本, 最长 40 个 Unicode 字符, 超出部分以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 如果切换目标的 agent 已处于 idle, 回复会附带该 session 最近一次 assistant 文本; 如果 agent 正在运行, 只确认切换, 不发送旧回复. 索引在会话排序变化后保持不变, 不因列表重排而复用.
 
 Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果目标是 Hub 会话, extension 会安全完成前后台 owner 交接. 未登记 session 不再因缺少 Hub 记录而阻止 Pi 原生恢复; 恢复后仅当 cwd 位于授权根内才自动接入 Hub.
 
