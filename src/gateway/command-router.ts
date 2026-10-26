@@ -574,6 +574,7 @@ export class GatewayCommandRouter {
     selector: string,
   ): Promise<string> {
     const session = await this.resolveSessionSelector(selector);
+    const previousRoute = (await this.registry.readSnapshot()).routes[routeId];
     await this.workerManager.resume(session.sessionId);
     const snapshot = await this.registry.readSnapshot();
     const owner = Object.values(snapshot.instances).find((instance) =>
@@ -591,7 +592,14 @@ export class GatewayCommandRouter {
       generation: (Object.hasOwn(snapshot.routes, routeId) ? snapshot.routes[routeId].generation : 0) + 1,
       updatedAt: new Date().toISOString(),
     });
-    return `已恢复会话 #${session.publicIndex ?? "?"} ${session.name ?? "未命名"} (${session.projectAlias})。`;
+    const confirmation = `已恢复会话 #${session.publicIndex ?? "?"} ${session.name ?? "未命名"} (${session.projectAlias})。`;
+    if (previousRoute?.sessionId === session.sessionId || owner.state !== "idle") {
+      return confirmation;
+    }
+    const latestAssistantText = await readLatestAssistantText(session.sessionFile);
+    return latestAssistantText
+      ? `${confirmation}\n\n最近一次回复:\n${truncateResumeAssistantText(latestAssistantText)}`
+      : confirmation;
   }
 
   /**
@@ -814,6 +822,7 @@ export class GatewayCommandRouter {
 }
 
 const SESSION_TITLE_LIMIT = 40;
+const RESUME_ASSISTANT_TEXT_LIMIT = 28000;
 
 /**
  * 解析 session 显示标题: 优先使用名称, 否则使用 Pi resume 列表采用的首条用户文本。
@@ -874,6 +883,85 @@ async function readFirstUserMessage(sessionFile: string): Promise<string | undef
     input?.destroy();
   }
   return undefined;
+}
+
+/**
+ * 从 Pi JSONL session 文件读取最近一条 assistant 对外文本.
+ *
+ * @param sessionFile Pi transcript 文件路径.
+ * @returns 最近一条非空 assistant 文本, 无法读取或不存在时返回 undefined.
+ */
+async function readLatestAssistantText(sessionFile: string): Promise<string | undefined> {
+  let input: ReturnType<typeof createReadStream> | undefined;
+  let lines: ReturnType<typeof createInterface> | undefined;
+  let latestText: string | undefined;
+  try {
+    input = createReadStream(sessionFile, { encoding: "utf8" });
+    lines = createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      let entry: unknown;
+      try {
+        entry = JSON.parse(line) as unknown;
+      } catch {
+        continue;
+      }
+      if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
+        continue;
+      }
+      const message = entry.message;
+      if (message.role !== "assistant") {
+        continue;
+      }
+      const content = message.content;
+      const text = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content
+            .filter((block) => isRecord(block) && block.type === "text" && typeof block.text === "string")
+            .map((block) => (block as { type: "text"; text: string }).text)
+            .join("")
+          : "";
+      const normalized = normalizeAssistantText(text);
+      if (normalized) {
+        latestText = normalized;
+      }
+    }
+  } catch {
+    return undefined;
+  } finally {
+    lines?.close();
+    input?.destroy();
+  }
+  return latestText;
+}
+
+/**
+ * 清理 assistant 文本中的终端控制字符, 保留换行和制表符格式.
+ *
+ * @param text transcript 中的 assistant 文本.
+ * @returns 清理并去除首尾空白后的文本.
+ */
+function normalizeAssistantText(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+    .trim();
+}
+
+/**
+ * 限制发往微信的恢复预览长度, 超长时保留末尾内容.
+ *
+ * @param text 最近一次 assistant 文本.
+ * @returns 可安全发送的完整或截断文本.
+ */
+function truncateResumeAssistantText(text: string): string {
+  const characters = Array.from(text);
+  if (characters.length <= RESUME_ASSISTANT_TEXT_LIMIT) {
+    return text;
+  }
+  const marker = "[回复过长, 以下仅显示末尾内容]\n\n";
+  const visibleLimit = RESUME_ASSISTANT_TEXT_LIMIT - Array.from(marker).length;
+  return `${marker}${characters.slice(-visibleLimit).join("")}`;
 }
 
 /**

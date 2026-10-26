@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,6 +152,27 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     assert.equal(help.state, "completed");
     assert.match(sentReplies.at(-1)?.text ?? "", /\/new[^\n]*\n\n\/projects/);
 
+    const transcriptSession = (await registry.readSnapshot()).sessions[sessionId!];
+    await appendFile(transcriptSession.sessionFile, `${[
+      {
+        type: "message",
+        id: "cafe0000",
+        parentId: null,
+        timestamp: new Date(Date.now() - 1000).toISOString(),
+        message: { role: "assistant", content: [{ type: "text", text: "这是更早的回复" }] },
+      },
+      {
+        type: "message",
+        id: "cafe0001",
+        parentId: "cafe0000",
+        timestamp: new Date().toISOString(),
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "隐藏推理" }, { type: "text", text: "测试回复: 重试这条普通 prompt" }],
+          timestamp: Date.now(),
+        },
+      },
+    ].map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
     const stopped = await router.receive({
       messageId: "wx-stop-1",
       senderId: "wx-user-1",
@@ -168,10 +189,101 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     });
     assert.equal(resumed.state, "completed");
     assert.equal((await registry.readSnapshot()).routes["wx-user-1"].sessionId, sessionId);
+    assert.match(sentReplies.at(-1)?.text ?? "", /最近一次回复/);
+    assert.match(sentReplies.at(-1)?.text ?? "", /测试回复: 重试这条普通 prompt/);
+    assert.doesNotMatch(sentReplies.at(-1)?.text ?? "", /这是更早的回复|隐藏推理/);
   } finally {
     if (sessionId) {
       await workerManager.stop(sessionId).catch(() => undefined);
     }
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("恢复目标的 agent 正在运行时只确认切换, 不回传旧回复", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-resume-running-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  const sessionFile = join(projectPath, "running-session.jsonl");
+  await mkdir(projectPath, { recursive: true });
+  await writeFile(sessionFile, [
+    JSON.stringify({ type: "session", version: 3, id: "running-session", cwd: projectPath }),
+    JSON.stringify({
+      type: "message",
+      id: "babe0001",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: { role: "assistant", content: [{ type: "text", text: "这是先前的回复" }] },
+    }),
+  ].join("\n") + "\n", "utf8");
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-running-resume" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "测试项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const now = new Date().toISOString();
+  const session = await registry.upsertSession({
+    sessionId: "running-session",
+    sessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: "运行中的会话",
+    mode: "background",
+    state: "active",
+    lastActivityAt: now,
+  });
+  await registry.upsertInstance({
+    instanceId: "running-session-owner",
+    pid: process.pid,
+    processBirthId: `${process.pid}:running-resume-test`,
+    sessionId: session.sessionId,
+    sessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    mode: "background",
+    state: "running",
+    heartbeatAt: now,
+  });
+  const workerManager: GatewayWorkerService = {
+    startNew: async () => { throw new Error("测试不应创建会话"); },
+    resume: async () => session,
+    prompt: async () => "unused",
+    stop: async () => undefined,
+    stopAll: async () => undefined,
+    listSessions: async () => [session],
+  };
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const result = await router.receive({
+      messageId: "wx-running-resume-1",
+      senderId: "wx-running-resume",
+      text: "/resume 1",
+    });
+    assert.equal(result.state, "completed");
+    assert.equal((await registry.readSnapshot()).routes["wx-running-resume"].sessionId, session.sessionId);
+    assert.match(replies.at(-1) ?? "", /已恢复会话/);
+    assert.doesNotMatch(replies.at(-1) ?? "", /最近一次回复|这是先前的回复/);
+  } finally {
     await lease.release();
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
