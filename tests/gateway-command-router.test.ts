@@ -141,7 +141,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
       text: "/sessions --project demo --state all",
     });
     assert.equal(sessionList.state, "completed");
-    assert.match(sentReplies.at(-1)?.text ?? "", /#1 \| 调查应用错误/);
+    assert.match(sentReplies.at(-1)?.text ?? "", /#1 调查应用错误/);
     assert.match(sentReplies.at(-1)?.text ?? "", /后台/);
 
     const help = await router.receive({
@@ -150,7 +150,11 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
       text: "/help",
     });
     assert.equal(help.state, "completed");
-    assert.match(sentReplies.at(-1)?.text ?? "", /\/new[^\n]*\n\n\/projects/);
+    const helpText = sentReplies.at(-1)?.text ?? "";
+    assert.match(helpText, /会话命令/);
+    assert.match(helpText, /项目命令/);
+    assert.match(helpText, /Hub 状态/);
+    assert.match(helpText, /\/sessions \[筛选条件\]/);
 
     const transcriptSession = (await registry.readSnapshot()).sessions[sessionId!];
     await appendFile(transcriptSession.sessionFile, `${[
@@ -168,7 +172,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
         timestamp: new Date().toISOString(),
         message: {
           role: "assistant",
-          content: [{ type: "thinking", thinking: "隐藏推理" }, { type: "text", text: "测试回复: 重试这条普通 prompt" }],
+          content: [{ type: "thinking", thinking: "隐藏推理" }, { type: "text", text: `测试回复: 重试这条普通 prompt\n${"较长的回复内容。".repeat(100)}` }],
           timestamp: Date.now(),
         },
       },
@@ -189,9 +193,12 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     });
     assert.equal(resumed.state, "completed");
     assert.equal((await registry.readSnapshot()).routes["wx-user-1"].sessionId, sessionId);
-    assert.match(sentReplies.at(-1)?.text ?? "", /最近一次回复/);
-    assert.match(sentReplies.at(-1)?.text ?? "", /测试回复: 重试这条普通 prompt/);
-    assert.doesNotMatch(sentReplies.at(-1)?.text ?? "", /这是更早的回复|隐藏推理/);
+    const resumeReply = sentReplies.at(-1)?.text ?? "";
+    assert.match(resumeReply, /最近一次回复（节选）/);
+    assert.match(resumeReply, /测试回复: 重试这条普通 prompt/);
+    assert.match(resumeReply, /完整回复仍保留在会话记录中/);
+    assert.ok(Array.from(resumeReply).length < 1000);
+    assert.doesNotMatch(resumeReply, /这是更早的回复|隐藏推理/);
   } finally {
     if (sessionId) {
       await workerManager.stop(sessionId).catch(() => undefined);
@@ -417,7 +424,7 @@ test("微信 /new 的项目 alias 错误会回复微信并把 queue 标记 compl
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
-test("/sessions 输出列标题、未命名会话首句及截断后的标题", async () => {
+test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-sessions-title-"));
   const projectRoot = join(temporaryDirectory, "projects");
   const projectPath = join(projectRoot, "demo");
@@ -494,6 +501,18 @@ test("/sessions 输出列标题、未命名会话首句及截断后的标题", a
     state: "saved",
     lastActivityAt: new Date(Date.now() - 1000).toISOString(),
   });
+  for (let index = 0; index < 4; index += 1) {
+    await registry.upsertSession({
+      sessionId: `older-session-${index}`,
+      sessionFile: join(temporaryDirectory, `older-session-${index}.jsonl`),
+      cwd: projectPath,
+      projectAlias: "demo",
+      name: `归档会话 ${index + 1}`,
+      mode: "background",
+      state: "saved",
+      lastActivityAt: new Date(Date.now() - 5000 - index * 1000).toISOString(),
+    });
+  }
   const workerManager = new BackgroundWorkerManager({
     projectService,
     registry,
@@ -521,11 +540,35 @@ test("/sessions 输出列标题、未命名会话首句及截断后的标题", a
     });
     assert.equal(result.state, "completed");
     const reply = replies.at(-1) ?? "";
-    assert.match(reply, /#索引 \| 标题 \| 项目 \| 模式 \| 状态 \| 微信路由/);
-    assert.match(reply, new RegExp(firstUserMessage));
-    assert.match(reply, /\| 当前$/m);
-    assert.ok(!reply.includes("未命名"));
-    assert.ok(reply.includes(`${Array.from(longTitle).slice(0, 37).join("")}...`));
+    assert.match(reply, /会话列表 · 第 1\/2 页 · 共 6 个/);
+    assert.match(reply, new RegExp(`【当前】#${indexedUnnamedSession.publicIndex} ${firstUserMessage}`));
+    assert.match(reply, /项目：测试项目 · 后台 · 活跃/);
+    assert.ok(reply.includes(`${Array.from(longTitle).slice(0, 29).join("")}...`));
+    assert.doesNotMatch(reply, /\|/);
+    assert.match(reply, /切换会话：\/resume <索引或名称>/);
+    assert.match(reply, /下一页：\/sessions --state all --page 2/);
+
+    const secondPage = await router.receive({
+      messageId: "wx-sessions-title-page-2",
+      senderId: "wx-sessions-title",
+      text: "/sessions --state all --page 2",
+    });
+    assert.equal(secondPage.state, "completed");
+    assert.match(replies.at(-1) ?? "", /会话列表 · 第 2\/2 页 · 共 6 个/);
+    assert.match(replies.at(-1) ?? "", /上一页：\/sessions --state all --page 1/);
+
+    const status = await router.receive({
+      messageId: "wx-sessions-title-status",
+      senderId: "wx-sessions-title",
+      text: "/status",
+    });
+    assert.equal(status.state, "completed");
+    const statusText = replies.at(-1) ?? "";
+    assert.match(statusText, /Hub 状态：未启动/);
+    assert.match(statusText, new RegExp(`当前微信会话：#${indexedUnnamedSession.publicIndex} ${firstUserMessage}`));
+    assert.match(statusText, /Pi：后台 · 空闲/);
+    assert.match(statusText, /未完成消息：0 条/);
+    assert.doesNotMatch(statusText, /PID|Gateway:|Worker:|Queue:/);
   } finally {
     await lease.release();
     await rm(temporaryDirectory, { recursive: true, force: true });

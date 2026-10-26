@@ -531,7 +531,7 @@ export class GatewayCommandRouter {
         return session.state === state;
       })
       .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
-    const pageSize = 10;
+    const pageSize = 5;
     const pageCount = Math.max(1, Math.ceil(sessions.length / pageSize));
     if (page > pageCount) {
       return `没有第 ${page} 页; 共 ${pageCount} 页。`;
@@ -544,21 +544,35 @@ export class GatewayCommandRouter {
       session,
       title: await resolveSessionTitle(session),
     })));
+    const currentRouteSession = currentRouteSessionId
+      ? snapshot.sessions[currentRouteSessionId]
+      : undefined;
+    const currentRouteLabel = currentRouteSession
+      ? `当前微信路由：#${currentRouteSession.publicIndex ?? "?"}`
+      : undefined;
+    const cards = displaySessions.map(({ session, title }) => {
+      const projectName = Object.hasOwn(config.projects, session.projectAlias)
+        ? config.projects[session.projectAlias].displayName
+        : session.projectAlias;
+      const status = activeSessionIds.has(session.sessionId)
+        ? session.state === "pending" ? "等待首条记录" : "活跃"
+        : session.state === "pending" ? "等待首条记录" : "已保存";
+      const mode = activeSessionIds.has(session.sessionId) && session.mode === "ui" ? "前台" : "后台";
+      const currentMark = currentRouteSessionId === session.sessionId ? "【当前】" : "";
+      return `${currentMark}#${session.publicIndex ?? "?"} ${title}\n项目：${projectName} · ${mode} · ${status}`;
+    });
+    const pageHint = pageCount > 1
+      ? page < pageCount
+        ? `下一页：${buildSessionsPageCommand(page + 1, projectAlias, state)}`
+        : `上一页：${buildSessionsPageCommand(page - 1, projectAlias, state)}`
+      : undefined;
     return [
-      `会话列表 (${page}/${pageCount}):`,
-      "#索引 | 标题 | 项目 | 模式 | 状态 | 微信路由",
-      ...displaySessions.map(({ session, title }) => {
-        const projectName = Object.hasOwn(config.projects, session.projectAlias)
-          ? config.projects[session.projectAlias].displayName
-          : session.projectAlias;
-        const status = activeSessionIds.has(session.sessionId)
-          ? session.state === "pending" ? "等待首条记录" : "活跃"
-          : session.state === "pending" ? "等待首条记录" : "已保存";
-        const mode = activeSessionIds.has(session.sessionId) && session.mode === "ui" ? "前台" : "后台";
-        const routeMark = currentRouteSessionId === session.sessionId ? "当前" : "-";
-        return `#${session.publicIndex ?? "?"} | ${title} | ${projectName} | ${mode} | ${status} | ${routeMark}`;
-      }),
-    ].join("\n");
+      `会话列表 · 第 ${page}/${pageCount} 页 · 共 ${sessions.length} 个`,
+      ...(currentRouteLabel ? [currentRouteLabel] : []),
+      ...cards,
+      "切换会话：/resume <索引或名称>",
+      ...(pageHint ? [pageHint] : []),
+    ].join("\n\n");
   }
 
   /**
@@ -597,9 +611,13 @@ export class GatewayCommandRouter {
       return confirmation;
     }
     const latestAssistantText = await readLatestAssistantText(session.sessionFile);
-    return latestAssistantText
-      ? `${confirmation}\n\n最近一次回复:\n${truncateResumeAssistantText(latestAssistantText)}`
-      : confirmation;
+    if (!latestAssistantText) {
+      return confirmation;
+    }
+    const preview = truncateResumeAssistantText(latestAssistantText);
+    return `${confirmation}\n\n最近一次回复${preview.truncated ? "（节选）" : ""}：\n${preview.text}${
+      preview.truncated ? "\n\n[内容较长, 完整回复仍保留在会话记录中。]" : ""
+    }`;
   }
 
   /**
@@ -682,15 +700,27 @@ export class GatewayCommandRouter {
       : undefined;
     const queueItems = await this.queue.list(routeId);
     const pendingQueueCount = queueItems.filter((item) =>
-      item.state === "queued" || item.state === "processing" || item.state === "failed" || item.state === "interrupted",
+      item.state === "queued" || item.state === "failed" || item.state === "interrupted",
     ).length;
     const projectCount = Object.keys(config.projects).length;
+    const projectName = session
+      ? Object.hasOwn(config.projects, session.projectAlias)
+        ? config.projects[session.projectAlias].displayName
+        : session.projectAlias
+      : undefined;
+    const sessionTitle = session
+      ? `#${session.publicIndex ?? "?"} ${await resolveSessionTitle(session)}`
+      : "未绑定";
+    const workerLabel = instance
+      ? `${instance.mode === "ui" ? "前台" : "后台"} · ${formatWorkerState(instance.state)}`
+      : "未运行";
     return [
-      `Gateway: ${snapshot.gateway?.state ?? "offline"}`,
-      `微信 route: ${session ? `#${session.publicIndex ?? "?"} ${session.name ?? "未命名"} (${session.projectAlias})` : "未绑定"}`,
-      `Worker: ${instance ? `${instance.mode}/${instance.state} PID ${instance.pid}` : "none"}`,
-      `Queue: ${pendingQueueCount}`,
-      `项目 alias: ${projectCount}`,
+      `Hub 状态：${formatGatewayState(snapshot.gateway?.state)}`,
+      `当前微信会话：${sessionTitle}`,
+      ...(projectName ? [`项目：${projectName}`] : []),
+      `Pi：${workerLabel}`,
+      `未完成消息：${pendingQueueCount} 条`,
+      `已登记项目：${projectCount} 个`,
     ].join("\n");
   }
 
@@ -821,8 +851,82 @@ export class GatewayCommandRouter {
   }
 }
 
-const SESSION_TITLE_LIMIT = 40;
-const RESUME_ASSISTANT_TEXT_LIMIT = 28000;
+const SESSION_TITLE_LIMIT = 32;
+const RESUME_ASSISTANT_TEXT_LIMIT = 800;
+
+/**
+ * 生成保留当前筛选条件的会话翻页命令.
+ *
+ * @param page 目标页码.
+ * @param projectAlias 可选项目 alias.
+ * @param state 当前会话状态筛选.
+ * @returns 可直接发送到微信的下一页或上一页命令.
+ */
+function buildSessionsPageCommand(
+  page: number,
+  projectAlias: string | undefined,
+  state: "default" | "active" | "saved" | "pending" | "all",
+): string {
+  const arguments_: string[] = [];
+  if (projectAlias) {
+    arguments_.push(`--project ${projectAlias}`);
+  }
+  if (state !== "default") {
+    arguments_.push(`--state ${state}`);
+  }
+  arguments_.push(`--page ${page}`);
+  return `/sessions ${arguments_.join(" ")}`;
+}
+
+/**
+ * 将 Gateway 生命周期状态转换为面向微信用户的中文说明.
+ *
+ * @param state Gateway 当前状态.
+ * @returns 简短的中文状态说明.
+ */
+function formatGatewayState(state: string | undefined): string {
+  switch (state) {
+    case undefined:
+      return "未启动";
+    case "starting":
+      return "启动中";
+    case "online":
+      return "在线";
+    case "auth_required":
+      return "需要重新登录";
+    case "stopping":
+      return "停止中";
+    case "stopped":
+      return "已停止";
+    case "lease_lost":
+      return "连接异常";
+    default:
+      return "状态未知";
+  }
+}
+
+/**
+ * 将 Pi worker 生命周期状态转换为面向微信用户的中文说明.
+ *
+ * @param state worker 当前状态.
+ * @returns 简短的中文状态说明.
+ */
+function formatWorkerState(state: string): string {
+  switch (state) {
+    case "starting":
+      return "启动中";
+    case "idle":
+      return "空闲";
+    case "running":
+      return "运行中";
+    case "stopping":
+      return "停止中";
+    case "stale":
+      return "断连待恢复";
+    default:
+      return "状态未知";
+  }
+}
 
 /**
  * 解析 session 显示标题: 优先使用名称, 否则使用 Pi resume 列表采用的首条用户文本。
@@ -949,19 +1053,20 @@ function normalizeAssistantText(text: string): string {
 }
 
 /**
- * 限制发往微信的恢复预览长度, 超长时保留末尾内容.
+ * 限制发往微信的恢复预览长度, 超长时保留开头内容.
  *
  * @param text 最近一次 assistant 文本.
  * @returns 可安全发送的完整或截断文本.
  */
-function truncateResumeAssistantText(text: string): string {
+function truncateResumeAssistantText(text: string): { text: string; truncated: boolean } {
   const characters = Array.from(text);
   if (characters.length <= RESUME_ASSISTANT_TEXT_LIMIT) {
-    return text;
+    return { text, truncated: false };
   }
-  const marker = "[回复过长, 以下仅显示末尾内容]\n\n";
-  const visibleLimit = RESUME_ASSISTANT_TEXT_LIMIT - Array.from(marker).length;
-  return `${marker}${characters.slice(-visibleLimit).join("")}`;
+  return {
+    text: characters.slice(0, RESUME_ASSISTANT_TEXT_LIMIT).join(""),
+    truncated: true,
+  };
 }
 
 /**
@@ -975,7 +1080,7 @@ function normalizeSessionTitle(title: string): string {
 }
 
 /**
- * 将会话标题限制为 40 个 Unicode code point, 超出部分以三个点省略。
+ * 将会话标题限制为 32 个 Unicode code point, 超出部分以三个点省略。
  *
  * @param title 已清理标题。
  * @returns 长度限制内的标题。
@@ -999,15 +1104,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const GATEWAY_HELP_TEXT = [
-  "/new [--mode background|ui] [--project <alias>] [--name <名称>]",
-  "/projects [add <alias> --name <名称> --path <绝对路径> | remove <alias> | default <alias>]",
-  "/sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>]",
-  "/resume <会话索引|名称>",
-  "/stop [会话索引|名称]",
-  "/retry <message-id> --confirm - 显式重试失败/中断消息; 会重新执行, 可能重复产生副作用",
+  "微信命令帮助",
+  "",
+  "会话命令",
+  "/new [--mode background|ui]",
+  "  [--project <别名>] [--name <名称>]",
+  "/sessions [筛选条件]",
+  "  --project <别名> --state <状态> --page <页码>",
+  "  状态：default / active / saved / pending / all",
+  "/resume <索引或名称>",
+  "/stop [索引或名称]",
+  "",
+  "项目命令",
+  "/projects",
+  "/projects add <别名>",
+  "  --name <名称> --path <绝对路径>",
+  "/projects remove <别名>",
+  "/projects default <别名>",
+  "",
+  "Hub 状态与队列",
   "/status",
-  "/help",
-].join("\n\n");
+  "/retry <message-id> --confirm",
+  "  会重新执行原消息, 可能产生副作用。",
+  "",
+  "发送 /help 查看此帮助。",
+].join("\n");
 
 /**
  * 将 durable queue dispatch 结果规范化为 Gateway receive 结果。

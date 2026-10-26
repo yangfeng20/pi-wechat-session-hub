@@ -184,8 +184,11 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
       text: "/sessions --state active",
     });
     assert.equal(firstList.state, "completed");
-    assert.match(sessionListReplies.at(-1) ?? "", /#1 \| 前后台切换测试 \| 测试项目 \| 前台 \| 活跃/);
-    assert.match(sessionListReplies.at(-1) ?? "", /#3 \| 后台会话 \| 测试项目 \| 后台 \| 等待首条记录/);
+    const foregroundListReply = sessionListReplies.at(-1) ?? "";
+    assert.match(foregroundListReply, /【当前】#1 前后台切换测试/);
+    assert.match(foregroundListReply, /项目：测试项目 · 前台 · 活跃/);
+    assert.match(foregroundListReply, /#3 后台会话/);
+    assert.match(foregroundListReply, /项目：测试项目 · 后台 · 等待首条记录/);
     assert.equal(await gatewayWorkerManager.prompt(session.sessionId, "桌面可见回复"), "UI 回复: 桌面可见回复");
 
     await bridge.onSessionShutdown({ reason: "quit" });
@@ -202,8 +205,11 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
       text: "/sessions --state active",
     });
     assert.equal(secondList.state, "completed");
-    assert.match(sessionListReplies.at(-1) ?? "", /#1 \| 前后台切换测试 \| 测试项目 \| 后台 \| 活跃/);
-    assert.match(sessionListReplies.at(-1) ?? "", /#3 \| 后台会话 \| 测试项目 \| 后台 \| 等待首条记录/);
+    const backgroundListReply = sessionListReplies.at(-1) ?? "";
+    assert.match(backgroundListReply, /【当前】#1 前后台切换测试/);
+    assert.match(backgroundListReply, /项目：测试项目 · 后台 · 活跃/);
+    assert.match(backgroundListReply, /#3 后台会话/);
+    assert.match(backgroundListReply, /项目：测试项目 · 后台 · 等待首条记录/);
     assert.equal(await gatewayWorkerManager.prompt(session.sessionId, "微信仍可回复"), "测试回复: 微信仍可回复");
   } finally {
     await bridge?.onSessionShutdown({ reason: "quit" }).catch(() => undefined);

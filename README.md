@@ -78,7 +78,7 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 /help
 ```
 
-`/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 并在表格中标明列含义及当前微信 route. 标题优先显示 session name; 未命名时显示 Pi `/resume` 使用的首条用户文本, 最长 40 个 Unicode 字符, 超出部分以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 如果切换目标的 agent 已处于 idle, 回复会附带该 session 最近一次 assistant 文本; 如果 agent 正在运行, 只确认切换, 不发送旧回复. 索引在会话排序变化后保持不变, 不因列表重排而复用.
+`/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 每页 5 条, 每个会话单独展示标题、项目、模式和状态, 当前微信路由会明确标记. 标题优先显示 session name; 未命名时使用 Pi `/resume` 同样采用的首条用户文本, 最长 32 个 Unicode 字符, 超出以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 如果切换目标的 agent 已处于 idle, 回复会附带最近一次回复预览; 超过 800 个 Unicode 字符时只显示开头并提示完整内容仍在会话中. 如果 agent 正在运行, 只确认切换, 不发送旧回复. 索引在会话排序变化后保持不变, 不因列表重排而复用.
 
 Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果目标是 Hub 会话, extension 会安全完成前后台 owner 交接. 未登记 session 不再因缺少 Hub 记录而阻止 Pi 原生恢复; 恢复后仅当 cwd 位于授权根内才自动接入 Hub.
 

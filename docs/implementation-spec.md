@@ -92,7 +92,7 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 
 `/new` 默认在后台创建 session, 不接受任意工作目录或 shell 参数; 用户可显式指定 `--mode ui` 请求在新 Windows Terminal tab 中打开可见 session. 若 route 后续通过本机 Pi TUI `/resume` 打开该 session, owner 会自动切换为 UI. 微信端 `/resume` 切换到已停止或 idle 的 session 时, 回复会附上 transcript 中最近一条 assistant 文本; 若目标 agent 正在运行, 则只确认 route 切换.
 
-`/sessions` 默认状态为 `active`, active 集合由当前 UI 和 background owner 共同构成. 需要查看已保存/待启动 session 时可使用 `--state all` 或相应过滤项. 表头标注索引、标题、项目、模式、状态和微信 route; 当前 route 绑定的 session 标记为“当前”. 标题优先使用 session name, 未命名时读取 Pi `/resume` 同样使用的首条 user 文本, 并在 40 个 Unicode 字符后以 `...` 省略.
+`/sessions` 默认状态为 `active`, active 集合由当前 UI 和 background owner 共同构成. 需要查看已保存/待启动 session 时可使用 `--state all` 或相应过滤项. 列表每页 5 条, 每个会话以独立信息块显示稳定索引、标题、项目、模式和状态; 当前微信 route 在会话项和列表摘要中标记. 标题优先使用 session name, 未命名时读取 Pi `/resume` 同样采用的首条 user 文本, 并在 32 个 Unicode 字符后以 `...` 省略. 微信命令帮助按会话、项目和 Hub 状态分组; `/status` 使用中文状态和会话摘要, 不显示 PID. 空闲会话的 `/resume` 回复附带最近 assistant 文本预览, 最多 800 个 Unicode 字符, 超长时明确提示剩余内容仍保留在 transcript.
 
 `SessionIndexRecord.publicIndex` 在首次写入时分配, 旧 registry 首次读取时按最近活动时间排序迁移. 索引持久保存, 不随列表排序变化; app 不主动删除旧 session 索引, 新会话递增分配. `session-index.json` 的 UUID 仍仅供内部关联使用.
 
