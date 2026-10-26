@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { mkdir, open, readdir, lstat, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isProcessAlive } from "../system/process-liveness.ts";
 import { GatewayLease } from "../registry/gateway-lease.ts";
 import { ManagerRegistry } from "../registry/manager-registry.ts";
 import type { UiWorkerLaunchRecord, UiWorkerRegistration } from "./ui-worker-types.ts";
@@ -1454,24 +1455,6 @@ function safeEqualBase64(provided: string, expected: string): boolean {
   const left = Buffer.from(provided, "base64url");
   const right = Buffer.from(expected, "base64url");
   return left.length === right.length && timingSafeEqual(left, right);
-}
-
-/**
- * 判断进程 PID 当前是否存在。
- *
- * @param pid 操作系统进程 ID。
- * @returns 进程存在或因权限不足无法检查时返回 true。
- */
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return isNodeError(error) && error.code === "EPERM";
-  }
 }
 
 /**

@@ -87,8 +87,6 @@ export async function runGatewayDaemon(): Promise<void> {
         handleAction: async (action) => handleControlAction(action),
       });
       await controlServer.listen();
-      readySent = true;
-      notifyParent({ kind: "ready" });
     },
   });
 
@@ -104,6 +102,10 @@ export async function runGatewayDaemon(): Promise<void> {
     });
     if (shutdownTask) {
       beginShutdown(false);
+    } else {
+      serviceState = toGatewayServiceState(runtime.status);
+      readySent = true;
+      notifyParent({ kind: "ready" });
     }
   } catch (error) {
     if (!readySent) {

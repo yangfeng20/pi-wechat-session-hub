@@ -581,6 +581,75 @@ test("Gateway runtime 通过 fake iLink 端到端路由并按入站 context 回�
   }
 });
 
+test("Gateway runtime 不因存活但 stale 的 UI owner 阻塞启动, 并保留 route 等待重连", { timeout: 30000 }, async () => {
+  const fixture = await createRuntimeFixture();
+  const lease = await GatewayLease.acquire(fixture.managerDirectory);
+  const registry = new ManagerRegistry(fixture.managerDirectory, lease);
+  const sessionId = "stale-ui-session";
+  const sessionFile = join(fixture.root, "stale-ui-session.jsonl");
+  const now = new Date().toISOString();
+  await writeFile(sessionFile, `${JSON.stringify({ id: sessionId })}\n`, "utf8");
+  await registry.upsertSession({
+    sessionId,
+    sessionFile,
+    cwd: join(fixture.root, "projects", "demo"),
+    projectAlias: "demo",
+    mode: "ui",
+    state: "saved",
+    lastActivityAt: now,
+  });
+  await registry.upsertInstance({
+    instanceId: "stale-ui-owner",
+    pid: process.pid,
+    processBirthId: `${process.pid}:stale-ui-owner`,
+    sessionId,
+    sessionFile,
+    cwd: join(fixture.root, "projects", "demo"),
+    projectAlias: "demo",
+    mode: "ui",
+    state: "stale",
+    heartbeatAt: now,
+  });
+  await registry.setRoute("stale-ui-route", {
+    sessionId,
+    workerInstanceId: "stale-ui-owner",
+    generation: 4,
+    updatedAt: now,
+  });
+  await lease.release();
+
+  let notifyPollStarted!: () => void;
+  const pollStarted = new Promise<void>((resolveStarted) => {
+    notifyPollStarted = resolveStarted;
+  });
+  const fetcher: typeof fetch = async (_input, init) => {
+    notifyPollStarted();
+    const signal = init?.signal as AbortSignal;
+    return new Promise<Response>((_resolveResponse, rejectResponse) => {
+      const rejectOnAbort = (): void => rejectResponse(new DOMException("已取消", "AbortError"));
+      if (signal.aborted) {
+        rejectOnAbort();
+        return;
+      }
+      signal.addEventListener("abort", rejectOnAbort, { once: true });
+    });
+  };
+  let runtime: GatewayRuntime | undefined;
+  try {
+    runtime = await GatewayRuntime.start(runtimeOptions(fixture, fetcher));
+    await pollStarted;
+    assert.equal(runtime.status, "online");
+    const recovered = await registry.readSnapshot();
+    assert.equal(recovered.sessions[sessionId].mode, "ui");
+    assert.equal(recovered.instances["stale-ui-owner"].state, "stale");
+    assert.equal(recovered.routes["stale-ui-route"].workerInstanceId, "stale-ui-owner");
+    await runtime.stop();
+  } finally {
+    await runtime?.stop().catch(() => undefined);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("Gateway runtime 拒绝活跃旧 worker 且不清除 owner/route 记录", async () => {
   const fixture = await createRuntimeFixture();
   const lease = await GatewayLease.acquire(fixture.managerDirectory);

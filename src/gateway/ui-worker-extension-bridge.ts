@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  FooterComponent,
+  type AgentSession,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { isProcessAlive } from "../system/process-liveness.ts";
 import { ProjectService, ProjectServiceError } from "../projects/project-service.ts";
 import {
   createStableNamedPipe,
@@ -22,6 +25,10 @@ interface PendingUiPrompt {
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
 }
+
+type UiWorkerConnectionState = "connected" | "connecting" | "disconnected";
+
+type UiWorkerStatusSink = (state: UiWorkerConnectionState) => void;
 
 interface UiWorkerBridgeProcessState extends NodeJS.Process {
   piWechatUiWorkerBridge?: UiWorkerExtensionBridge;
@@ -51,6 +58,7 @@ export class UiWorkerExtensionBridge {
   private readonly instanceId: string;
   private readonly managerDirectory: string;
   private readonly launchRecord?: UiWorkerLaunchRecord;
+  private statusSink?: UiWorkerStatusSink;
 
   /**
    * 创建可见 Pi session 的 Gateway bridge, 支持 Gateway 启动的 TUI 与普通 Pi TUI。
@@ -71,6 +79,29 @@ export class UiWorkerExtensionBridge {
     }
     this.launchId = launchRecord?.launchId ?? randomUUID();
     this.instanceId = launchRecord?.instanceId ?? randomUUID();
+  }
+
+  /**
+   * 设置当前 TUI footer 状态回调, 用于显示 Hub 是否已接入.
+   *
+   * @param sink 状态回调. 传入 undefined 时移除回调.
+   * @returns 无返回值.
+   */
+  setStatusSink(sink: UiWorkerStatusSink | undefined): void {
+    this.statusSink = sink;
+    if (sink) {
+      sink(this.client ? "connected" : "disconnected");
+    }
+  }
+
+  /**
+   * 向当前 TUI 通知 UI worker 连接状态.
+   *
+   * @param state 当前连接状态.
+   * @returns 无返回值.
+   */
+  private notifyConnectionState(state: UiWorkerConnectionState): void {
+    this.statusSink?.(state);
   }
 
   /**
@@ -102,8 +133,10 @@ export class UiWorkerExtensionBridge {
           clearName: registration.name === undefined,
         });
       }
+      this.notifyConnectionState("connected");
       return;
     }
+    this.notifyConnectionState("connecting");
     this.scheduleConnect(0);
   }
 
@@ -193,7 +226,6 @@ export class UiWorkerExtensionBridge {
         typeof value.pid !== "number" ||
         !Number.isSafeInteger(value.pid) ||
         value.pid <= 0 ||
-        (value.state !== "stale" && value.state !== "stopping") ||
         isProcessAlive(value.pid)
       ) {
         return true;
@@ -306,6 +338,7 @@ export class UiWorkerExtensionBridge {
       const previousClient = this.client;
       this.client = undefined;
       previousClient?.close();
+      this.notifyConnectionState("disconnected");
       return;
     }
     this.closing = true;
@@ -321,6 +354,7 @@ export class UiWorkerExtensionBridge {
     if (bridgeProcess.piWechatUiWorkerBridge === this) {
       delete bridgeProcess.piWechatUiWorkerBridge;
     }
+    this.notifyConnectionState("disconnected");
   }
 
   /**
@@ -529,6 +563,7 @@ export class UiWorkerExtensionBridge {
         return;
       }
       this.client = client;
+      this.notifyConnectionState("connected");
       if (this.registration !== registration) {
         client.notify("session_changed", { registration: this.registration });
       }
@@ -537,6 +572,7 @@ export class UiWorkerExtensionBridge {
         if (this.client === client) {
           this.client = undefined;
           this.stopHeartbeat();
+          this.notifyConnectionState("connecting");
           this.scheduleConnect(this.reconnectDelayMs);
           this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 15000);
         }
@@ -545,6 +581,7 @@ export class UiWorkerExtensionBridge {
         if (this.client === client) {
           this.client = undefined;
           this.stopHeartbeat();
+          this.notifyConnectionState("connecting");
           this.scheduleConnect(this.reconnectDelayMs);
           this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 15000);
         }
@@ -552,6 +589,7 @@ export class UiWorkerExtensionBridge {
       this.startHeartbeat();
       client.notify("heartbeat", { state: registration.state });
     } catch {
+      this.notifyConnectionState("connecting");
       this.scheduleConnect(this.reconnectDelayMs);
       this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 15000);
     }
@@ -671,6 +709,54 @@ export async function attachCurrentUiWorkerSession(
 }
 
 /**
+ * 安装保留 Pi 默认 footer 布局的 Hub 状态渲染器.
+ *
+ * @param context 当前 TUI session context.
+ * @param statusKey Hub footer 状态 key.
+ * @returns 无返回值.
+ */
+function installHubFooter(context: ExtensionContext, statusKey: string): void {
+  if (context.mode !== "tui") {
+    return;
+  }
+  const sessionLike = {
+    get state() {
+      return {
+        model: context.model,
+        thinkingLevel: context.thinkingLevel ?? "off",
+      };
+    },
+    sessionManager: context.sessionManager,
+    getContextUsage: () => context.getContextUsage(),
+    modelRuntime: {
+      isUsingSubscription: (): boolean => false,
+    },
+  } as unknown as AgentSession;
+
+  context.ui.setFooter((_tui, theme, footerData) => {
+    const defaultFooter = new FooterComponent(sessionLike, footerData);
+    return {
+      render(width: number): string[] {
+        const lines = defaultFooter.render(width);
+        const statusText = footerData.getExtensionStatuses().get(statusKey);
+        const lastLine = lines.at(-1);
+        if (statusText && lastLine) {
+          const color = statusText.startsWith("🟢") ? "success" : "warning";
+          lines[lines.length - 1] = lastLine.replace(statusText, theme.fg(color, statusText));
+        }
+        return lines;
+      },
+      invalidate(): void {
+        defaultFooter.invalidate();
+      },
+      dispose(): void {
+        defaultFooter.dispose();
+      },
+    };
+  });
+}
+
+/**
  * 注册所有可见 Pi TUI 的 Hub session owner bridge。
  *
  * @param pi Pi extension API。
@@ -684,17 +770,41 @@ export function registerUiWorkerBridgeHooks(
   managerDirectory: string,
 ): void {
   let bridge = bridgeProcess.piWechatUiWorkerBridge;
+  let statusContext: ExtensionContext | undefined;
+  const statusKey = "wechat-session-hub";
+  const updateStatus = (state: UiWorkerConnectionState): void => {
+    const ui = statusContext?.ui;
+    if (!ui) {
+      return;
+    }
+    const text = state === "connected"
+      ? "🟢 微信: 已接入"
+      : state === "connecting"
+        ? "🟡 微信: 连接中"
+        : undefined;
+    ui.setStatus(statusKey, text);
+  };
 
   pi.on("session_start", async (event, sessionContext) => {
     if (sessionContext.mode !== "tui") {
       return;
     }
-    if (event.reason === "reload" && bridge) {
+    if (bridge && typeof bridge.setStatusSink !== "function") {
       if (bridgeProcess.piWechatUiWorkerBridge === bridge) {
         delete bridgeProcess.piWechatUiWorkerBridge;
       }
       bridge = undefined;
     }
+    if (event.reason === "reload" && bridge) {
+      bridge.setStatusSink(undefined);
+      if (bridgeProcess.piWechatUiWorkerBridge === bridge) {
+        delete bridgeProcess.piWechatUiWorkerBridge;
+      }
+      bridge = undefined;
+    }
+    statusContext = sessionContext;
+    sessionContext.ui.setStatus(statusKey, undefined);
+    installHubFooter(sessionContext, statusKey);
     const configuredManagerDirectory = process.env.PI_WECHAT_MANAGER_DIR;
     if (configuredManagerDirectory && !samePath(configuredManagerDirectory, managerDirectory)) {
       sessionContext.ui.notify("UI worker managerDirectory 与当前 Pi agent 配置不一致, 已拒绝注册。", "error");
@@ -722,6 +832,7 @@ export function registerUiWorkerBridgeHooks(
         return;
       }
     }
+    bridge.setStatusSink(updateStatus);
     try {
       await bridge.attach(pi, sessionContext);
     } catch (error) {
@@ -764,12 +875,21 @@ export function registerUiWorkerBridgeHooks(
   pi.on("agent_settled", () => bridge?.onAgentSettled());
   pi.on("session_shutdown", async (event) => {
     if (!bridge) {
+      statusContext?.ui.setStatus(statusKey, undefined);
+      if (event.reason === "quit") {
+        statusContext = undefined;
+      }
       return;
     }
     await bridge.onSessionShutdown(event);
     if (event.reason === "quit" && bridgeProcess.piWechatUiWorkerBridge === bridge) {
+      if (typeof bridge.setStatusSink === "function") {
+        bridge.setStatusSink(undefined);
+      }
       delete bridgeProcess.piWechatUiWorkerBridge;
       bridge = undefined;
+      statusContext?.ui.setStatus(statusKey, undefined);
+      statusContext = undefined;
     }
   });
 }
@@ -816,21 +936,6 @@ function extractAssistantText(message: unknown): string {
     .filter((item) => isRecord(item) && item.type === "text" && typeof item.text === "string")
     .map((item) => (item as { text: string }).text)
     .join("");
-}
-
-/**
- * 判断指定 PID 是否仍可能运行。
- *
- * @param pid 进程 ID。
- * @returns PID 存活或状态不明确时返回 true。
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH");
-  }
 }
 
 /**

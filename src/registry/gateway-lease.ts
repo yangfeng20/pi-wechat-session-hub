@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, unlink, utimes } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { isProcessAlive } from "../system/process-liveness.ts";
 import { promisify } from "node:util";
 
 interface GatewayLockMetadata {
@@ -330,12 +331,7 @@ async function isStaleLock(
       return existing.processBirthId !== current.processBirthId;
     }
 
-    try {
-      process.kill(existing.pid, 0);
-      return false;
-    } catch (error) {
-      return isNodeError(error) && error.code === "ESRCH";
-    }
+    return !isProcessAlive(existing.pid);
   } catch {
     return false;
   }

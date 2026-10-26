@@ -11,6 +11,7 @@ import {
   UiWorkerIpcServer,
   type UiWorkerIpcConnection,
 } from "../gateway/ui-worker-ipc.ts";
+import { isProcessAlive } from "../system/process-liveness.ts";
 import type { UiWorkerLaunchRecord, UiWorkerRegistration } from "../gateway/ui-worker-types.ts";
 import type { PiCliInvocation } from "./pi-cli.ts";
 import type { BackgroundWorkerManager } from "./background-worker-manager.ts";
@@ -389,7 +390,7 @@ export class UiWorkerManager {
     let otherOwner = Object.values(snapshot.instances).find((instance) =>
       instance.sessionId === registration.sessionId &&
       instance.instanceId !== registration.instanceId &&
-      ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+      isProcessAlive(instance.pid),
     );
     if (
       otherOwner?.mode === "background" &&
@@ -402,7 +403,7 @@ export class UiWorkerManager {
       otherOwner = Object.values(snapshot.instances).find((instance) =>
         instance.sessionId === registration.sessionId &&
         instance.instanceId !== registration.instanceId &&
-        ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+        isProcessAlive(instance.pid),
       );
     }
     if (otherOwner) {
@@ -629,7 +630,7 @@ export class UiWorkerManager {
       const unindexedOwner = Object.values(snapshot.instances).find((instance) =>
         samePath(instance.sessionFile, params.sessionFile as string) &&
         instance.instanceId !== connection.registration.instanceId &&
-        ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+        isProcessAlive(instance.pid),
       );
       return unindexedOwner
         ? { allowed: false, reason: "session_owned_by_other_process" }
@@ -643,7 +644,7 @@ export class UiWorkerManager {
     let competingOwner = Object.values(snapshot.instances).find((instance) =>
       instance.sessionId === target.sessionId &&
       instance.instanceId !== connection.registration.instanceId &&
-      ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+      isProcessAlive(instance.pid),
     );
     if (
       competingOwner?.mode === "background" &&
@@ -660,7 +661,7 @@ export class UiWorkerManager {
       competingOwner = Object.values(snapshot.instances).find((instance) =>
         instance.sessionId === target.sessionId &&
         instance.instanceId !== connection.registration.instanceId &&
-        ((instance.state !== "stale" && instance.state !== "stopping") || isProcessAlive(instance.pid)),
+        isProcessAlive(instance.pid),
       );
     }
     if (competingOwner) {
@@ -1121,21 +1122,6 @@ async function isPersistedSessionFile(sessionFile: string): Promise<boolean> {
       return false;
     }
     throw error;
-  }
-}
-
-/**
- * 判断 worker PID 是否存活或权限无法判定。
- *
- * @param pid 进程 ID。
- * @returns 存活或状态不明时返回 true。
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return !(isNodeError(error) && error.code === "ESRCH");
   }
 }
 

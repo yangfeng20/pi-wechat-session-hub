@@ -15,6 +15,7 @@ import { IlinkCursorStore } from "./wechat-ilink/cursor-store.ts";
 import { GatewayLease } from "../registry/gateway-lease.ts";
 import { ManagerRegistry } from "../registry/manager-registry.ts";
 import type { GatewayStatusRecord, RouteRecord, SessionIndexRecord, WorkerInstanceRecord } from "../registry/types.ts";
+import { isProcessAlive } from "../system/process-liveness.ts";
 import { BackgroundWorkerManager } from "../runtime/background-worker-manager.ts";
 import { GatewayWorkerManager } from "../runtime/gateway-worker-manager.ts";
 import { UiWorkerManager } from "../runtime/ui-worker-manager.ts";
@@ -336,6 +337,7 @@ export class GatewayRuntime extends EventEmitter {
 
     const deadInstances: WorkerInstanceRecord[] = [];
     const liveUiInstances: WorkerInstanceRecord[] = [];
+    const staleUiInstances: WorkerInstanceRecord[] = [];
     for (const instance of Object.values(initial.instances)) {
       if (!initial.sessions[instance.sessionId]) {
         throw new GatewayRuntimeError(
@@ -346,7 +348,11 @@ export class GatewayRuntime extends EventEmitter {
       if (!isProcessAlive(instance.pid)) {
         deadInstances.push(instance);
       } else if (instance.mode === "ui" && this.uiWorkerManager.isSupported) {
-        liveUiInstances.push(instance);
+        if (instance.state === "stale" || instance.state === "stopping") {
+          staleUiInstances.push(instance);
+        } else {
+          liveUiInstances.push(instance);
+        }
       } else {
         throw new GatewayRuntimeError(
           "live_worker_detected",
@@ -388,8 +394,11 @@ export class GatewayRuntime extends EventEmitter {
         .filter((instance) => instance.mode === "ui" && instance.state !== "stale" && instance.state !== "stopping")
         .map((instance) => instance.sessionId),
     );
+    const staleUiSessionIds = new Set(staleUiInstances.map((instance) => instance.sessionId));
     const unownedUiSessions = Object.values(snapshot.sessions).filter((session) =>
-      session.mode === "ui" && !liveUiSessionIds.has(session.sessionId),
+      session.mode === "ui" &&
+      !staleUiSessionIds.has(session.sessionId) &&
+      !liveUiSessionIds.has(session.sessionId),
     );
     await Promise.all(unownedUiSessions.map(async (session) =>
       this.registry.upsertSession({
@@ -422,11 +431,13 @@ export class GatewayRuntime extends EventEmitter {
 
     const restorableRoutes = routeAnalyses.filter(({ session, ownerIsActive, sessionFileExists }) =>
       !ownerIsActive &&
+      !staleUiSessionIds.has(session.sessionId) &&
       sessionFileExists &&
       (session.mode === "background" || this.uiWorkerManager.isSupported),
     );
     const unboundRoutes = routeAnalyses.filter(({ ownerIsActive, sessionFileExists, session }) =>
       !ownerIsActive &&
+      !staleUiSessionIds.has(session.sessionId) &&
       (!sessionFileExists || (session.mode === "ui" && !this.uiWorkerManager.isSupported)),
     );
     const missingTranscriptSessions = new Map(
@@ -463,6 +474,7 @@ export class GatewayRuntime extends EventEmitter {
     }
     await this.registry.appendEvent("gateway.recovered", {
       staleWorkerCount: deadInstances.length,
+      staleUiWorkerCount: staleUiInstances.length,
       reattachedUiWorkerCount: liveUiInstances.length,
       resumedRouteCount: restorableRoutes.length,
       unboundRouteCount: unboundRoutes.length,
@@ -643,27 +655,6 @@ export class GatewayRuntime extends EventEmitter {
       heartbeatAt,
       state,
     };
-  }
-}
-
-/**
- * 检查 registry 中 Pi worker PID 是否仍可能对应存活进程。
- *
- * @param pid worker 进程 ID。
- * @returns 进程存在或权限状态不明确时返回 true。
- */
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return true;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ESRCH") {
-      return false;
-    }
-    return true;
   }
 }
 

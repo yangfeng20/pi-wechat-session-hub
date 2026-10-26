@@ -134,6 +134,10 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     });
 
     bridge = new UiWorkerExtensionBridge(undefined, projectService, managerDirectory);
+    const bridgeStates: string[] = [];
+    bridge.setStatusSink((state) => {
+      bridgeStates.push(state);
+    });
     uiState.cwd = outsidePath;
     uiState.sessionFile = join(outsidePath, "outside-ui-session.jsonl");
     await assert.rejects(bridge.attach(pi, context), /\/wx roots add-current/);
@@ -144,12 +148,14 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     });
     await bridge.attach(pi, context);
     await autoRegistered;
+    assert.equal(bridgeStates.at(-1), "connected");
     const autoSession = (await registry.readSnapshot()).sessions[uiState.sessionId];
     assert.ok(autoSession);
     assert.equal(autoSession.projectAlias, "unregistered");
     assert.equal((await projectService.list()).config.projects.unregistered.displayName, "unregistered");
     assert.equal(await bridge.canSwitchSession(session.sessionFile), true);
     await bridge.onSessionShutdown({ reason: "resume" });
+    assert.equal(bridgeStates.at(-1), "disconnected");
     uiState.sessionId = session.sessionId;
     uiState.sessionFile = session.sessionFile;
     uiState.cwd = projectPath;
@@ -159,6 +165,7 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     });
     await bridge.attach(pi, context);
     await registered;
+    assert.equal(bridgeStates.at(-1), "connected");
 
     const otherBackgroundSession = await backgroundManager.startNew("demo", "后台会话");
     assert.equal(
@@ -182,6 +189,7 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     assert.equal(await gatewayWorkerManager.prompt(session.sessionId, "桌面可见回复"), "UI 回复: 桌面可见回复");
 
     await bridge.onSessionShutdown({ reason: "quit" });
+    assert.equal(bridgeStates.at(-1), "disconnected");
     const background = await registry.readSnapshot();
     const backgroundOwnerId = background.routes["wx-owner-test"].workerInstanceId;
     assert.notEqual(backgroundOwnerId, foregroundOwnerId);

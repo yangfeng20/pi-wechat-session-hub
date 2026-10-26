@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isProcessAlive } from "../system/process-liveness.ts";
 import { getCredentialFilePath, getManagerConfigurationPath } from "./paths.ts";
 import { createDefaultConfiguration } from "./defaults.ts";
 import { ConfigurationValidationError, validateConfiguration } from "./validation.ts";
@@ -222,12 +223,7 @@ export class ConfigurationStore {
       if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 || !metadata.token) {
         return true;
       }
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch (error) {
-        return !isNodeError(error) || error.code !== "ESRCH";
-      }
+      return isProcessAlive(pid);
     } catch {
       return true;
     }
