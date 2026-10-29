@@ -34,7 +34,12 @@ export async function watchGatewayLifecycleOperation(
   }
   const operationDirectory = await ensureOperationDirectory(managerDirectory);
   const receiptPath = join(operationDirectory, `${operationId}.json`);
-  const watcher = watch(operationDirectory, { persistent: false });
+  // 使用 persistent: true, 由 wait() 安装的超时定时器与 close() 共同控制生命周期。
+  // persistent: false 会让监听器不持有事件循环: 若同时把超时定时器 unref,
+  // Node 会在 Promise 决之前退出 (Windows CI 上曾复现); 若定时器不 unref,
+  // 又会在 Linux 上让进程迟迟不退出。改为 persistent: true 后两者行为一致,
+  // 且 close() 一定会释放监听器。
+  const watcher = watch(operationDirectory, { persistent: true });
   let cachedReceipt: GatewayLifecycleOperationReceipt | undefined;
   let readError: Error | undefined;
   let resolveWait: ((receipt: GatewayLifecycleOperationReceipt) => void) | undefined;
@@ -113,10 +118,9 @@ export async function watchGatewayLifecycleOperation(
           clearWait();
           reject?.(new Error("等待 Gateway 重启完成超时。"));
         }, timeoutMs);
-        // 超时定时器不调用 unref(): 等待期间唯一的活动资源是 persistent:false
-        // 的目录监听器, 若定时器也不持有事件循环, Node 会在 Promise 决之前退出,
-        // 表现为主进程报告 "Promise resolution is still pending but the event
-        // loop has already resolved"。等待方主动 close() 会清理该定时器。
+        // 超时定时器不调用 unref(): 等待期间的存活由 close() 控制,
+        // 由监听器与定时器共同保证 Node 不会在 Promise 决之前退出。
+        // 调用方结束时会主动 close(), 因此不会长期占用事件循环。
         void readReceipt();
       });
     },
@@ -182,9 +186,8 @@ export async function writeGatewayLifecycleOperationReceipt(
  * 在替换阶段瞬时失败. 重试次数少且间隔短, 不改变调用方的超时预期。
  * 采用递归推进而非循环内等待, 避免在循环体内阻塞。
  *
- * 退避定时器不调用 `unref()`: 调用方(如 lifecycle watcher)可能使用
- * `persistent: false` 的监听器, 若重试期间定时器也不持有事件循环,
- * 进程会在真正完成替换前提前退出。单个退避最长 200ms, 影响可忽略。
+ * 退避定时器不调用 `unref()`: 替换完成前进程必须保持存活,
+ * 否则调用方可能在回执落盘前失去事件循环。单个退避最长 200ms, 影响可忽略。
  *
  * @param temporaryPath 已写入的临时文件路径。
  * @param targetPath 目标回执文件路径。
