@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { ProjectService, ProjectServiceError } from "../projects/project-service.ts";
 import type { ProjectDefinition } from "../config/types.ts";
@@ -1000,13 +1000,23 @@ export class UiWorkerManager {
    * @returns 已验证项目路径。
    */
   private async resolveProject(projectAlias: string): Promise<{ displayName: string; path: string }> {
+    let project: { displayName: string; path: string };
     try {
-      return await this.options.projectService.resolve(projectAlias);
+      project = await this.options.projectService.resolve(projectAlias);
     } catch (error) {
       if (error instanceof ProjectServiceError) {
         throw error;
       }
       throw new UiWorkerManagerError("worker_launch_failed", "UI worker 项目路径验证失败。 ");
+    }
+    // launch record 会与 UI worker 注册时的 realpath 规范化 cwd 做严格比较。
+    // GitHub Windows runner 的临时目录带 8.3 短名 (RUNNER~1), 若不在此统一
+    // 规范化, 两侧路径字符串不同会导致握手阶段误判为 registration 与 launch
+    // record 不匹配。规范化失败时回退原路径, 由后续校验决定是否放行。
+    try {
+      return { displayName: project.displayName, path: await realpath(project.path) };
+    } catch {
+      return project;
     }
   }
 
