@@ -1,5 +1,6 @@
+import { realpathSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
-import { realpath, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { ProjectService, ProjectServiceError } from "../projects/project-service.ts";
 import type { ProjectDefinition } from "../config/types.ts";
@@ -1000,23 +1001,13 @@ export class UiWorkerManager {
    * @returns 已验证项目路径。
    */
   private async resolveProject(projectAlias: string): Promise<{ displayName: string; path: string }> {
-    let project: { displayName: string; path: string };
     try {
-      project = await this.options.projectService.resolve(projectAlias);
+      return await this.options.projectService.resolve(projectAlias);
     } catch (error) {
       if (error instanceof ProjectServiceError) {
         throw error;
       }
       throw new UiWorkerManagerError("worker_launch_failed", "UI worker 项目路径验证失败。 ");
-    }
-    // launch record 会与 UI worker 注册时的 realpath 规范化 cwd 做严格比较。
-    // GitHub Windows runner 的临时目录带 8.3 短名 (RUNNER~1), 若不在此统一
-    // 规范化, 两侧路径字符串不同会导致握手阶段误判为 registration 与 launch
-    // record 不匹配。规范化失败时回退原路径, 由后续校验决定是否放行。
-    try {
-      return { displayName: project.displayName, path: await realpath(project.path) };
-    } catch {
-      return project;
     }
   }
 
@@ -1142,12 +1133,33 @@ function applySessionName(
  * @returns 规范路径一致时返回 true。
  */
 function samePath(left: string, right: string): boolean {
-  const resolvedLeft = resolve(left);
-  const resolvedRight = resolve(right);
+  const resolvedLeft = normalizeComparablePath(left);
+  const resolvedRight = normalizeComparablePath(right);
   return process.platform === "win32"
     ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
     : resolvedLeft === resolvedRight;
 }
+
+/**
+ * 将路径归一化为可比较形式, 尽量消解 Windows 8.3 短名与符号链接差异。
+ *
+ * GitHub Windows runner 的临时目录会是 `RUNNER~1`, 而 `realpath` 返回
+ * `runneradmin`。两侧若一侧已规范化、另一侧未规范化, 纯字符串比较会
+ * 误判为不同路径。这里尽力对两侧同时做 `realpathSync.native`; 任一侧
+ * 无法解析(例如文件尚未创建)时回退到 `resolve` 结果。
+ *
+ * @param value 待归一化路径。
+ * @returns 用于相等比较的路径字符串。
+ */
+function normalizeComparablePath(value: string): string {
+  const resolved = resolve(value);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 
 /**
  * 校验 UI bridge 发来的 worker state。

@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
@@ -1062,9 +1063,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * @returns 路径相同时返回 true。
  */
 function samePath(left: string, right: string): boolean {
-  const resolvedLeft = resolve(left);
-  const resolvedRight = resolve(right);
+  const resolvedLeft = normalizeComparablePath(left);
+  const resolvedRight = normalizeComparablePath(right);
   return process.platform === "win32"
     ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
     : resolvedLeft === resolvedRight;
 }
+
+/**
+ * 将路径归一化为可比较形式, 尽量消解 Windows 8.3 短名与符号链接差异。
+ *
+ * GitHub Windows runner 的临时目录会是 `RUNNER~1`, 而 `realpath` 返回
+ * `runneradmin`。两侧若一侧已规范化、另一侧未规范化, 纯字符串比较会
+ * 误判为不同路径。这里尽力对两侧同时做 `realpathSync.native`; 任一侧
+ * 无法解析(例如文件尚未创建)时回退到 `resolve` 结果。
+ *
+ * @param value 待归一化路径。
+ * @returns 用于相等比较的路径字符串。
+ */
+function normalizeComparablePath(value: string): string {
+  const resolved = resolve(value);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
