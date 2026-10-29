@@ -30,12 +30,25 @@ type UiWorkerConnectionState = "connected" | "connecting" | "disconnected";
 
 type UiWorkerStatusSink = (state: UiWorkerConnectionState) => void;
 
+/**
+ * 可供本机诊断展示的 UI worker bridge 状态快照。
+ */
+export interface UiWorkerBridgeDiagnostics {
+  instanceId: string;
+  sessionId: string | undefined;
+  state: UiWorkerConnectionState;
+  reconnectAttempts: number;
+  lastConnectedAt: string | undefined;
+  lastDisconnectReason: string | undefined;
+}
+
 interface UiWorkerBridgeProcessState extends NodeJS.Process {
   piWechatUiWorkerBridge?: UiWorkerExtensionBridge;
 }
 
 const bridgeProcess = process as UiWorkerBridgeProcessState;
 const PROCESS_BIRTH_ID = `${process.pid}:${Math.floor(Date.now() - process.uptime() * 1000)}`;
+const RECOVERY_CHECK_INTERVAL_MS = 15000;
 
 /**
  * 在一个 Pi TUI extension host 内运行 session owner named pipe bridge。
@@ -47,9 +60,14 @@ export class UiWorkerExtensionBridge {
   private registration?: UiWorkerRegistration;
   private connectionTask?: Promise<void>;
   private reconnectTimer?: NodeJS.Timeout;
+  private recoveryTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
   private reconnectDelayMs = 500;
   private closing = false;
+  private connectionState: UiWorkerConnectionState = "disconnected";
+  private reconnectAttempts = 0;
+  private lastConnectedAt: string | undefined;
+  private lastDisconnectReason: string | undefined;
   private initialSessionId?: string;
   private latestAssistantText = "";
   private pendingPrompt?: PendingUiPrompt;
@@ -101,7 +119,24 @@ export class UiWorkerExtensionBridge {
    * @returns 无返回值.
    */
   private notifyConnectionState(state: UiWorkerConnectionState): void {
+    this.connectionState = state;
     this.statusSink?.(state);
+  }
+
+  /**
+   * 获取当前 bridge 连接诊断快照, 供 `/wx status` 展示真实连接状态。
+   *
+   * @returns 不包含凭证与消息正文的诊断信息。
+   */
+  getDiagnostics(): UiWorkerBridgeDiagnostics {
+    return {
+      instanceId: this.instanceId,
+      sessionId: this.registration?.sessionId,
+      state: this.connectionState,
+      reconnectAttempts: this.reconnectAttempts,
+      lastConnectedAt: this.lastConnectedAt,
+      lastDisconnectReason: this.lastDisconnectReason,
+    };
   }
 
   /**
@@ -136,6 +171,7 @@ export class UiWorkerExtensionBridge {
       this.notifyConnectionState("connected");
       return;
     }
+    this.reconnectDelayMs = 500;
     this.notifyConnectionState("connecting");
     this.scheduleConnect(0);
   }
@@ -331,16 +367,18 @@ export class UiWorkerExtensionBridge {
     this.pendingPrompt = undefined;
     pending?.reject(new UiWorkerIpcError("worker_disconnected", "Pi session 正在关闭或切换, remote prompt 未完成。 "));
     if (event.reason !== "quit") {
-      this.pi = undefined;
-      this.context = undefined;
       this.registration = undefined;
       this.stopHeartbeat();
       const previousClient = this.client;
       this.client = undefined;
       previousClient?.close();
+      this.lastDisconnectReason = `session ${event.reason} 切换中`;
       this.notifyConnectionState("disconnected");
+      this.scheduleRecoveryCheck();
       return;
     }
+    this.pi = undefined;
+    this.context = undefined;
     this.closing = true;
     this.clearTimers();
     const client = this.client;
@@ -517,17 +555,65 @@ export class UiWorkerExtensionBridge {
     if (this.closing || this.client || this.connectionTask || this.reconnectTimer) {
       return;
     }
+    if (!this.registration) {
+      this.lastDisconnectReason ??= "缺少 session registration, 等待 session 重新 attach";
+      this.notifyConnectionState("disconnected");
+      this.scheduleRecoveryCheck();
+      return;
+    }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       this.connectionTask = this.connectOnce().finally(() => {
         this.connectionTask = undefined;
-        if (!this.client && this.registration && !this.closing) {
+        if (!this.client && !this.closing) {
           this.scheduleConnect(this.reconnectDelayMs);
         }
       });
       void this.connectionTask;
     }, delayMs);
     this.reconnectTimer.unref();
+  }
+
+  /**
+   * 在缺少 registration 时定期重试恢复, 避免 footer 永久停在“连接中”。
+   *
+   * @returns 无返回值。
+   */
+  private scheduleRecoveryCheck(): void {
+    if (this.closing || this.client || this.recoveryTimer) {
+      return;
+    }
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = undefined;
+      void this.recoverRegistration();
+    }, RECOVERY_CHECK_INTERVAL_MS);
+    this.recoveryTimer.unref();
+  }
+
+  /**
+   * 尝试用当前 Pi context 重建 registration 并恢复 IPC 连接。
+   *
+   * @returns 无返回值。
+   */
+  private async recoverRegistration(): Promise<void> {
+    if (this.closing || this.client) {
+      return;
+    }
+    if (!this.registration && this.pi && this.context) {
+      try {
+        this.registration = await this.createRegistration(this.context, false);
+      } catch (error) {
+        this.lastDisconnectReason = error instanceof Error ? error.message : "重建 registration 失败";
+      }
+    }
+    if (this.registration) {
+      this.reconnectDelayMs = 500;
+      this.notifyConnectionState("connecting");
+      this.scheduleConnect(0);
+      return;
+    }
+    this.notifyConnectionState("disconnected");
+    this.scheduleRecoveryCheck();
   }
 
   /**
@@ -563,6 +649,9 @@ export class UiWorkerExtensionBridge {
         return;
       }
       this.client = client;
+      this.reconnectAttempts = 0;
+      this.lastConnectedAt = new Date().toISOString();
+      this.lastDisconnectReason = undefined;
       this.notifyConnectionState("connected");
       if (this.registration !== registration) {
         client.notify("session_changed", { registration: this.registration });
@@ -572,15 +661,17 @@ export class UiWorkerExtensionBridge {
         if (this.client === client) {
           this.client = undefined;
           this.stopHeartbeat();
+          this.lastDisconnectReason = "IPC 连接已关闭";
           this.notifyConnectionState("connecting");
           this.scheduleConnect(this.reconnectDelayMs);
           this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 15000);
         }
       });
-      client.on("transport_error", () => {
+      client.on("transport_error", (error: Error) => {
         if (this.client === client) {
           this.client = undefined;
           this.stopHeartbeat();
+          this.lastDisconnectReason = `IPC 传输错误: ${error.message}`;
           this.notifyConnectionState("connecting");
           this.scheduleConnect(this.reconnectDelayMs);
           this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 15000);
@@ -588,7 +679,9 @@ export class UiWorkerExtensionBridge {
       });
       this.startHeartbeat();
       client.notify("heartbeat", { state: registration.state });
-    } catch {
+    } catch (error) {
+      this.reconnectAttempts += 1;
+      this.lastDisconnectReason = error instanceof Error ? error.message : "UI worker IPC 连接失败";
       this.notifyConnectionState("connecting");
       this.scheduleConnect(this.reconnectDelayMs);
       this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 15000);
@@ -622,6 +715,10 @@ export class UiWorkerExtensionBridge {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
+    }
+    if (this.recoveryTimer) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = undefined;
     }
     this.stopHeartbeat();
     for (const resolveIdle of this.idleWaiters) {
@@ -892,6 +989,15 @@ export function registerUiWorkerBridgeHooks(
       statusContext = undefined;
     }
   });
+}
+
+/**
+ * 获取当前进程内 UI worker bridge 的诊断快照。
+ *
+ * @returns 当前 TUI 的连接诊断信息; 本进程未建立 bridge 时返回 undefined。
+ */
+export function getCurrentUiWorkerBridgeDiagnostics(): UiWorkerBridgeDiagnostics | undefined {
+  return bridgeProcess.piWechatUiWorkerBridge?.getDiagnostics();
 }
 
 /**

@@ -18,7 +18,7 @@ import { getManagerDataDirectory } from "../src/config/paths.ts";
 import { GatewayControlError } from "../src/gateway/gateway-control-ipc.ts";
 import { GatewayServiceController, type GatewayDaemonLaunchSpec, type GatewayServiceStatus } from "../src/runtime/gateway-service-controller.ts";
 import { WindowsLogonTaskManager, WindowsLogonTaskManagerError } from "../src/runtime/windows-logon-task-manager.ts";
-import { registerUiWorkerBridgeHooks, attachCurrentUiWorkerSession } from "../src/gateway/ui-worker-extension-bridge.ts";
+import { registerUiWorkerBridgeHooks, attachCurrentUiWorkerSession, getCurrentUiWorkerBridgeDiagnostics } from "../src/gateway/ui-worker-extension-bridge.ts";
 import { UiWorkerIpcError } from "../src/gateway/ui-worker-ipc.ts";
 import { IlinkApiError } from "../src/gateway/wechat-ilink/api-client.ts";
 import { IlinkCredentialStoreError } from "../src/gateway/credential-store.ts";
@@ -131,6 +131,54 @@ function formatGatewayServiceStatus(
     `Windows 登录自动启动: ${autoStart ? "开启" : "关闭"}`,
     ...(status.error ? [`状态说明: ${status.error}`] : []),
   ].join("\n");
+}
+
+/**
+ * 格式化当前 Pi TUI 自身的 Hub bridge 连接状态.
+ *
+ * Gateway 进程在线不代表当前 TUI 已接入; 该行用于区分全局服务状态与本终端连接状态.
+ *
+ * @returns 面向用户的中文状态说明.
+ */
+function formatCurrentTuiBridgeStatus(): string {
+  const diagnostics = getCurrentUiWorkerBridgeDiagnostics();
+  if (!diagnostics) {
+    return "当前终端接入: 未建立 (本会话未接入 Hub)";
+  }
+  const stateText: Record<typeof diagnostics.state, string> = {
+    connected: "🟢 已接入",
+    connecting: "🟡 连接中",
+    disconnected: "⚪ 未接入",
+  };
+  const lines = [
+    `当前终端接入: ${stateText[diagnostics.state]}`,
+    `终端实例: ${diagnostics.instanceId.slice(0, 8)}`,
+  ];
+  if (diagnostics.lastConnectedAt) {
+    lines.push(`上次接入: ${formatLocalMinute(diagnostics.lastConnectedAt)}`);
+  }
+  if (diagnostics.reconnectAttempts > 0) {
+    lines.push(`重连失败次数: ${diagnostics.reconnectAttempts}`);
+  }
+  if (diagnostics.state !== "connected" && diagnostics.lastDisconnectReason) {
+    lines.push(`断开原因: ${diagnostics.lastDisconnectReason}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * 将 ISO 时间转换为本地时区的分钟精度文本.
+ *
+ * @param isoTimestamp ISO 时间字符串.
+ * @returns 本地时间文本, 无法解析时返回原始文本.
+ */
+function formatLocalMinute(isoTimestamp: string): string {
+  const parsed = new Date(isoTimestamp);
+  if (Number.isNaN(parsed.getTime())) {
+    return isoTimestamp;
+  }
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
 }
 
 /**
@@ -384,6 +432,7 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
         ctx.ui.notify(
           [
             formatGatewayServiceStatus(status, snapshot.config.autoStartOnWindowsLogon),
+            formatCurrentTuiBridgeStatus(),
             `配置: ${snapshot.exists ? "已加载" : "尚未创建"}`,
             `授权根目录: ${snapshot.config.allowedProjectRoots.length}`,
             `项目: ${Object.keys(snapshot.config.projects).length}`,

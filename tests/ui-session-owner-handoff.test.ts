@@ -219,3 +219,270 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     await rm(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * 轮询等待条件成立。
+ *
+ * @param predicate 条件函数。
+ * @param timeoutMs 最长等待时间。
+ * @returns 条件成立时的诊断快照。
+ */
+async function waitForDiagnostics(
+  predicate: (diagnostics: ReturnType<UiWorkerExtensionBridge["getDiagnostics"]>) => boolean,
+  timeoutMs = 5000,
+): Promise<ReturnType<UiWorkerExtensionBridge["getDiagnostics"]>> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const diagnostics = bridgeUnderTest!.getDiagnostics();
+    if (predicate(diagnostics)) {
+      return diagnostics;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`等待 bridge 状态超时, 当前状态: ${JSON.stringify(diagnostics)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+let bridgeUnderTest: UiWorkerExtensionBridge | undefined;
+
+test("UI bridge 诊断快照暴露真实连接状态与断开原因", async () => {
+  const root = await createTemporaryDirectory();
+  const agentDirectory = join(root, "pi-agent");
+  const managerDirectory = join(agentDirectory, "wechat-session-manager");
+  const projectRoot = join(root, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(agentDirectory, "wechat-session-manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    projects: { ...config.projects, demo: { displayName: "测试项目", path: projectPath } },
+    wechat: { ...config.wechat, authorizedUserId: "wx-bridge-diag" },
+  }));
+  const projectService = new ProjectService(configStore);
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const endpoint = process.platform === "win32"
+    ? createStableNamedPipe(managerDirectory)
+    : join(root, "ui-diag.sock");
+  const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
+  const fakePi = join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs");
+  const backgroundManager = new BackgroundWorkerManager({
+    projectService,
+    registry,
+    invocation: { command: process.execPath, args: [fakePi] },
+  });
+  const uiManager = new UiWorkerManager({
+    managerDirectory,
+    projectService,
+    registry,
+    ipcServer: server,
+    invocation: { command: process.execPath, args: [fakePi] },
+    extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
+    backgroundWorkerManager: backgroundManager,
+    platform: "win32",
+  });
+  const sessionFile = join(projectPath, "diag-session.jsonl");
+  const pi = { sendUserMessage: () => undefined } as unknown as ExtensionAPI;
+  const context = {
+    mode: "tui",
+    cwd: projectPath,
+    sessionManager: {
+      getSessionId: () => "diag-session",
+      getSessionFile: () => sessionFile,
+      getCwd: () => projectPath,
+      getSessionName: () => "诊断会话",
+    },
+    isIdle: () => true,
+    abort: () => undefined,
+    shutdown: () => undefined,
+  } as unknown as ExtensionContext;
+  const bridge = new UiWorkerExtensionBridge(undefined, projectService, managerDirectory);
+  bridgeUnderTest = bridge;
+
+  try {
+    const initial = bridge.getDiagnostics();
+    assert.equal(initial.state, "disconnected");
+    assert.equal(initial.reconnectAttempts, 0);
+    assert.equal(initial.lastDisconnectReason, undefined);
+    assert.equal(typeof initial.instanceId, "string");
+
+    await server.listen();
+    await bridge.attach(pi, context);
+    const connected = await waitForDiagnostics(
+      (diagnostics) => diagnostics.state === "connected",
+    );
+    assert.equal(connected.reconnectAttempts, 0);
+    assert.equal(connected.sessionId, "diag-session");
+    assert.equal(typeof connected.lastConnectedAt, "string");
+    assert.equal(connected.lastDisconnectReason, undefined);
+  } finally {
+    bridgeUnderTest = undefined;
+    await bridge.onSessionShutdown({ reason: "quit" }).catch(() => undefined);
+    await server.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session 切换清空 registration 后 bridge 不静默放弃, 可重新 attach 恢复", async () => {
+  const root = await createTemporaryDirectory();
+  const agentDirectory = join(root, "pi-agent");
+  const managerDirectory = join(agentDirectory, "wechat-session-manager");
+  const projectRoot = join(root, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(agentDirectory, "wechat-session-manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    projects: { ...config.projects, demo: { displayName: "测试项目", path: projectPath } },
+    wechat: { ...config.wechat, authorizedUserId: "wx-bridge-recovery" },
+  }));
+  const projectService = new ProjectService(configStore);
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const endpoint = process.platform === "win32"
+    ? createStableNamedPipe(managerDirectory)
+    : join(root, "ui-recovery.sock");
+  const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
+  const fakePi = join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs");
+  const backgroundManager = new BackgroundWorkerManager({
+    projectService,
+    registry,
+    invocation: { command: process.execPath, args: [fakePi] },
+  });
+  const uiManager = new UiWorkerManager({
+    managerDirectory,
+    projectService,
+    registry,
+    ipcServer: server,
+    invocation: { command: process.execPath, args: [fakePi] },
+    extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
+    backgroundWorkerManager: backgroundManager,
+    platform: "win32",
+  });
+  const sessionFile = join(projectPath, "recovery-session.jsonl");
+  const pi = { sendUserMessage: () => undefined } as unknown as ExtensionAPI;
+  const context = {
+    mode: "tui",
+    cwd: projectPath,
+    sessionManager: {
+      getSessionId: () => "recovery-session",
+      getSessionFile: () => sessionFile,
+      getCwd: () => projectPath,
+      getSessionName: () => "恢复会话",
+    },
+    isIdle: () => true,
+    abort: () => undefined,
+    shutdown: () => undefined,
+  } as unknown as ExtensionContext;
+  const bridge = new UiWorkerExtensionBridge(undefined, projectService, managerDirectory);
+  bridgeUnderTest = bridge;
+  const states: string[] = [];
+  bridge.setStatusSink((state) => {
+    states.push(state);
+  });
+
+  try {
+    await server.listen();
+    await bridge.attach(pi, context);
+    await waitForDiagnostics((diagnostics) => diagnostics.state === "connected");
+
+    await bridge.onSessionShutdown({ reason: "resume" });
+    const afterSwitch = bridge.getDiagnostics();
+    assert.equal(afterSwitch.sessionId, undefined);
+    assert.match(afterSwitch.lastDisconnectReason ?? "", /resume/);
+    assert.ok(
+      states.includes("disconnected"),
+      "footer 必须显示未接入, 不能永久停在连接中",
+    );
+
+    await bridge.attach(pi, context);
+    const recovered = await waitForDiagnostics(
+      (diagnostics) => diagnostics.state === "connected",
+    );
+    assert.equal(recovered.sessionId, "recovery-session");
+  } finally {
+    bridgeUnderTest = undefined;
+    await bridge.onSessionShutdown({ reason: "quit" }).catch(() => undefined);
+    await server.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session 切换后无需显式 attach, bridge 也能自动重建 registration 并恢复接入", async () => {
+  const root = await createTemporaryDirectory();
+  const agentDirectory = join(root, "pi-agent");
+  const managerDirectory = join(agentDirectory, "wechat-session-manager");
+  const projectRoot = join(root, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(agentDirectory, "wechat-session-manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    projects: { ...config.projects, demo: { displayName: "测试项目", path: projectPath } },
+    wechat: { ...config.wechat, authorizedUserId: "wx-bridge-auto" },
+  }));
+  const projectService = new ProjectService(configStore);
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const endpoint = process.platform === "win32"
+    ? createStableNamedPipe(managerDirectory)
+    : join(root, "ui-auto.sock");
+  const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
+  const fakePi = join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs");
+  const backgroundManager = new BackgroundWorkerManager({
+    projectService,
+    registry,
+    invocation: { command: process.execPath, args: [fakePi] },
+  });
+  new UiWorkerManager({
+    managerDirectory,
+    projectService,
+    registry,
+    ipcServer: server,
+    invocation: { command: process.execPath, args: [fakePi] },
+    extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
+    backgroundWorkerManager: backgroundManager,
+    platform: "win32",
+  });
+  const sessionFile = join(projectPath, "auto-session.jsonl");
+  const pi = { sendUserMessage: () => undefined } as unknown as ExtensionAPI;
+  const context = {
+    mode: "tui",
+    cwd: projectPath,
+    sessionManager: {
+      getSessionId: () => "auto-session",
+      getSessionFile: () => sessionFile,
+      getCwd: () => projectPath,
+      getSessionName: () => "自动恢复会话",
+    },
+    isIdle: () => true,
+    abort: () => undefined,
+    shutdown: () => undefined,
+  } as unknown as ExtensionContext;
+  const bridge = new UiWorkerExtensionBridge(undefined, projectService, managerDirectory);
+  bridgeUnderTest = bridge;
+
+  try {
+    await server.listen();
+    await bridge.attach(pi, context);
+    await waitForDiagnostics((diagnostics) => diagnostics.state === "connected");
+
+    await bridge.onSessionShutdown({ reason: "resume" });
+    assert.equal(bridge.getDiagnostics().sessionId, undefined);
+
+    const recovered = await waitForDiagnostics(
+      (diagnostics) => diagnostics.state === "connected" && diagnostics.sessionId === "auto-session",
+      20000,
+    );
+    assert.equal(recovered.sessionId, "auto-session");
+  } finally {
+    bridgeUnderTest = undefined;
+    await bridge.onSessionShutdown({ reason: "quit" }).catch(() => undefined);
+    await server.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -20,7 +20,8 @@ Pi WeChat Session Hub 是一个 Pi 扩展, 用微信管理本机多个 Pi 会话
 - 每条微信 route 指向同一 Pi session. 在 Pi TUI 中 `/resume` 恢复 Hub 管理的会话时, 扩展通过 IPC 将 owner 从后台 RPC 安全切换到前台 TUI; 同一会话的微信消息和回复会在该 TUI 中显示. TUI 关闭后, route 返回后台 RPC.
 - 新建微信会话默认在后台, 不自动打开 Windows Terminal tab. route、session JSONL 和稳定会话索引保留.
 - 同一 session 同一时刻只允许一个 runtime writer. Pi TUI session 的 cwd 位于 `allowedProjectRoots` 内时会自动登记并纳入 Hub; 授权根外的会话仍可在本机使用, 但不接入微信管理.
-- 当前 Pi TUI 已成功接入 Hub 时, footer 的扩展状态行会在 MCP 状态后显示 `🟢 微信: 已接入`; Gateway 重启或连接恢复期间显示 `🟡 微信: 连接中`.
+- 当前 Pi TUI 已成功接入 Hub 时, footer 的扩展状态行会在 MCP 状态后显示 `🟢 微信: 已接入`; Gateway 重启或连接恢复期间显示 `🟡 微信: 连接中`, 确认未接入时显示 `⚪ 未接入`.
+- Gateway 进程在线不代表当前 TUI 已接入. `/wx status` 会单独展示当前终端的接入状态、实例 ID、上次接入时间、重连失败次数和断开原因, 便于区分是全局服务问题还是本终端连接问题. 会话切换导致 owner 释放后, bridge 会自动重建 registration 并恢复接入, 不需要重启 TUI.
 
 ## 安装和首次使用
 
@@ -48,7 +49,7 @@ pi --extension ./extensions/wechat-session-hub.ts
 |---|---|
 | `/wx login` | 在本地 TUI 扫码, create-only 写入 Hub 自己的凭证 |
 | `/wx start` | 幂等启动独立后台 Gateway; 首次使用时初始化当前目录授权 |
-| `/wx status` | 查询后台连接、PID、会话数、项目和授权根目录 |
+| `/wx status` | 查询后台连接、PID、会话数、项目和授权根目录, 以及当前终端自身的接入状态 |
 | `/wx roots` | 查看本机授权根目录 |
 | `/wx roots add-current` | 授权当前 Pi session 目录及其子目录, 并接入当前会话 |
 | `/wx roots add <绝对路径>` | 在本地 TUI 授权一个工作区根目录 |
