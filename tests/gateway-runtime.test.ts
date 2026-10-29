@@ -314,9 +314,7 @@ test("Gateway runtime 将已保存 UI route 恢复为后台, 不自动打开 Win
   });
   await priorLease.release();
 
-  const uiEndpoint = process.platform === "win32"
-    ? createStableNamedPipe(fixture.managerDirectory)
-    : join(fixture.root, "gateway-ui-runtime.sock");
+  const uiEndpoint = createStableNamedPipe(fixture.managerDirectory);
   let resolvePollStarted!: () => void;
   const pollStarted = new Promise<void>((resolveStarted) => {
     resolvePollStarted = resolveStarted;
@@ -650,9 +648,7 @@ test("Gateway runtime 不因存活但 stale 的 UI owner 阻塞启动, 并保留
     // 显式注入 win32 与能力探测, 避免在 Linux CI 上退化为 live_worker_detected 分支。
     runtime = await GatewayRuntime.start(runtimeOptions(fixture, fetcher, undefined, {
       uiPlatform: "win32",
-      uiIpcEndpoint: process.platform === "win32"
-        ? createStableNamedPipe(fixture.managerDirectory)
-        : join(fixture.root, `stale-ui-${randomUUID()}.sock`),
+      uiIpcEndpoint: createStableNamedPipe(fixture.managerDirectory),
       uiWorkerCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
     }));
     await pollStarted;

@@ -122,9 +122,7 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
   const projectService = new ProjectService(configStore);
   const lease = await GatewayLease.acquire(managerDirectory);
   const registry = new ManagerRegistry(managerDirectory, lease);
-  const endpoint = process.platform === "win32"
-    ? createStableNamedPipe(managerDirectory)
-    : join(temporaryDirectory, `ui-worker-${randomUUID()}.sock`);
+  const endpoint = createStableNamedPipe(managerDirectory);
   const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
   const workers: FakeUiWorker[] = [];
   const launcher = {

@@ -26,7 +26,6 @@ async function createTemporaryDirectory(): Promise<string> {
 }
 
 test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后台", async () => {
-  console.log("[ENTER] case 1");
   const root = await createTemporaryDirectory();
   const agentDirectory = join(root, "pi-agent");
   const managerDirectory = join(agentDirectory, "wechat-session-manager");
@@ -47,9 +46,7 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
   const projectService = new ProjectService(configStore);
   const lease = await GatewayLease.acquire(managerDirectory);
   const registry = new ManagerRegistry(managerDirectory, lease);
-  const endpoint = process.platform === "win32"
-    ? createStableNamedPipe(managerDirectory)
-    : join(root, "ui-owner.sock");
+  const endpoint = createStableNamedPipe(managerDirectory);
   const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
   const fakePi = join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs");
   const backgroundManager = new BackgroundWorkerManager({
@@ -249,7 +246,6 @@ async function waitForDiagnostics(
 let bridgeUnderTest: UiWorkerExtensionBridge | undefined;
 
 test("UI bridge 诊断快照暴露真实连接状态与断开原因", async () => {
-  console.log("[ENTER] case 2");
   const root = await createTemporaryDirectory();
   const agentDirectory = join(root, "pi-agent");
   const managerDirectory = join(agentDirectory, "wechat-session-manager");
@@ -266,9 +262,7 @@ test("UI bridge 诊断快照暴露真实连接状态与断开原因", async () =
   const projectService = new ProjectService(configStore);
   const lease = await GatewayLease.acquire(managerDirectory);
   const registry = new ManagerRegistry(managerDirectory, lease);
-  const endpoint = process.platform === "win32"
-    ? createStableNamedPipe(managerDirectory)
-    : join(root, "ui-diag.sock");
+  const endpoint = createStableNamedPipe(managerDirectory);
   const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
   const fakePi = join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs");
   const backgroundManager = new BackgroundWorkerManager({
@@ -330,7 +324,6 @@ test("UI bridge 诊断快照暴露真实连接状态与断开原因", async () =
 });
 
 test("session 切换清空 registration 后 bridge 不静默放弃, 可重新 attach 恢复", async () => {
-  console.log("[ENTER] case 3");
   const root = await createTemporaryDirectory();
   const agentDirectory = join(root, "pi-agent");
   const managerDirectory = join(agentDirectory, "wechat-session-manager");
@@ -347,9 +340,7 @@ test("session 切换清空 registration 后 bridge 不静默放弃, 可重新 at
   const projectService = new ProjectService(configStore);
   const lease = await GatewayLease.acquire(managerDirectory);
   const registry = new ManagerRegistry(managerDirectory, lease);
-  const endpoint = process.platform === "win32"
-    ? createStableNamedPipe(managerDirectory)
-    : join(root, "ui-recovery.sock");
+  const endpoint = createStableNamedPipe(managerDirectory);
   const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
   const fakePi = join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs");
   const backgroundManager = new BackgroundWorkerManager({
@@ -418,7 +409,6 @@ test("session 切换清空 registration 后 bridge 不静默放弃, 可重新 at
 });
 
 test("session 切换后无需显式 attach, bridge 也能自动重建 registration 并恢复接入", async () => {
-  console.log("[ENTER] case 4");
   const root = await createTemporaryDirectory();
   const agentDirectory = join(root, "pi-agent");
   const managerDirectory = join(agentDirectory, "wechat-session-manager");
@@ -435,9 +425,7 @@ test("session 切换后无需显式 attach, bridge 也能自动重建 registrati
   const projectService = new ProjectService(configStore);
   const lease = await GatewayLease.acquire(managerDirectory);
   const registry = new ManagerRegistry(managerDirectory, lease);
-  const endpoint = process.platform === "win32"
-    ? createStableNamedPipe(managerDirectory)
-    : join(root, "ui-auto.sock");
+  const endpoint = createStableNamedPipe(managerDirectory);
   const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
   const fakePi = join(process.cwd(), "tests", "fixtures", "fake-pi-session-manager.mjs");
   const backgroundManager = new BackgroundWorkerManager({

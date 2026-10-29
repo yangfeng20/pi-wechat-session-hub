@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { constants, realpathSync } from "node:fs";
 import { mkdir, open, readdir, lstat, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isProcessAlive } from "../system/process-liveness.ts";
 import { GatewayLease } from "../registry/gateway-lease.ts";
@@ -1330,15 +1331,25 @@ export async function readUiWorkerAttachToken(managerDirectory: string): Promise
 }
 
 /**
- * 计算 stable named pipe 名, 不嵌入用户名或项目路径。
+ * 计算稳定的本机 IPC endpoint, 不嵌入用户名或项目路径。
+ *
+ * Windows 使用命名管道, POSIX 使用 tmpdir 下的 Unix domain socket。
+ * 两侧 endpoint 必须由同一份逻辑推导, Gateway 与 UI worker 才能互相找到。
  *
  * @param managerDirectory manager 数据目录。
- * @returns 当前用户配置唯一的 named pipe endpoint。
+ * @param platform 目标平台, 默认当前平台。
+ * @returns 当前用户配置唯一的 IPC endpoint。
  */
-export function createStableNamedPipe(managerDirectory: string): string {
-  const normalized = resolve(managerDirectory).toLowerCase();
+export function createStableNamedPipe(
+  managerDirectory: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const resolved = resolve(managerDirectory);
+  const normalized = platform === "win32" ? resolved.toLowerCase() : resolved;
   const scope = createHash("sha256").update(normalized).digest("hex").slice(0, 24);
-  return `\\\\.\\pipe\\pi-wechat-session-hub-${scope}`;
+  return platform === "win32"
+    ? `\\\\.\\pipe\\pi-wechat-session-hub-${scope}`
+    : join(tmpdir(), `pi-wechat-session-hub-${scope}.sock`);
 }
 
 /**
