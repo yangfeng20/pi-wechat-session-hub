@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { open } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { ConfigurationStore } from "../config/store.ts";
 import type { ManagerConfiguration, RuntimeMode } from "../config/types.ts";
@@ -621,6 +622,78 @@ export class GatewayCommandRouter {
   }
 
   /**
+   * 只读展示指定或当前 route 会话的最近一轮对话, 不更改 route 绑定, 也不投递 prompt。
+   *
+   * @param routeId 微信 route ID。
+   * @param selector 可选会话索引或名称。
+   * @param config 当前配置快照。
+   * @returns 最近一轮对话的只读摘要。
+   */
+  private async handleLast(
+    routeId: string,
+    selector: string | undefined,
+    config: ManagerConfiguration,
+  ): Promise<string> {
+    const snapshot = await this.registry.readSnapshot();
+    const boundSessionId = Object.hasOwn(snapshot.routes, routeId)
+      ? snapshot.routes[routeId].sessionId
+      : undefined;
+    const session = selector
+      ? await this.resolveSessionSelector(selector)
+      : boundSessionId && Object.hasOwn(snapshot.sessions, boundSessionId)
+        ? snapshot.sessions[boundSessionId]
+        : undefined;
+    if (!session) {
+      return "当前微信路由没有绑定会话。使用 /sessions 查看列表, 或 /last <索引> 查看指定会话。";
+    }
+    const running = Object.values(snapshot.instances).some((instance) =>
+      instance.sessionId === session.sessionId && instance.state === "running"
+    );
+    const projectName = Object.hasOwn(config.projects, session.projectAlias)
+      ? config.projects[session.projectAlias].displayName
+      : session.projectAlias;
+    const title = await resolveSessionTitle(session);
+    const header = [
+      `会话 #${session.publicIndex ?? "?"} ${title} · ${projectName}`,
+      `最后活动：${formatLocalMinute(session.lastActivityAt)} · ${session.mode === "ui" ? "前台" : "后台"}`,
+    ];
+    const turn = await readLatestTurn(session.sessionFile);
+    if (!turn) {
+      return [
+        ...header,
+        "",
+        session.state === "pending"
+          ? "该会话尚未写入任何对话记录。"
+          : "未能读取该会话的对话记录。",
+      ].join("\n");
+    }
+
+    const body: string[] = [];
+    if (turn.userText) {
+      const userPreview = truncateTurnText(turn.userText);
+      body.push(`你：\n${userPreview.text}`, ...(userPreview.truncated ? ["[提问较长, 已截断。]"] : []));
+    }
+    if (turn.assistantText) {
+      const assistantPreview = truncateTurnText(turn.assistantText);
+      body.push(
+        `AI${assistantPreview.truncated ? "（节选）" : ""}：\n${assistantPreview.text}`,
+        ...(assistantPreview.truncated ? ["[回复较长, 完整内容仍在会话记录中。]"] : []),
+      );
+    } else {
+      body.push("AI：尚未产生回复。");
+    }
+    return [
+      ...header,
+      ...(running ? ["⚠️ 该会话正在运行, 以下为目前已落盘的内容。"] : []),
+      "",
+      "最近一轮对话",
+      ...body,
+      "",
+      selector ? "发送 /resume " + (session.publicIndex ?? selector) + " 可切换到此会话。" : "发送任意内容可继续对话。",
+    ].join("\n");
+  }
+
+  /**
    * 停止当前 route 或指定的活跃 Pi session。
    *
    * @param routeId 微信 route ID。
@@ -806,6 +879,8 @@ export class GatewayCommandRouter {
           return await this.formatSessions(routeId, command.projectAlias, command.state, command.page, config);
         case "resume":
           return await this.handleResume(routeId, command.selector);
+        case "last":
+          return await this.handleLast(routeId, command.selector, config);
         case "stop":
           return await this.handleStop(routeId, command.selector);
         case "retry":
@@ -853,6 +928,9 @@ export class GatewayCommandRouter {
 
 const SESSION_TITLE_LIMIT = 32;
 const RESUME_ASSISTANT_TEXT_LIMIT = 800;
+const LAST_TURN_TEXT_LIMIT = 600;
+const TAIL_READ_BYTES = 256 * 1024;
+const TAIL_READ_MAX_BYTES = 8 * 1024 * 1024;
 
 /**
  * 生成保留当前筛选条件的会话翻页命令.
@@ -1040,6 +1118,208 @@ async function readLatestAssistantText(sessionFile: string): Promise<string | un
 }
 
 /**
+ * 将 ISO 时间转换为本地时区的分钟精度文本。
+ *
+ * @param isoTimestamp registry 中记录的 ISO 时间。
+ * @returns 形如 `2026-08-05 14:32` 的本地时间, 无法解析时返回原始文本。
+ */
+function formatLocalMinute(isoTimestamp: string): string {
+  const parsed = new Date(isoTimestamp);
+  if (Number.isNaN(parsed.getTime())) {
+    return isoTimestamp;
+  }
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+}
+
+/**
+ * 将发往微信的最近一轮文本限制在固定长度内, 按 Unicode code point 截断。
+ *
+ * @param text 原始消息文本。
+ * @returns 可安全发送的完整或截断文本。
+ */
+function truncateTurnText(text: string): { text: string; truncated: boolean } {
+  const characters = Array.from(text);
+  if (characters.length <= LAST_TURN_TEXT_LIMIT) {
+    return { text, truncated: false };
+  }
+  return {
+    text: characters.slice(0, LAST_TURN_TEXT_LIMIT).join(""),
+    truncated: true,
+  };
+}
+
+/**
+ * 从 Pi transcript 尾部按需扩展窗口, 读取最近一轮 user 与 assistant 文本。
+ *
+ * 先读文件末尾固定字节区间, 按 LF 切分后从后向前定位最新的 user 与 assistant
+ * 消息; 尾部首行可能是被截断的半行, 因此总是丢弃。如果窗口内找不到完整一轮
+ * (常见于单条消息本身就超过初始窗口), 按倍数扩大窗口重试; 超过上限仍未命中时
+ * 回退为流式全文件扫描, 保证结果正确。
+ *
+ * @param sessionFile Pi transcript 文件路径。
+ * @returns 最近一轮 user 与 assistant 文本, 无可用记录时返回 undefined。
+ */
+async function readLatestTurn(sessionFile: string): Promise<LatestTurn | undefined> {
+  const handle = await open(sessionFile, "r").catch(() => undefined);
+  if (!handle) {
+    return undefined;
+  }
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) {
+      return undefined;
+    }
+    let windowBytes = Math.min(size, TAIL_READ_BYTES);
+    for (;;) {
+      const start = size - windowBytes;
+      const chunk = Buffer.alloc(windowBytes);
+      await handle.read(chunk, 0, windowBytes, start);
+      const text = chunk.toString("utf8");
+      let buffer = text;
+      if (start > 0) {
+        const firstNewline = text.indexOf("\n");
+        buffer = firstNewline < 0 ? "" : text.slice(firstNewline + 1);
+      }
+      const turn = scanTurnLines(buffer);
+      if (turn.assistantText !== undefined && turn.userText !== undefined) {
+        return turn;
+      }
+      if (start === 0) {
+        return turn.assistantText === undefined && turn.userText === undefined ? undefined : turn;
+      }
+      if (windowBytes >= TAIL_READ_MAX_BYTES) {
+        const fallback = await fullScanLatestTurn(sessionFile);
+        return fallback.assistantText === undefined && fallback.userText === undefined
+          ? undefined
+          : fallback;
+      }
+      windowBytes = Math.min(size, windowBytes * 2);
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * 在一段 transcript 文本中从后向前定位最新的 user 与 assistant 文本。
+ *
+ * @param buffer 已剔除尾部半行的 transcript 文本片段。
+ * @returns 已找到的 user 与 assistant 文本, 任意字段都可能缺失。
+ */
+function scanTurnLines(buffer: string): LatestTurn {
+  const lines = buffer.split("\n");
+  let assistantText: string | undefined;
+  let userText: string | undefined;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line.trim()) {
+      continue;
+    }
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line) as unknown;
+    } catch {
+      continue;
+    }
+    if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
+      continue;
+    }
+    const role = entry.message.role;
+    if (role !== "user" && role !== "assistant") {
+      continue;
+    }
+    const text = extractMessageText(entry.message.content);
+    if (!text) {
+      continue;
+    }
+    if (role === "assistant") {
+      assistantText ??= text;
+    } else if (userText === undefined) {
+      userText = text;
+    }
+    if (assistantText !== undefined && userText !== undefined) {
+      break;
+    }
+  }
+  return { userText, assistantText };
+}
+
+/**
+ * 流式扫描整个 transcript, 作为超大单条记录窗口读取失败后的兼容路径。
+ *
+ * @param sessionFile Pi transcript 文件路径。
+ * @returns 整个文件中最后一组 user 与 assistant 文本。
+ */
+async function fullScanLatestTurn(sessionFile: string): Promise<LatestTurn> {
+  let input: ReturnType<typeof createReadStream> | undefined;
+  let lines: ReturnType<typeof createInterface> | undefined;
+  let assistantText: string | undefined;
+  let userText: string | undefined;
+  try {
+    input = createReadStream(sessionFile, { encoding: "utf8" });
+    lines = createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      let entry: unknown;
+      try {
+        entry = JSON.parse(line) as unknown;
+      } catch {
+        continue;
+      }
+      if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
+        continue;
+      }
+      const role = entry.message.role;
+      if (role !== "user" && role !== "assistant") {
+        continue;
+      }
+      const text = extractMessageText(entry.message.content);
+      if (!text) {
+        continue;
+      }
+      if (role === "assistant") {
+        assistantText = text;
+      } else {
+        userText = text;
+      }
+    }
+  } catch {
+    return { userText, assistantText };
+  } finally {
+    lines?.close();
+    input?.destroy();
+  }
+  return { userText, assistantText };
+}
+
+/**
+ * 从 Pi message content 中提取纯文本片段, 忽略 thinking 等非对外内容。
+ *
+ * @param content message.content 原始值。
+ * @returns 已清理的文本, 无文本时返回 undefined。
+ */
+function extractMessageText(content: unknown): string | undefined {
+  const raw = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+        .filter((block) => isRecord(block) && block.type === "text" && typeof block.text === "string")
+        .map((block) => (block as { text: string }).text)
+        .join("\n")
+      : "";
+  const normalized = normalizeAssistantText(raw);
+  return normalized || undefined;
+}
+
+/**
+ * 表示从 transcript 尾部提取出的最近一轮对话。
+ */
+interface LatestTurn {
+  userText?: string;
+  assistantText?: string;
+}
+
+/**
  * 清理 assistant 文本中的终端控制字符, 保留换行和制表符格式.
  *
  * @param text transcript 中的 assistant 文本.
@@ -1113,6 +1393,8 @@ const GATEWAY_HELP_TEXT = [
   "  --project <别名> --state <状态> --page <页码>",
   "  状态：default / active / saved / pending / all",
   "/resume <索引或名称>",
+  "/last [索引或名称]",
+  "  只读查看最近一轮对话",
   "/stop [索引或名称]",
   "",
   "项目命令",

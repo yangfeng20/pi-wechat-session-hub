@@ -59,6 +59,16 @@ test("解析 session 分页、恢复和显式重试确认", () => {
   );
 });
 
+test("解析 /last 只读查询参数", () => {
+  assert.deepEqual(parseGatewayCommand("/last"), { kind: "last" });
+  assert.deepEqual(parseGatewayCommand("/last 3"), { kind: "last", selector: "3" });
+  assert.deepEqual(
+    parseGatewayCommand('/last "调查应用错误"'),
+    { kind: "last", selector: "调查应用错误" },
+  );
+  assert.throws(() => parseGatewayCommand("/last 1 2"), GatewayCommandParseError);
+});
+
 test("普通文本作为 prompt, 未知 slash command fail-closed", () => {
   assert.deepEqual(parseGatewayCommand("继续排查这个问题"), {
     kind: "prompt",

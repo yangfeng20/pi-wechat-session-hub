@@ -71,6 +71,7 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 /new [--mode background|ui] [--project <alias>] [--name <名称>]
 /sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>]
 /resume <会话索引|名称>
+/last [会话索引|名称]
 /stop [会话索引|名称]
 /retry <message-id> --confirm
 /status
@@ -79,6 +80,20 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 ```
 
 `/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 每页 5 条, 每个会话单独展示标题、项目、模式和状态, 当前微信路由会明确标记. 标题优先显示 session name; 未命名时使用 Pi `/resume` 同样采用的首条用户文本, 最长 32 个 Unicode 字符, 超出以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 如果切换目标的 agent 已处于 idle, 回复会附带最近一次回复预览; 超过 800 个 Unicode 字符时只显示开头并提示完整内容仍在会话中. 如果 agent 正在运行, 只确认切换, 不发送旧回复. 索引在会话排序变化后保持不变, 不因列表重排而复用.
+
+## 在微信端找回上下文
+
+从 PC TUI 切换到手机微信时, 往往不知道会话进行到哪里了. 补一条消息又可能让 agent 白跑一轮, 因此 `/last` 提供纯只读的上下文回顾:
+
+```text
+/last              查看当前微信路由会话的最近一轮对话
+/last 3            查看索引为 3 的会话最近一轮对话
+/last "调查错误"   按唯一会话名称查看
+```
+
+回复包含会话编号、标题、项目、最后活动时间、运行模式, 以及最近一轮的 user 提问和 assistant 回复, 单段最多展示 600 个 Unicode 字符, 超长时提示完整内容仍在会话记录中. 工具输出和 thinking 推理不会出现在摘要里.
+
+`/last` 只读取 Pi session JSONL 文件末尾固定区间, 不加载整个 transcript, 也不改变 route 绑定、不写入 transcript、不调用模型, 因此不会产生任何副作用或额外 token 消耗. 如果目标会话正在运行, 回复会显式标注"该会话正在运行, 以下为目前已落盘的内容", 避免把中间步骤误读为最终结论. 尚未产生任何消息的会话会明确提示无记录. 看完后可直接发送新指令, 或用 `/resume <索引>` 切换过去继续工作.
 
 Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果目标是 Hub 会话, extension 会安全完成前后台 owner 交接. 未登记 session 不再因缺少 Hub 记录而阻止 Pi 原生恢复; 恢复后仅当 cwd 位于授权根内才自动接入 Hub.
 

@@ -8,6 +8,7 @@ export type GatewayCommand =
   | { kind: "new"; mode?: RuntimeMode; projectAlias?: string; name?: string }
   | { kind: "sessions"; projectAlias?: string; state: "default" | "active" | "saved" | "pending" | "all"; page: number }
   | { kind: "resume"; selector: string }
+  | { kind: "last"; selector?: string }
   | { kind: "stop"; selector?: string }
   | { kind: "retry"; messageId: string; confirmed: boolean }
   | { kind: "prompt"; text: string };
@@ -77,6 +78,9 @@ export function parseGatewayCommand(text: string): GatewayCommand {
   }
   if (commandName === "resume") {
     return parseResumeCommand(arguments_);
+  }
+  if (commandName === "last") {
+    return parseLastCommand(arguments_);
   }
   if (commandName === "stop") {
     if (arguments_.length > 1 || (arguments_.length === 1 && !arguments_[0].trim())) {
@@ -182,6 +186,22 @@ function parseResumeCommand(arguments_: string[]): GatewayCommand {
 }
 
 /**
+ * 解析 /last 参数。
+ *
+ * @param arguments_ 去掉命令名后的 token 列表。
+ * @returns 只读查询最近一轮对话的参数。
+ */
+function parseLastCommand(arguments_: string[]): GatewayCommand {
+  if (arguments_.length > 1 || (arguments_.length === 1 && !arguments_[0].trim())) {
+    throw usageError();
+  }
+  return {
+    kind: "last",
+    ...(arguments_[0] ? { selector: arguments_[0] } : {}),
+  };
+}
+
+/**
  * 解析新会话运行模式。
  *
  * @param value 模式参数。
@@ -259,7 +279,7 @@ function extractRawArguments(input: string): string {
 }
 
 const GATEWAY_COMMAND_USAGE =
-  "用法: /new [--mode background|ui] [--project <alias>] [--name <名称>] | /sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>] | /resume <会话索引|名称> | /stop [会话索引|名称] | /retry <message-id> --confirm | /status | /projects | /help";
+  "用法: /new [--mode background|ui] [--project <alias>] [--name <名称>] | /sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>] | /resume <会话索引|名称> | /last [会话索引|名称] | /stop [会话索引|名称] | /retry <message-id> --confirm | /status | /projects | /help";
 
 /**
  * 创建统一格式的 command usage 错误。

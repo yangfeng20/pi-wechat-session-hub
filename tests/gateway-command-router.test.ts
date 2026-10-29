@@ -614,3 +614,349 @@ test("Gateway 在 allowlist 检查前不写 queue", async () => {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("/last 只读展示当前会话最近一轮对话, 不切换 route 也不投递 prompt", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-last-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-last-route" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "测试项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const sessionFile = join(temporaryDirectory, "last-session.jsonl");
+  await writeFile(sessionFile, [
+    JSON.stringify({ type: "session", version: 3, id: "last-session", cwd: projectPath }),
+    JSON.stringify({
+      type: "message",
+      id: "user-entry-old",
+      parentId: null,
+      timestamp: new Date(Date.now() - 60000).toISOString(),
+      message: { role: "user", content: [{ type: "text", text: "这是更早的提问" }] },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "assistant-entry-old",
+      parentId: "user-entry-old",
+      timestamp: new Date(Date.now() - 59000).toISOString(),
+      message: { role: "assistant", content: [{ type: "text", text: "这是更早的回复" }] },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "user-entry-new",
+      parentId: "assistant-entry-old",
+      timestamp: new Date(Date.now() - 2000).toISOString(),
+      message: { role: "user", content: [{ type: "text", text: "把 tokenizer 里的 execCommand 改成 runCommand" }] },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "tool-entry-new",
+      parentId: "user-entry-new",
+      timestamp: new Date(Date.now() - 1500).toISOString(),
+      message: { role: "toolResult", content: [{ type: "text", text: "工具输出不应出现在摘要中" }] },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "assistant-entry-new",
+      parentId: "tool-entry-new",
+      timestamp: new Date(Date.now() - 1000).toISOString(),
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "隐藏推理不应出现" },
+          { type: "text", text: "已把 3 处调用点改为 runCommand, 并补齐测试。" },
+        ],
+      },
+    }),
+  ].join("\n") + "\n", "utf8");
+  const indexed = await registry.upsertSession({
+    sessionId: "last-session",
+    sessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    mode: "background",
+    state: "active",
+    lastActivityAt: new Date().toISOString(),
+  });
+  await registry.upsertInstance({
+    instanceId: "last-owner",
+    pid: process.pid,
+    processBirthId: `${process.pid}:last-test`,
+    sessionId: indexed.sessionId,
+    sessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    mode: "background",
+    state: "idle",
+    heartbeatAt: new Date().toISOString(),
+  });
+  await registry.setRoute("wx-last-route", {
+    sessionId: indexed.sessionId,
+    workerInstanceId: "last-owner",
+    generation: 1,
+    updatedAt: new Date().toISOString(),
+  });
+  const prompts: string[] = [];
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: {
+      prompt: async (_sessionId: string, text: string) => {
+        prompts.push(text);
+        return "不应被调用";
+      },
+    } as unknown as GatewayWorkerService,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const result = await router.receive({
+      messageId: "wx-last-1",
+      senderId: "wx-last-route",
+      text: "/last",
+    });
+    assert.equal(result.state, "completed");
+    const reply = replies.at(-1) ?? "";
+    assert.match(reply, new RegExp(`会话 #${indexed.publicIndex}`));
+    assert.match(reply, /最近一轮对话/);
+    const body = reply.slice(reply.indexOf("最近一轮对话"));
+    assert.match(body, /把 tokenizer 里的 execCommand 改成 runCommand/);
+    assert.match(body, /已把 3 处调用点改为 runCommand/);
+    assert.doesNotMatch(body, /这是更早的提问|这是更早的回复|工具输出不应出现|隐藏推理不应出现/);
+    assert.match(reply, /发送任意内容可继续对话/);
+    assert.deepEqual(prompts, []);
+    const afterSnapshot = await registry.readSnapshot();
+    assert.equal(afterSnapshot.routes["wx-last-route"].sessionId, indexed.sessionId);
+    assert.equal(afterSnapshot.routes["wx-last-route"].generation, 1);
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("/last 支持指定会话索引、运行中提示与无记录会话", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-last-selector-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-last-selector" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "测试项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const runningSessionFile = join(temporaryDirectory, "running-last.jsonl");
+  await writeFile(runningSessionFile, [
+    JSON.stringify({ type: "session", version: 3, id: "running-last", cwd: projectPath }),
+    JSON.stringify({
+      type: "message",
+      id: "assistant-running",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: { role: "assistant", content: [{ type: "text", text: "当前已完成的中间结论" }] },
+    }),
+  ].join("\n") + "\n", "utf8");
+  const runningSession = await registry.upsertSession({
+    sessionId: "running-last",
+    sessionFile: runningSessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: "运行中的会话",
+    mode: "background",
+    state: "active",
+    lastActivityAt: new Date().toISOString(),
+  });
+  await registry.upsertInstance({
+    instanceId: "running-owner",
+    pid: process.pid,
+    processBirthId: `${process.pid}:running-last-test`,
+    sessionId: runningSession.sessionId,
+    sessionFile: runningSessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    mode: "background",
+    state: "running",
+    heartbeatAt: new Date().toISOString(),
+  });
+  const pendingSession = await registry.upsertSession({
+    sessionId: "pending-last",
+    sessionFile: join(temporaryDirectory, "pending-last.jsonl"),
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: "未开始的会话",
+    mode: "background",
+    state: "pending",
+    lastActivityAt: new Date().toISOString(),
+  });
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: { prompt: async () => "不应被调用" } as unknown as GatewayWorkerService,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const withoutRoute = await router.receive({
+      messageId: "wx-last-no-route",
+      senderId: "wx-last-selector",
+      text: "/last",
+    });
+    assert.equal(withoutRoute.state, "completed");
+    assert.match(replies.at(-1) ?? "", /当前微信路由没有绑定会话/);
+
+    const runningResult = await router.receive({
+      messageId: "wx-last-running",
+      senderId: "wx-last-selector",
+      text: `/last ${runningSession.publicIndex}`,
+    });
+    assert.equal(runningResult.state, "completed");
+    const runningReply = replies.at(-1) ?? "";
+    assert.match(runningReply, /运行中的会话/);
+    assert.match(runningReply, /当前已完成的中间结论/);
+    assert.match(runningReply, /该会话正在运行/);
+    assert.match(runningReply, new RegExp(`/resume ${runningSession.publicIndex}`));
+    assert.equal((await registry.readSnapshot()).routes["wx-last-selector"], undefined);
+
+    const pendingResult = await router.receive({
+      messageId: "wx-last-pending",
+      senderId: "wx-last-selector",
+      text: `/last ${pendingSession.publicIndex}`,
+    });
+    assert.equal(pendingResult.state, "completed");
+    assert.match(replies.at(-1) ?? "", /尚未写入任何对话记录/);
+
+    const missing = await router.receive({
+      messageId: "wx-last-missing",
+      senderId: "wx-last-selector",
+      text: "/last 999",
+    });
+    assert.equal(missing.state, "completed");
+    assert.match(replies.at(-1) ?? "", /未找到会话索引或名称/);
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("/last 在单条消息超过尾部窗口时仍能取到最近一轮", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-last-big-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-last-big" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "测试项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const sessionFile = join(temporaryDirectory, "big-last.jsonl");
+  const hugeReply = `开头标记${"超长回复内容。".repeat(40000)}结尾标记`;
+  await writeFile(sessionFile, [
+    JSON.stringify({ type: "session", version: 3, id: "big-last", cwd: projectPath }),
+    JSON.stringify({
+      type: "message",
+      id: "big-user",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: { role: "user", content: [{ type: "text", text: "请阅读这段超大内容" }] },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "big-assistant",
+      parentId: "big-user",
+      timestamp: new Date().toISOString(),
+      message: { role: "assistant", content: [{ type: "text", text: hugeReply }] },
+    }),
+  ].join("\n") + "\n", "utf8");
+  const indexed = await registry.upsertSession({
+    sessionId: "big-last",
+    sessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: "超大记录会话",
+    mode: "background",
+    state: "active",
+    lastActivityAt: new Date().toISOString(),
+  });
+  await registry.upsertInstance({
+    instanceId: "big-owner",
+    pid: process.pid,
+    processBirthId: `${process.pid}:big-last-test`,
+    sessionId: indexed.sessionId,
+    sessionFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    mode: "background",
+    state: "idle",
+    heartbeatAt: new Date().toISOString(),
+  });
+  await registry.setRoute("wx-last-big", {
+    sessionId: indexed.sessionId,
+    workerInstanceId: "big-owner",
+    generation: 1,
+    updatedAt: new Date().toISOString(),
+  });
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: { prompt: async () => "不应被调用" } as unknown as GatewayWorkerService,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const result = await router.receive({
+      messageId: "wx-last-big-1",
+      senderId: "wx-last-big",
+      text: "/last",
+    });
+    assert.equal(result.state, "completed");
+    const reply = replies.at(-1) ?? "";
+    assert.match(reply, /超大记录会话/);
+    assert.match(reply, /请阅读这段超大内容/);
+    assert.match(reply, /开头标记/);
+    assert.match(reply, /AI（节选）/);
+    assert.match(reply, /完整内容仍在会话记录中/);
+    assert.ok(Array.from(reply).length < 2000, "回复必须能装进单条 iLink 文本");
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
