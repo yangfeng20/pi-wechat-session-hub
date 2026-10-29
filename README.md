@@ -45,6 +45,8 @@ Pi WeChat Session Hub 是一个 Pi 扩展, 用微信管理本机多个 Pi 会话
 | PowerShell 7 | 建议安装 | 可见 UI tab 通过 `pwsh.exe` 启动固定脚本 |
 | 微信 | iLink 能力账号 | 需能通过 `/wx login` 扫码授权 |
 
+CI 在 `ubuntu-latest` 上跑 Pi 三版本兼容矩阵, 在 `windows-latest` 上额外覆盖 `0.85.1` 与 `1.3.0` 并验证真实平台的 `wt.exe` 探测逻辑.
+
 ### 平台限制的实际影响
 
 非 Windows 平台, 或 Windows 上找不到 `wt.exe` 时:
@@ -192,6 +194,18 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 /help
 ```
 
+| 命令 | 是否改变状态 | 作用 |
+|---|---|---|
+| `/new` | 是 | 新建会话并绑定当前微信 route |
+| `/sessions` | 否 | 分页列出 Hub 管理的会话 |
+| `/resume` | 是 | 把当前微信 route 切到目标会话 |
+| `/last` | **否** | 只读回顾目标会话最近一轮对话 |
+| `/stop` | 是 | 停止目标会话的 Pi worker |
+| `/retry` | 是 | 重新执行指定消息, 可能产生副作用 |
+| `/status` | 否 | 展示 Hub、当前会话与 UI 模式可用性 |
+| `/projects` | 否 | 列出已登记项目 |
+| `/help` | 否 | 查看命令帮助 |
+
 `/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 每页 5 条, 每个会话单独展示标题、项目、模式和状态, 当前微信路由会明确标记. 标题优先显示 session name; 未命名时使用 Pi `/resume` 同样采用的首条用户文本, 最长 32 个 Unicode 字符, 超出以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 如果切换目标的 agent 已处于 idle, 回复会附带最近一次回复预览; 超过 800 个 Unicode 字符时只显示开头并提示完整内容仍在会话中. 如果 agent 正在运行, 只确认切换, 不发送旧回复. 索引在会话排序变化后保持不变, 不因列表重排而复用.
 
 `/status` 会额外输出 `可见 UI 模式` 一行; 平台不支持或缺少 `wt.exe` 时显示 `不可用` 及具体原因.
@@ -206,9 +220,49 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 /last "调查错误"   按唯一会话名称查看
 ```
 
-回复包含会话编号、标题、项目、最后活动时间、运行模式, 以及最近一轮的 user 提问和 assistant 回复, 单段最多展示 600 个 Unicode 字符, 超长时提示完整内容仍在会话记录中. 工具输出和 thinking 推理不会出现在摘要里.
+### 输出内容
 
-`/last` 只读取 Pi session JSONL 文件末尾固定区间, 不加载整个 transcript, 也不改变 route 绑定、不写入 transcript、不调用模型, 因此不会产生任何副作用或额外 token 消耗. 如果目标会话正在运行, 回复会显式标注"该会话正在运行, 以下为目前已落盘的内容", 避免把中间步骤误读为最终结论. 尚未产生任何消息的会话会明确提示无记录. 看完后可直接发送新指令, 或用 `/resume <索引>` 切换过去继续工作.
+```text
+会话 #3 修复登录态失效 · 项目展示名
+最后活动：10-29 14:04 · 后台
+
+最近一轮对话
+你：
+<最近一条 user 提问, 最多 600 字符>
+AI：
+<最近一条 assistant 回复, 最多 600 字符>
+
+发送 /resume 3 可切换到此会话。
+```
+
+- 带选择器时未复现有会内固定尾行改为提示 `发送 /resume <索引> 可切换到此会话`; 无选择器时提示 `发送任意内容可继续对话`
+- 单段超过 600 个 Unicode 字符时截断, 并附 `[提问较长, 已截断。]` 或 `[回复较长, 完整内容仍在会话记录中。]`
+- 工具输出与 thinking 推理 **不会** 进入摘要, 只展示用户提问与最终回复
+- 会话正在运行时, 在 header 与正文之间插入 `⚠️ 该会话正在运行, 以下为目前已落盘的内容。`, 避免把中间步骤误读为最终结论
+- assistant 尚未产生回复时显式输出 `AI：尚未产生回复。`
+
+### 无记录与未绑定会话
+
+| 场景 | 回复 |
+|---|---|
+| 当前 route 未绑定会话且未传选择器 | `当前微信路由没有绑定会话。使用 /sessions 查看列表, 或 /last <索引> 查看指定会话。` |
+| 会话状态为 `pending` 且无任何 transcript | `该会话尚未写入任何对话记录。` |
+| transcript 存在但读取失败 | `未能读取该会话的对话记录。` |
+
+### 无副作用保证
+
+`/last` 的读取策略是按需增窗, 不是固定只读末尾:
+
+```text
+初始读末尾 256 KB
+  ↓ 窗口内已找到完整一轮 (user + assistant)
+  ↓ 否则倍数扩大窗口重试
+上限 8 MB
+  ↓ 仍不命中(单条消息超大)
+流式全文件扫描兜底, 保证结果正确
+```
+
+无论走哪条路径, `/last` 都不改变 route 绑定、不写入 transcript、不调用模型、不产生 durable queue 项, 因此无副作用且无额外 token 消耗. 尾部首行可能是半行, 总是丢弃以避免解析到截断的 JSON. 看完后可直接发送新指令, 或用 `/resume <索引>` 切换过去继续工作.
 
 Pi TUI 的内置 `/resume` 仍使用 Pi 自己的会话选择器. 如果目标是 Hub 会话, extension 会安全完成前后台 owner 交接. 未登记 session 不再因缺少 Hub 记录而阻止 Pi 原生恢复; 恢复后仅当 cwd 位于授权根内才自动接入 Hub.
 
@@ -256,6 +310,8 @@ Windows 首次创建空 manager 目录时会关闭继承 ACL, 仅授权当前用
 **Q: 提示"未找到 Windows Terminal (wt.exe)"怎么办?**
 从 Microsoft Store 安装 Windows Terminal, 或确认 `%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe` 存在且在 PATH 中. 安装后不必重启 daemon, 直接重试即可(失败结果不缓存). 也可一直使用后台模式, 不依赖 `wt.exe`.
 
+> Windows Terminal 常以 App Execution Alias 形式存在. 该目录权限受限, 对它执行 `Test-Path` / `existsSync` 会返回 false, 因此探测逻辑不依赖文件存在性, 而以 `where.exe` 解析结果与路径归属为准.
+
 **Q: 扫码后 `/wx start` 报需要重新授权?**
 凭证文件只在不存在时 create-only 写入, 不会覆盖. 若授权失效, 重新执行 `/wx login` 覆盖 Hub 自己的凭证文件即可.
 
@@ -267,6 +323,9 @@ Hub 只管理 `allowedProjectRoots` 内的会话, 且不扫描本机其他 sessi
 
 **Q: 安装时 npm 拉依赖失败?**
 `pi install git:` 与 `npm install` 需要访问 npm registry. 可配置 npm 镜像, 或在 `settings.json` 中用 `npmCommand` 指定包装命令(如 `mise`、`asdf`).
+
+**Q: `/last` 和 `/resume` 区别?**
+`/last` 纯只读, 看完不动 route, 适合先确认上下文再决定下一步; `/resume` 会真实切换当前微信 route 并可能重启 Pi worker. 两者都支持索引和唯一名称选择器.
 
 **Q: 升级后行为异常?**
 执行 `pi update --all` 拉齐 Pi 与包版本, 然后 `/wx restart`. 版本兼容范围见 `package.json` 的 `piCompatibility`.
