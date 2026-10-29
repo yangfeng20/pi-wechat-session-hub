@@ -153,6 +153,7 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
     registrationTimeoutMs: 5000,
     shutdownTimeoutMs: 5000,
     platform: "win32",
+    probeCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
   });
   const backgroundManager = new BackgroundWorkerManager({
     projectService,

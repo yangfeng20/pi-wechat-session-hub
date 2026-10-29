@@ -65,6 +65,7 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
     backgroundWorkerManager: backgroundManager,
     platform: "win32",
+    probeCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
   });
   const gatewayWorkerManager = new GatewayWorkerManager(backgroundManager, uiManager, registry);
   const queue = new DurableMessageQueue(managerDirectory, lease);
@@ -282,6 +283,7 @@ test("UI bridge 诊断快照暴露真实连接状态与断开原因", async () =
     extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
     backgroundWorkerManager: backgroundManager,
     platform: "win32",
+    probeCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
   });
   const sessionFile = join(projectPath, "diag-session.jsonl");
   const pi = { sendUserMessage: () => undefined } as unknown as ExtensionAPI;
@@ -361,6 +363,7 @@ test("session 切换清空 registration 后 bridge 不静默放弃, 可重新 at
     extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
     backgroundWorkerManager: backgroundManager,
     platform: "win32",
+    probeCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
   });
   const sessionFile = join(projectPath, "recovery-session.jsonl");
   const pi = { sendUserMessage: () => undefined } as unknown as ExtensionAPI;
@@ -447,6 +450,7 @@ test("session 切换后无需显式 attach, bridge 也能自动重建 registrati
     extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
     backgroundWorkerManager: backgroundManager,
     platform: "win32",
+    probeCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
   });
   const sessionFile = join(projectPath, "auto-session.jsonl");
   const pi = { sendUserMessage: () => undefined } as unknown as ExtensionAPI;
