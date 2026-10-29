@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, stat, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,7 +12,8 @@ import { ProjectService, ProjectServiceError } from "../src/projects/project-ser
  * @returns 临时目录及其授权项目根目录。
  */
 async function createProjectFixture(): Promise<{ temporaryDirectory: string; allowedRoot: string }> {
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-projects-"));
+  const createdDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-projects-"));
+  const temporaryDirectory = await realpath(createdDirectory);
   const allowedRoot = join(temporaryDirectory, "allowed");
   await mkdir(allowedRoot, { recursive: true });
   return { temporaryDirectory, allowedRoot };

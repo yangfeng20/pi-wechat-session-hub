@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,7 +25,8 @@ async function createCredentialFixture(): Promise<{
   managerDirectory: string;
   credentialFile: string;
 }> {
-  const root = await mkdtemp(join(tmpdir(), "pi-wechat-credentials-"));
+  const createdRoot = await mkdtemp(join(tmpdir(), "pi-wechat-credentials-"));
+  const root = await realpath(createdRoot);
   const managerDirectory = join(root, "wechat-session-manager");
   await mkdir(managerDirectory, { recursive: true, mode: 0o700 });
   return {

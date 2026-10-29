@@ -159,11 +159,68 @@ export async function writeGatewayLifecycleOperationReceipt(
     mode: 0o600,
   });
   try {
-    await rename(temporaryPath, receiptPath);
+    await replaceWithRetry(temporaryPath, receiptPath);
   } catch (error) {
     await unlink(temporaryPath).catch(() => undefined);
+    if (isWindowsRenameConflict(error)) {
+      throw new Error(
+        "写入 Gateway 生命周期回执失败: 目标文件持续被其他进程占用, 已重试仍无法替换。",
+        { cause: error },
+      );
+    }
     throw error;
   }
+}
+
+/**
+ * 原子替换目标文件, Windows 占用类错误按退避重试。
+ *
+ * Windows 上杀毒软件与索引器会短暂持有文件句柄, 使成功落盘的临时文件
+ * 在替换阶段瞬时失败. 重试次数少且间隔短, 不改变调用方的超时预期。
+ * 采用递归推进而非循环内等待, 避免在循环体内阻塞。
+ *
+ * @param temporaryPath 已写入的临时文件路径。
+ * @param targetPath 目标回执文件路径。
+ * @param attempt 当前重试序号, 从 0 开始。
+ * @returns 替换完成后正常结束。
+ * @throws {unknown} 非占用类错误或重试耗尽时抛出最后一次错误。
+ */
+async function replaceWithRetry(
+  temporaryPath: string,
+  targetPath: string,
+  attempt = 0,
+): Promise<void> {
+  const retryDelaysMs = [10, 25, 50, 100, 200];
+  try {
+    await rename(temporaryPath, targetPath);
+  } catch (error) {
+    const delay = retryDelaysMs[attempt];
+    if (!isWindowsRenameConflict(error) || delay === undefined) {
+      throw error;
+    }
+    await new Promise<void>((resolveDelay) => {
+      setTimeout(resolveDelay, delay).unref();
+    });
+    return replaceWithRetry(temporaryPath, targetPath, attempt + 1);
+  }
+}
+
+/**
+ * 判断是否为 Windows 上常见的原子替换失败。
+ *
+ * Windows 不允许替换被其他进程以不共享方式打开的文件, 杀毒软件、
+ * Windows Search 索引器等会短暂持有句柄, 使 `rename` 返回 EPERM/EACCES/EBUSY。
+ * 这些错误是可重试的瞬时错误, 与权限配置错误不同。
+ *
+ * @param error 捕获的错误。
+ * @returns 属可重试的 Windows 占用类错误时返回 true。
+ */
+function isWindowsRenameConflict(error: unknown): boolean {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EPERM" || code === "EACCES" || code === "EBUSY";
 }
 
 /**
