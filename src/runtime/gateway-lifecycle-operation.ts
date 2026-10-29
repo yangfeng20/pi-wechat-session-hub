@@ -113,7 +113,10 @@ export async function watchGatewayLifecycleOperation(
           clearWait();
           reject?.(new Error("等待 Gateway 重启完成超时。"));
         }, timeoutMs);
-        timer.unref();
+        // 超时定时器不调用 unref(): 等待期间唯一的活动资源是 persistent:false
+        // 的目录监听器, 若定时器也不持有事件循环, Node 会在 Promise 决之前退出,
+        // 表现为主进程报告 "Promise resolution is still pending but the event
+        // loop has already resolved"。等待方主动 close() 会清理该定时器。
         void readReceipt();
       });
     },
@@ -179,6 +182,10 @@ export async function writeGatewayLifecycleOperationReceipt(
  * 在替换阶段瞬时失败. 重试次数少且间隔短, 不改变调用方的超时预期。
  * 采用递归推进而非循环内等待, 避免在循环体内阻塞。
  *
+ * 退避定时器不调用 `unref()`: 调用方(如 lifecycle watcher)可能使用
+ * `persistent: false` 的监听器, 若重试期间定时器也不持有事件循环,
+ * 进程会在真正完成替换前提前退出。单个退避最长 200ms, 影响可忽略。
+ *
  * @param temporaryPath 已写入的临时文件路径。
  * @param targetPath 目标回执文件路径。
  * @param attempt 当前重试序号, 从 0 开始。
@@ -199,7 +206,7 @@ async function replaceWithRetry(
       throw error;
     }
     await new Promise<void>((resolveDelay) => {
-      setTimeout(resolveDelay, delay).unref();
+      setTimeout(resolveDelay, delay);
     });
     return replaceWithRetry(temporaryPath, targetPath, attempt + 1);
   }
