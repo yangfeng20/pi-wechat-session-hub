@@ -47,4 +47,4 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - name: 校验可见 UI 模式前置能力探测
-        run: node scripts/probe-wt-capability.mjs
+        run: npm run test:wt-capability
