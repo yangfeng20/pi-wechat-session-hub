@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -122,7 +123,10 @@ function runtimeOptions(
   fixture: RuntimeFixture,
   fetcher: typeof fetch,
   invocation: PiCliInvocation = { command: process.execPath, args: [] },
-  extra: Partial<Pick<Parameters<typeof GatewayRuntime.start>[0], "uiWorkerLauncher" | "uiIpcEndpoint" | "uiPlatform" | "lease">> = {},
+  extra: Partial<Pick<
+    Parameters<typeof GatewayRuntime.start>[0],
+    "uiWorkerLauncher" | "uiWorkerCapability" | "uiIpcEndpoint" | "uiPlatform" | "lease"
+  >> = {},
 ) {
   return {
     dataDirectory: fixture.managerDirectory,
@@ -642,7 +646,15 @@ test("Gateway runtime 不因存活但 stale 的 UI owner 阻塞启动, 并保留
   };
   let runtime: GatewayRuntime | undefined;
   try {
-    runtime = await GatewayRuntime.start(runtimeOptions(fixture, fetcher));
+    // 该用例验证「存活但 stale 的 UI owner 不阻塞启动」, 前提是当前部署支持 UI 模式。
+    // 显式注入 win32 与能力探测, 避免在 Linux CI 上退化为 live_worker_detected 分支。
+    runtime = await GatewayRuntime.start(runtimeOptions(fixture, fetcher, undefined, {
+      uiPlatform: "win32",
+      uiIpcEndpoint: process.platform === "win32"
+        ? createStableNamedPipe(fixture.managerDirectory)
+        : join(fixture.root, `stale-ui-${randomUUID()}.sock`),
+      uiWorkerCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
+    }));
     await pollStarted;
     assert.equal(runtime.status, "online");
     const recovered = await registry.readSnapshot();

@@ -38,7 +38,8 @@ test("自启动启用和禁用使用当前用户的登录触发任务", async ()
   await manager.disable();
 
   assert.equal(calls.length, 2);
-  assert.ok(calls[0].executable.endsWith("System32\\schtasks.exe"));
+  // join() 使用宿主平台的路径分隔符, 因此按平台无关方式断言尾部片段。
+  assert.match(calls[0].executable, /System32[\\/]schtasks\.exe$/);
   assert.ok(calls[0].args.includes("ONLOGON"));
   assert.ok(calls[0].args.includes("/Create"));
   assert.ok(calls[1].args.includes("/Delete"));
