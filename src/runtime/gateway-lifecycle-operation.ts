@@ -34,12 +34,10 @@ export async function watchGatewayLifecycleOperation(
   }
   const operationDirectory = await ensureOperationDirectory(managerDirectory);
   const receiptPath = join(operationDirectory, `${operationId}.json`);
-  // 使用 persistent: true, 由 wait() 安装的超时定时器与 close() 共同控制生命周期。
-  // persistent: false 会让监听器不持有事件循环: 若同时把超时定时器 unref,
-  // Node 会在 Promise 决之前退出 (Windows CI 上曾复现); 若定时器不 unref,
-  // 又会在 Linux 上让进程迟迟不退出。改为 persistent: true 后两者行为一致,
-  // 且 close() 一定会释放监听器。
-  const watcher = watch(operationDirectory, { persistent: true });
+  // persistent: false 让监听器不单独持有事件循环。等待期间的存活由 wait()
+  // 安装的非 unref 超时定时器保证, 两端平台行为一致; close() 同时清理
+  // 定时器与监听器, 因此不会让测试或 CLI 长期挂住进程。
+  const watcher = watch(operationDirectory, { persistent: false });
   let cachedReceipt: GatewayLifecycleOperationReceipt | undefined;
   let readError: Error | undefined;
   let resolveWait: ((receipt: GatewayLifecycleOperationReceipt) => void) | undefined;
