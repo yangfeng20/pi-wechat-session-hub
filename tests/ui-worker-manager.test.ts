@@ -180,7 +180,16 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
 
   try {
     await server.listen();
-    await uiManager.startNew("demo", "Fake TUI session");
+    try {
+      await uiManager.startNew("demo", "Fake TUI session");
+    } catch (error) {
+      const cause = (error as { cause?: unknown }).cause;
+      console.error("[DEBUG startNew]", error instanceof Error ? error.message : error);
+      if (cause) {
+        console.error("[DEBUG cause]", cause instanceof Error ? `${cause.name}: ${cause.message}` : cause);
+      }
+      throw error;
+    }
     const firstSnapshot = await registry.readSnapshot();
     const created = firstSnapshot.sessions["fake-ui-session"];
     assert.ok(created);

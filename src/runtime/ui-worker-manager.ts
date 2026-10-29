@@ -1091,7 +1091,12 @@ export class UiWorkerManager {
       if (error instanceof UiWorkerManagerError) {
         throw error;
       }
-      throw new UiWorkerManagerError("worker_launch_failed", "UI worker 启动失败; 未绑定微信 route。 ");
+      throw new UiWorkerManagerError(
+        "worker_launch_failed",
+        `UI worker 启动失败; 未绑定微信 route。 原因: ${
+          error instanceof Error ? error.message : "未知错误"
+        }`,
+      );
     }
     const registeredSessionId = launch.mode === "resume"
       ? launch.sessionId
