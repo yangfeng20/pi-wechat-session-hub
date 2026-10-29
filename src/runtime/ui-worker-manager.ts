@@ -1153,6 +1153,9 @@ function samePath(left: string, right: string): boolean {
  */
 function normalizeComparablePath(value: string): string {
   const resolved = resolve(value);
+  if (process.platform !== "win32") {
+    return resolved;
+  }
   try {
     return realpathSync.native(resolved);
   } catch {
