@@ -10,6 +10,13 @@ export type WindowsTerminalLaunchErrorCode =
   | "launch_failed";
 
 /**
+ * 描述当前环境能否启动可见 Windows Terminal UI worker。
+ */
+export type WindowsTerminalCapability =
+  | { supported: true; executable: string }
+  | { supported: false; reason: string };
+
+/**
  * 表示 Windows Terminal UI worker 无法安全启动。
  */
 export class WindowsTerminalLaunchError extends Error {
@@ -117,6 +124,41 @@ export class WindowsTerminalLauncher {
         ));
       });
     });
+  }
+}
+
+/**
+ * 探测当前环境是否具备启动可见 Windows Terminal UI worker 的能力。
+ *
+ * 该探测不启动任何进程, 只判断平台与 wt.exe 是否可用, 供命令在执行前阻塞不受支持的操作。
+ *
+ * @param options 可注入平台、WindowsApps 路径、文件存在检查器和 where.exe 查询器。
+ * @returns 支持时返回已解析的 wt.exe 路径, 否则返回面向用户的中文原因。
+ */
+export async function probeWindowsTerminalCapability(options: {
+  platform?: NodeJS.Platform;
+  localAppData?: string;
+  systemRoot?: string;
+  fileExists?: (path: string) => boolean;
+  findOnPath?: (wherePath: string) => Promise<string>;
+} = {}): Promise<WindowsTerminalCapability> {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    return {
+      supported: false,
+      reason: `当前系统为 ${platform}, 可见 UI 模式依赖 Windows Terminal, 仅支持 Windows`,
+    };
+  }
+  try {
+    const executable = await resolveWindowsTerminalExecutable(options);
+    return { supported: true, executable };
+  } catch (error) {
+    return {
+      supported: false,
+      reason: error instanceof WindowsTerminalLaunchError && error.code === "wt_not_found"
+        ? "未找到 Windows Terminal (wt.exe), 请先安装 Windows Terminal 或将其加入应用执行别名"
+        : "无法确认 Windows Terminal 可用性",
+    };
   }
 }
 

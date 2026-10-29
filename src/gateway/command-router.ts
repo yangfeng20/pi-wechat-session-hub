@@ -90,6 +90,7 @@ export class GatewayCommandRouter {
   private readonly lease: GatewayLease;
   private readonly replySink?: GatewayReplySink;
   private readonly processingIndicator?: GatewayProcessingIndicator;
+  private readonly uiModeCapability?: () => Promise<import("../gateway/windows-terminal-launcher.ts").WindowsTerminalCapability>;
 
   /**
    * 创建 Gateway 命令路由器。
@@ -105,6 +106,7 @@ export class GatewayCommandRouter {
     lease: GatewayLease;
     replySink?: GatewayReplySink;
     processingIndicator?: GatewayProcessingIndicator;
+    uiModeCapability?: () => Promise<import("../gateway/windows-terminal-launcher.ts").WindowsTerminalCapability>;
   }) {
     this.configStore = options.configStore;
     this.projectService = options.projectService;
@@ -114,6 +116,7 @@ export class GatewayCommandRouter {
     this.lease = options.lease;
     this.replySink = options.replySink;
     this.processingIndicator = options.processingIndicator;
+    this.uiModeCapability = options.uiModeCapability;
   }
 
   /**
@@ -787,14 +790,32 @@ export class GatewayCommandRouter {
     const workerLabel = instance
       ? `${instance.mode === "ui" ? "前台" : "后台"} · ${formatWorkerState(instance.state)}`
       : "未运行";
+    const uiModeLine = this.uiModeCapability
+      ? [`可见 UI 模式：${await this.formatUiModeCapability()}`]
+      : [];
     return [
       `Hub 状态：${formatGatewayState(snapshot.gateway?.state)}`,
       `当前微信会话：${sessionTitle}`,
       ...(projectName ? [`项目：${projectName}`] : []),
       `Pi：${workerLabel}`,
+      ...uiModeLine,
       `未完成消息：${pendingQueueCount} 条`,
       `已登记项目：${projectCount} 个`,
     ].join("\n");
+  }
+
+  /**
+   * 格式化当前环境是否可创建或恢复可见 UI 会话。
+   *
+   * @returns 面向微信用户的中文能力说明。
+   */
+  private async formatUiModeCapability(): Promise<string> {
+    try {
+      const capability = await this.uiModeCapability!();
+      return capability.supported ? "可用" : `不可用（${capability.reason}）`;
+    } catch {
+      return "不可用（无法确认 Windows Terminal 可用性）";
+    }
   }
 
   /**

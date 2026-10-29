@@ -15,7 +15,7 @@ import { ManagerRegistry } from "../src/registry/manager-registry.ts";
 import { ProjectService } from "../src/projects/project-service.ts";
 import { BackgroundWorkerManager } from "../src/runtime/background-worker-manager.ts";
 import { GatewayWorkerManager } from "../src/runtime/gateway-worker-manager.ts";
-import { UiWorkerManager } from "../src/runtime/ui-worker-manager.ts";
+import { UiWorkerManager, UiWorkerManagerError } from "../src/runtime/ui-worker-manager.ts";
 
 interface FakeUiWorker {
   instanceId: string;
@@ -329,3 +329,84 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("非 Windows 平台在创建或恢复可见 UI 会话前阻塞并给出平台原因", async () => {
+  const manager = createBlockingManager({ platform: "darwin" });
+  const blockedError = (error: unknown): boolean =>
+    error instanceof UiWorkerManagerError &&
+    error.code === "unsupported_platform" &&
+    /仅支持 Windows|依赖 Windows Terminal/.test(error.message);
+
+  await assert.rejects(manager.startNew("demo"), blockedError);
+  await assert.rejects(manager.resume("any-session"), blockedError);
+});
+
+test("缺少 Windows Terminal 时阻塞可见 UI 会话并在提示中说明 wt.exe 缺失", async () => {
+  const manager = createBlockingManager({
+    platform: "win32",
+    probeCapability: async () => ({
+      supported: false,
+      reason: "未找到 Windows Terminal (wt.exe), 请先安装 Windows Terminal 或将其加入应用执行别名",
+    }),
+  });
+  await assert.rejects(
+    manager.startNew("demo"),
+    (error: unknown) =>
+      error instanceof UiWorkerManagerError &&
+      error.code === "wt_not_found" &&
+      /wt\.exe/.test(error.message) &&
+      /background/.test(error.message),
+  );
+});
+
+test("可见 UI 能力失败结果不缓存 安装 Windows Terminal 后无需重启即可恢复", async () => {
+  let probeCount = 0;
+  const manager = createBlockingManager({
+    platform: "win32",
+    probeCapability: async () => {
+      probeCount += 1;
+      return probeCount === 1
+        ? { supported: false, reason: "未找到 Windows Terminal (wt.exe)" }
+        : { supported: true, executable: "C:/WindowsApps/wt.exe" };
+    },
+  });
+  await assert.rejects(manager.startNew("demo"), (error: unknown) =>
+    error instanceof UiWorkerManagerError && error.code === "wt_not_found");
+  const capability = await manager.describeUiModeCapability();
+  assert.equal(capability.supported, true);
+  assert.equal(probeCount, 2);
+});
+
+/**
+ * 创建只验证 UI 模式前置阻塞的 UiWorkerManager。
+ *
+ * @param options 平台和可选能力探测器。
+ * @returns 依赖被最小化替身填充的 manager。
+ */
+function createBlockingManager(options: {
+  platform: NodeJS.Platform;
+  probeCapability?: () => Promise<import("../src/gateway/windows-terminal-launcher.ts").WindowsTerminalCapability>;
+}): UiWorkerManager {
+  const ipcServer = {
+    setHandlers: () => undefined,
+    listen: async () => undefined,
+  } as unknown as UiWorkerIpcServer;
+  return new UiWorkerManager({
+    managerDirectory: join(tmpdir(), "pi-wechat-blocking-manager"),
+    projectService: {
+      resolve: async () => {
+        throw new Error("不应在阻塞校验通过前解析项目");
+      },
+    } as unknown as ProjectService,
+    registry: {
+      readSnapshot: async () => {
+        throw new Error("不应在阻塞校验通过前读取 registry");
+      },
+    } as unknown as ManagerRegistry,
+    ipcServer,
+    invocation: { command: process.execPath, args: [process.execPath] },
+    extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
+    platform: options.platform,
+    ...(options.probeCapability ? { probeCapability: options.probeCapability } : {}),
+  });
+}

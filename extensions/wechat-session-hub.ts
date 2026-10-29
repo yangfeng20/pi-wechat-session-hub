@@ -16,6 +16,7 @@ import {
 } from "../src/commands/wechat-manager-command-parser.ts";
 import { getManagerDataDirectory } from "../src/config/paths.ts";
 import { GatewayControlError } from "../src/gateway/gateway-control-ipc.ts";
+import { probeWindowsTerminalCapability } from "../src/gateway/windows-terminal-launcher.ts";
 import { GatewayServiceController, type GatewayDaemonLaunchSpec, type GatewayServiceStatus } from "../src/runtime/gateway-service-controller.ts";
 import { WindowsLogonTaskManager, WindowsLogonTaskManagerError } from "../src/runtime/windows-logon-task-manager.ts";
 import { registerUiWorkerBridgeHooks, attachCurrentUiWorkerSession, getCurrentUiWorkerBridgeDiagnostics } from "../src/gateway/ui-worker-extension-bridge.ts";
@@ -38,6 +39,7 @@ const HELP_TEXT = [
   "  status - 查看连接、项目和授权根目录状态",
   "  roots add-current - 授权当前目录及其子目录并接入当前会话",
   "  help - 查看命令说明",
+  "  可见 UI 模式需要 Windows Terminal; 当前系统不支持或找不到 wt.exe 时会阻塞并在提示中说明原因.",
   "/wechat-manager - /wx 的兼容别名",
 ].join("\n");
 
@@ -114,6 +116,7 @@ async function updateWindowsLogonAutoStart(
 function formatGatewayServiceStatus(
   status: GatewayServiceStatus,
   autoStart: boolean,
+  uiModeText: string,
 ): string {
   const stateText: Record<GatewayServiceStatus["state"], string> = {
     offline: "已停止",
@@ -129,8 +132,19 @@ function formatGatewayServiceStatus(
     `后台会话: ${status.backgroundSessionCount ?? 0}`,
     `微信 route: ${status.routeCount ?? 0}`,
     `Windows 登录自动启动: ${autoStart ? "开启" : "关闭"}`,
+    `可见 UI 模式: ${uiModeText}`,
     ...(status.error ? [`状态说明: ${status.error}`] : []),
   ].join("\n");
+}
+
+/**
+ * 描述当前环境能否创建或恢复可见 UI 会话.
+ *
+ * @returns 面向用户的中文能力说明.
+ */
+async function describeUiModeCapability(): Promise<string> {
+  const capability = await probeWindowsTerminalCapability();
+  return capability.supported ? "可用" : `不可用 (${capability.reason})`;
 }
 
 /**
@@ -429,9 +443,10 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
       if (command.action === "status") {
         const snapshot = await store.load();
         const status = await serviceController.status();
+        const uiModeText = await describeUiModeCapability();
         ctx.ui.notify(
           [
-            formatGatewayServiceStatus(status, snapshot.config.autoStartOnWindowsLogon),
+            formatGatewayServiceStatus(status, snapshot.config.autoStartOnWindowsLogon, uiModeText),
             formatCurrentTuiBridgeStatus(),
             `配置: ${snapshot.exists ? "已加载" : "尚未创建"}`,
             `授权根目录: ${snapshot.config.allowedProjectRoots.length}`,

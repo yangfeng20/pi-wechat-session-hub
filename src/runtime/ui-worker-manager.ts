@@ -15,7 +15,7 @@ import { isProcessAlive } from "../system/process-liveness.ts";
 import type { UiWorkerLaunchRecord, UiWorkerRegistration } from "../gateway/ui-worker-types.ts";
 import type { PiCliInvocation } from "./pi-cli.ts";
 import type { BackgroundWorkerManager } from "./background-worker-manager.ts";
-import { WindowsTerminalLaunchError, WindowsTerminalLauncher } from "../gateway/windows-terminal-launcher.ts";
+import { WindowsTerminalLaunchError, WindowsTerminalLauncher, probeWindowsTerminalCapability, type WindowsTerminalCapability } from "../gateway/windows-terminal-launcher.ts";
 
 export type UiWorkerManagerErrorCode =
   | "unsupported_platform"
@@ -57,6 +57,7 @@ export class UiWorkerManager {
   private readonly staleTimers = new Map<string, NodeJS.Timeout>();
   private readonly explicitStops = new Set<string>();
   private readonly maxStaleMs: number;
+  private capabilityTask?: Promise<WindowsTerminalCapability>;
 
   /**
    * 创建 UI worker manager 并安装 IPC lifecycle handlers。
@@ -69,6 +70,7 @@ export class UiWorkerManager {
     registry: ManagerRegistry;
     ipcServer: UiWorkerIpcServer;
     launcher?: Pick<WindowsTerminalLauncher, "launch">;
+    probeCapability?: () => Promise<WindowsTerminalCapability>;
     invocation: PiCliInvocation;
     extensionPath: string;
     backgroundWorkerManager?: BackgroundWorkerManager;
@@ -116,7 +118,7 @@ export class UiWorkerManager {
    * @throws {UiWorkerManagerError} Windows Terminal 不可用或 Pi worker 未注册时抛出。
    */
   async startNew(projectAlias: string, name?: string): Promise<SessionIndexRecord> {
-    this.assertSupportedPlatform();
+    await this.assertUiModeAvailable();
     const project = await this.resolveProject(projectAlias);
     const launch = this.createLaunchRecord({
       mode: "new",
@@ -135,7 +137,7 @@ export class UiWorkerManager {
    * @throws {UiWorkerManagerError} session 无法安全恢复或 owner 仍活跃时抛出。
    */
   async resume(sessionId: string): Promise<SessionIndexRecord> {
-    this.assertSupportedPlatform();
+    await this.assertUiModeAvailable();
     let snapshot = await this.options.registry.readSnapshot();
     let session = snapshot.sessions[sessionId];
     if (!session) {
@@ -938,9 +940,57 @@ export class UiWorkerManager {
     if ((this.options.platform ?? process.platform) !== "win32") {
       throw new UiWorkerManagerError(
         "unsupported_platform",
-        "UI worker 需要 Windows Terminal; 当前平台可使用 background 模式。",
+        "可见 UI 模式依赖 Windows Terminal, 当前平台不支持, 已阻塞该操作; 请改用 background 模式。",
       );
     }
+  }
+
+  /**
+   * 探测可见 UI 模式是否可用, 不可用时在启动前阻塞操作。
+   *
+   * 仅缓存成功结果; 失败结果不缓存, 以便用户安装 Windows Terminal 后无需重启 daemon 即可重试。
+   *
+   * @returns 可用时正常结束。
+   * @throws {UiWorkerManagerError} 平台不受支持或 Windows Terminal 缺失时抛出。
+   */
+  private async assertUiModeAvailable(): Promise<void> {
+    this.assertSupportedPlatform();
+    const capability = await this.describeUiModeCapability();
+    if (capability.supported) {
+      return;
+    }
+    throw new UiWorkerManagerError(
+      "wt_not_found",
+      `${capability.reason}; 已阻塞可见 UI 会话创建与恢复, 请安装 Windows Terminal 或改用 background 模式。`,
+    );
+  }
+
+  /**
+   * 读取可见 UI 模式的能力探测结果, 供状态展示复用。
+   *
+   * 仅缓存成功结果; 平台不受支持或缺少 wt.exe 时每次重新探测。
+   *
+   * @returns 当前环境的 UI 模式能力。
+   */
+  async describeUiModeCapability(): Promise<WindowsTerminalCapability> {
+    if ((this.options.platform ?? process.platform) !== "win32") {
+      return {
+        supported: false,
+        reason: `当前系统为 ${this.options.platform ?? process.platform}, 可见 UI 模式依赖 Windows Terminal, 仅支持 Windows`,
+      };
+    }
+    if (this.capabilityTask) {
+      return this.capabilityTask;
+    }
+    const probe = this.options.probeCapability
+      ? this.options.probeCapability
+      : async (): Promise<WindowsTerminalCapability> =>
+        probeWindowsTerminalCapability({ platform: this.options.platform ?? process.platform });
+    const capability = await probe();
+    if (capability.supported) {
+      this.capabilityTask = Promise.resolve(capability);
+    }
+    return capability;
   }
 
   /**

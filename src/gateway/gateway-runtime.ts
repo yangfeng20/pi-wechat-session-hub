@@ -106,6 +106,7 @@ export class GatewayRuntime extends EventEmitter {
     onControlReady?: (lease: GatewayLease, registry: ManagerRegistry) => Promise<void>;
     fetcher?: typeof fetch;
     uiWorkerLauncher?: Pick<WindowsTerminalLauncher, "launch">;
+    uiWorkerCapability?: () => Promise<import("./windows-terminal-launcher.ts").WindowsTerminalCapability>;
     uiIpcEndpoint?: string;
     uiPlatform?: NodeJS.Platform;
     credentialStoreOptions?: ConstructorParameters<typeof IlinkCredentialStore>[2];
@@ -173,6 +174,7 @@ export class GatewayRuntime extends EventEmitter {
         staleAfterMs: config.runtime.staleAfterMs,
         registrationTimeoutMs: 60000,
         ...(options.uiWorkerLauncher ? { launcher: options.uiWorkerLauncher } : {}),
+        ...(options.uiWorkerCapability ? { probeCapability: options.uiWorkerCapability } : {}),
         ...(options.uiPlatform ? { platform: options.uiPlatform } : {}),
       });
       gatewayWorkerManager = new GatewayWorkerManager(workerManager, uiWorkerManager, registry);
@@ -194,6 +196,7 @@ export class GatewayRuntime extends EventEmitter {
         queue,
         lease,
         processingIndicator: typingIndicator,
+        uiModeCapability: () => uiWorkerManager!.describeUiModeCapability(),
         replySink: (routeId, messageId, reply, replyContext) =>
           channel!.sendReply(routeId, messageId, reply, replyContext),
       });

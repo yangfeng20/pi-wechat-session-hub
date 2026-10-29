@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  probeWindowsTerminalCapability,
   resolveWindowsTerminalExecutable,
   WindowsTerminalLaunchError,
   WindowsTerminalLauncher,
@@ -83,4 +84,35 @@ test("Windows Terminal launcher 以 argv 启动固定脚本且不拼接用户消
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("能力探测在非 Windows 平台返回不支持原因 且不抛出", async () => {
+  const capability = await probeWindowsTerminalCapability({ platform: "darwin" });
+  assert.equal(capability.supported, false);
+  assert.match(capability.supported ? "" : capability.reason, /仅支持 Windows/);
+});
+
+test("能力探测在缺少 wt.exe 时返回不支持原因 且不抛出", async () => {
+  const capability = await probeWindowsTerminalCapability({
+    platform: "win32",
+    localAppData: "C:\\Users\\test\\AppData\\Local",
+    systemRoot: "C:\\Windows",
+    fileExists: () => false,
+    findOnPath: async () => "",
+  });
+  assert.equal(capability.supported, false);
+  assert.match(capability.supported ? "" : capability.reason, /Windows Terminal/);
+});
+
+test("能力探测在 wt.exe 可用时返回可执行文件路径", async () => {
+  const alias = "C:\\Users\\test\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe";
+  const capability = await probeWindowsTerminalCapability({
+    platform: "win32",
+    localAppData: "C:\\Users\\test\\AppData\\Local",
+    systemRoot: "C:\\Windows",
+    fileExists: () => false,
+    findOnPath: async () => `${alias}\r\n`,
+  });
+  assert.equal(capability.supported, true);
+  assert.equal(capability.supported ? capability.executable : "", alias);
 });

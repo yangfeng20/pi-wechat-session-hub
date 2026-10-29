@@ -378,6 +378,57 @@ test("微信 /new --mode ui 将显式 UI 模式交给 worker manager", async () 
   }
 });
 
+test("微信 /status 在 UI 模式不可用时明确标注原因", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-router-ui-capability-"));
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    wechat: { ...config.wechat, authorizedUserId: "wx-user-capability" },
+  }));
+  const projectService = new ProjectService(configStore);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: {
+      startNew: async () => { throw new Error("此测试不创建会话"); },
+      resume: async () => { throw new Error("此测试不恢复会话"); },
+      prompt: async () => "",
+      stop: async () => undefined,
+      stopAll: async () => undefined,
+      listSessions: async () => [],
+    },
+    registry,
+    queue,
+    lease,
+    uiModeCapability: async () => ({
+      supported: false,
+      reason: "未找到 Windows Terminal (wt.exe), 请先安装 Windows Terminal 或将其加入应用执行别名",
+    }),
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const result = await router.receive({
+      messageId: "wx-status-ui-capability",
+      senderId: "wx-user-capability",
+      text: "/status",
+    });
+    assert.equal(result.state, "completed");
+    assert.match(replies[0], /可见 UI 模式：不可用/);
+    assert.match(replies[0], /wt\.exe/);
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
 test("微信 /new 的项目 alias 错误会回复微信并把 queue 标记 completed", async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-router-ui-project-error-"));
   const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));

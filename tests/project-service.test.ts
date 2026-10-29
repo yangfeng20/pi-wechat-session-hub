@@ -47,7 +47,7 @@ test("首次初始化自动授权当前目录, 并按文件夹名称登记项目
 test("允许根中的目录自动登记且重复登记复用同一项目", async () => {
   const { temporaryDirectory, allowedRoot } = await createProjectFixture();
   try {
-    const projectPath = join(allowedRoot, "workspace", "deltaforce-insight");
+    const projectPath = join(allowedRoot, "workspace", "demo-workspace");
     await mkdir(projectPath, { recursive: true });
     const store = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
     await store.update((config) => ({
@@ -60,7 +60,7 @@ test("允许根中的目录自动登记且重复登记复用同一项目", async
     const second = await service.ensureProjectForCwd(projectPath);
 
     assert.equal(first.alias, second.alias);
-    assert.equal(first.project.displayName, "deltaforce-insight");
+    assert.equal(first.project.displayName, "demo-workspace");
     assert.equal((await service.list()).projects.length, 1);
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });

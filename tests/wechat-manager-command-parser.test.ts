@@ -29,14 +29,14 @@ test("/wx 解析项目和授权根子命令, 并保留 Windows 路径空格", ()
     command: { action: "list" },
   });
   assert.deepEqual(
-    parseWechatManagerCommand('projects add demo --name "Delta Force" --path "D:\\Program Project\\deltaforce-insight"'),
+    parseWechatManagerCommand('projects add demo --name "示例 项目" --path "D:\\Work Space\\demo-app"'),
     {
       action: "projects",
       command: {
         action: "add",
         alias: "demo",
-        displayName: "Delta Force",
-        path: "D:\\Program Project\\deltaforce-insight",
+        displayName: "示例 项目",
+        path: "D:\\Work Space\\demo-app",
       },
     },
   );
@@ -45,10 +45,10 @@ test("/wx 解析项目和授权根子命令, 并保留 Windows 路径空格", ()
     action: "roots",
     operation: "add-current",
   });
-  assert.deepEqual(parseWechatManagerCommand('roots add "D:\\Program Project\\List"'), {
+  assert.deepEqual(parseWechatManagerCommand('roots add "D:\\Work Space"'), {
     action: "roots",
     operation: "add",
-    path: "D:\\Program Project\\List",
+    path: "D:\\Work Space",
   });
 });
 
