@@ -125,7 +125,8 @@ export class WindowsLogonTaskManager {
  */
 export function buildWindowsScheduledTaskCommand(spec: GatewayDaemonLaunchSpec): string {
   const args = [
-    "--experimental-transform-types",
+    // 与 launchDetachedGatewayDaemon 保持一致：仅 .ts 入口才需要 TS flag。
+    ...(spec.daemonEntry.endsWith(".ts") ? ["--experimental-transform-types"] : []),
     spec.daemonEntry,
     "--launch-payload",
     encodeGatewayDaemonLaunchSpec(spec),

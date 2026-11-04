@@ -63,7 +63,7 @@ function createGatewayServiceControllerSpec(): GatewayDaemonLaunchSpec {
   return {
     managerDirectory,
     extensionPath: fileURLToPath(import.meta.url),
-    daemonEntry: fileURLToPath(new URL("../src/runtime/gateway-daemon.ts", import.meta.url)),
+    daemonEntry: fileURLToPath(new URL("./daemon-entry.mjs", import.meta.url)),
     piInvocation: resolveCurrentPiCli(),
   };
 }
