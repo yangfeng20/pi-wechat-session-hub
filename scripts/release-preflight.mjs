@@ -150,17 +150,25 @@ async function runVerify() {
 
   const published = packument.versions?.[version];
   if (!published) {
-    fail(`registry 上找不到 ${version}, 发布可能尚未生效`);
+    const rawVersions = Object.keys(packument.versions ?? {});
+    if (rawVersions.includes("0.0.0-stage") || packument["dist-tags"]?.latest !== version) {
+      fail(`registry 上暂时看不到 ${version}: npm 可能正在做发布后安全扫描(网页显示 Validating), 稍等几分钟后重试`);
+    } else {
+      fail(`registry 上找不到 ${version}, 发布可能尚未生效`);
+    }
     report();
     return;
   }
 
+  // 版本级 readme 在正常发布的包里也常为空, 真正影响搜索索引的是顶层 readme,
+  // 因此只在顶层也为空时判失败, 避免误报。
   const packumentReadme = typeof packument.readme === "string" ? packument.readme : "";
   const versionReadme = typeof published.readme === "string" ? published.readme : "";
-  if (packumentReadme.trim().length === 0 && versionReadme.trim().length === 0) {
-    fail("packument 的 readme 为空, 该包无法进入 npm search 索引(0.1.0 的同款问题)");
+  if (packumentReadme.trim().length === 0) {
+    fail("顶层 readme 为空, 该包可能无法进入 npm search 索引(0.1.0 的同款问题)");
   } else {
-    note(`packument readme 长度 ${packumentReadme.length}, 版本 readme 长度 ${versionReadme.length}`);
+    const versionNote = versionReadme.trim().length === 0 ? "(版本级为空属正常)" : "";
+    note(`顶层 readme ${packumentReadme.length} 字符, 版本级 readme ${versionReadme.length} 字符${versionNote}`);
   }
 
   const latest = packument["dist-tags"]?.latest;
@@ -170,37 +178,81 @@ async function runVerify() {
     note(`dist-tags.latest = ${version}`);
   }
 
-  if (!versionReadme.includes("daemon-entry") && packumentReadme.length === 0) {
-    note("README 中未提及 daemon-entry, 如已更新文档可忽略");
-  }
-
-  const search = await fetch(
-    `${REGISTRY}/-/v1/search?text=${encodeURIComponent(`${name} keywords:pi-package`)}&size=20`,
-    { headers: { "user-agent": "pi-wechat-session-hub-release-check" } },
-  );
-  if (search.ok) {
-    const result = await search.json();
-    const hit = result.objects?.some((item) => item.package?.name === name);
-    if (hit) {
-      note("npm search 已能检索到该包");
-    } else {
-      note("npm search 暂未收录, 索引有延迟, 通常几分钟到数小时");
-    }
-  }
-
-  const gallery = await fetch(`https://pi.dev/packages?name=${encodeURIComponent(name)}`, {
-    headers: { "user-agent": "pi-wechat-session-hub-release-check" },
+  const searchHit = await checkNpmSearch(name).catch((error) => {
+    note(`npm search 检查跳过: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
   });
-  if (gallery.ok) {
-    const html = await gallery.text();
-    if (html.includes(name)) {
-      note("pi.dev/packages 已能搜到该包");
-    } else {
-      note("pi.dev/packages 暂未收录, 站点有自己的索引缓存, 需要等待刷新");
-    }
+  if (searchHit === true) {
+    note("npm search 已能检索到该包");
+  } else if (searchHit === false) {
+    note("npm search 暂未收录, 索引有延迟, 通常几分钟到数小时");
+  }
+
+  const galleryHit = await checkGallery(name).catch((error) => {
+    note(`pi.dev/packages 检查跳过: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  });
+  if (galleryHit === true) {
+    note("pi.dev/packages 已能搜到该包");
+  } else if (galleryHit === false) {
+    note("pi.dev/packages 暂未收录, 站点有自己的索引缓存, 需要等待刷新");
   }
 
   report();
+}
+
+/**
+ * 查询 npm search 是否已收录该包。
+ *
+ * @param {string} name 包名。
+ * @returns {Promise<boolean>} 已收录返回 true, 未收录返回 false。
+ */
+async function checkNpmSearch(name) {
+  const response = await fetchWithTimeout(
+    `${REGISTRY}/-/v1/search?text=${encodeURIComponent(`${name} keywords:pi-package`)}&size=20`,
+  );
+  if (!response.ok) {
+    throw new Error(`search 接口返回 ${response.status}`);
+  }
+  const result = await response.json();
+  return Boolean(result.objects?.some((item) => item.package?.name === name));
+}
+
+/**
+ * 查询 pi.dev 包画廊是否已收录该包。
+ *
+ * @param {string} name 包名。
+ * @returns {Promise<boolean>} 已收录返回 true, 未收录返回 false。
+ */
+async function checkGallery(name) {
+  const response = await fetchWithTimeout(`https://pi.dev/packages?name=${encodeURIComponent(name)}`);
+  if (!response.ok) {
+    throw new Error(`pi.dev 返回 ${response.status}`);
+  }
+  const html = await response.text();
+  return html.includes(name);
+}
+
+/**
+ * 带超时的 fetch。
+ *
+ * 外部站点(尤其是经 Cloudflare 的 pi.dev)在网络受限时可能长时间不响应,
+ * 必须显式限时, 否则会拖住整个校验流程。
+ *
+ * @param {string} url 请求地址。
+ * @returns {Promise<Response>} 响应对象。
+ */
+async function fetchWithTimeout(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    return await fetch(url, {
+      headers: { "user-agent": "pi-wechat-session-hub-release-check" },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
