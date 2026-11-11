@@ -137,13 +137,17 @@ export class GatewayCommandRouter {
       return;
     }
     const notice = [
-      "你有一条消息没有处理成功, 已自动跳过, 后续消息不受影响。",
-      `消息 ID: ${item.messageId}`,
-      `原文: ${truncatePreview(item.text)}`,
-      item.errorCode ? `原因: ${item.errorCode}` : undefined,
-      `要重新执行请发送 /retry ${item.messageId} --confirm`,
-      "(注意: 重新执行可能重复产生副作用)",
-    ].filter((line): line is string => line !== undefined).join("\n");
+      "⚠️ **有一条消息没有处理成功, 已自动跳过**",
+      [
+        "| 项 | 值 |",
+        "| --- | --- |",
+        `| 消息 ID | ${item.messageId} |`,
+        `| 原文 | ${truncatePreview(item.text)} |`,
+        ...(item.errorCode ? [`| 原因 | ${item.errorCode} |`] : []),
+      ].join("\n"),
+      "后续消息不受影响。",
+      `重新执行：\`/retry ${item.messageId} --confirm\` (可能重复产生副作用)`,
+    ].join("\n\n");
     await this.replySink(routeId, `${item.messageId}:skipped`, notice, item.replyContext);
   }
 
@@ -448,13 +452,17 @@ export class GatewayCommandRouter {
           ? "尚无项目 alias。请先在配置文件设置 allowedProjectRoots。"
           : "尚无项目 alias, 可用 /projects add 登记项目。";
       }
+      const defaultAlias = config.defaultProject;
+      const rows = projects.map(([alias, project]) => {
+        const mark = defaultAlias === alias ? "**是**" : "";
+        return `| ${alias} | ${project.displayName} | ${mark} |`;
+      });
       return [
-        "已登记项目:",
-        ...projects.map(([alias, project]) => {
-          const defaultMark = config.defaultProject === alias ? " (默认)" : "";
-          return `${alias}${defaultMark}: ${project.displayName}`;
-        }),
-      ].join("\n");
+        `**已登记项目** · 共 ${projects.length} 个`,
+        ["| 别名 | 名称 | 默认 |", "| --- | --- | --- |", ...rows].join("\n"),
+        `默认项目：${defaultAlias ? `\`${defaultAlias}\`` : "未设置"}`,
+        "登记新项目：`/projects add <别名> --name <名称> --path <绝对路径>`",
+      ].join("\n\n");
     }
     if (command.action === "add") {
       const project = await this.projectService.add(
@@ -524,9 +532,16 @@ export class GatewayCommandRouter {
       await this.workerManager.stop(session.sessionId).catch(() => undefined);
       throw error;
     }
-    const stateText = indexedSession?.state === "pending" ? "等待首条 transcript 写入" : "活跃";
+    const stateText = indexedSession?.state === "pending" ? "待首次对话后落盘" : "活跃";
     const modeText = requestedMode === "ui" ? "可见 UI" : "后台";
-    return `${modeText} Pi session 已创建: ${indexedSession?.name ?? `#${indexedSession?.publicIndex ?? "?"}`} (${alias}, ${stateText})。`;
+    const sessionLabel = indexedSession?.name ?? `#${indexedSession?.publicIndex ?? "?"}`;
+    return [
+      `**已创建会话** ${sessionLabel}`,
+      `项目：${alias}`,
+      `模式：${modeText}`,
+      `状态：${stateText}`,
+      "直接发送内容即可开始对话。",
+    ].join("\n\n");
   }
 
   /**
@@ -668,11 +683,13 @@ export class GatewayCommandRouter {
       return confirmation;
     }
     const preview = truncateTail(latestAssistantText, RESUME_ASSISTANT_TEXT_LIMIT);
-    return `${confirmation}\n\n最近一次回复${preview.truncated ? "（末段节选）" : ""}：\n${preview.text}${
+    // 单个换行会被微信的 markdown 渲染吞成空格, 因此标签与正文之间用空行分隔。
+    return [
+      `${confirmation}`,
       preview.truncated
-        ? `\n\n[回复较长, 以上为结尾 ${RESUME_ASSISTANT_TEXT_LIMIT} 字; 完整回复仍保留在会话记录中。]`
-        : ""
-    }`;
+        ? `**最近一次回复（末段节选）**\n\n${preview.text}\n\n[回复较长, 以上为结尾 ${RESUME_ASSISTANT_TEXT_LIMIT} 字; 完整回复仍保留在会话记录中。]`
+        : `**最近一次回复**\n\n${preview.text}`,
+    ].join("\n\n");
   }
 
   /**
@@ -708,45 +725,53 @@ export class GatewayCommandRouter {
       : session.projectAlias;
     const title = await resolveSessionTitle(session);
     const header = [
-      `会话 #${session.publicIndex ?? "?"} ${title} · ${projectName}`,
+      `**会话 #${session.publicIndex ?? "?"}** ${title}`,
+      `项目：${projectName}`,
       `最后活动：${formatLocalMinute(session.lastActivityAt)} · ${session.mode === "ui" ? "前台" : "后台"}`,
-    ];
+    ].join("\n\n");
     const turn = await readLatestTurn(session.sessionFile);
     if (!turn) {
       return [
-        ...header,
-        "",
+        header,
         session.state === "pending"
           ? "该会话尚未写入任何对话记录。"
           : "未能读取该会话的对话记录。",
-      ].join("\n");
+      ].join("\n\n");
     }
 
     const body: string[] = [];
     if (turn.userText) {
       const userPreview = truncateHead(turn.userText, LAST_USER_TEXT_LIMIT);
-      body.push(`你：\n${userPreview.text}`, ...(userPreview.truncated ? ["[提问较长, 已截断。]"] : []));
+      body.push(
+        [
+          "**你**",
+          userPreview.text,
+          ...(userPreview.truncated ? ["[提问较长, 已截断。]"] : []),
+        ].join("\n\n"),
+      );
     }
     if (turn.assistantText) {
       const assistantPreview = truncateTail(turn.assistantText, LAST_ASSISTANT_TEXT_LIMIT);
       body.push(
-        `AI${assistantPreview.truncated ? "（末段节选）" : ""}：\n${assistantPreview.text}`,
-        ...(assistantPreview.truncated
-          ? [`[回复较长, 以上为结尾 ${LAST_ASSISTANT_TEXT_LIMIT} 字; 完整内容仍保留在会话记录中。]`]
-          : []),
+        [
+          assistantPreview.truncated ? "**AI（末段节选）**" : "**AI**",
+          assistantPreview.text,
+          ...(assistantPreview.truncated
+            ? [`[回复较长, 以上为结尾 ${LAST_ASSISTANT_TEXT_LIMIT} 字; 完整内容仍保留在会话记录中。]`]
+            : []),
+        ].join("\n\n"),
       );
     } else {
-      body.push("AI：尚未产生回复。");
+      body.push(["**AI**", "尚未产生回复。"].join("\n\n"));
     }
     return [
-      ...header,
+      header,
       ...(running ? ["⚠️ 该会话正在运行, 以下为目前已落盘的内容。"] : []),
-      "",
-      "最近一轮对话",
-      ...body,
-      "",
-      selector ? "发送 /resume " + (session.publicIndex ?? selector) + " 可切换到此会话。" : "发送任意内容可继续对话。",
-    ].join("\n");
+      body.join("\n\n"),
+      selector
+        ? `发送 \`/resume ${session.publicIndex ?? selector}\` 可切换到此会话。`
+        : "发送任意内容可继续对话。",
+    ].join("\n\n");
   }
 
   /**
@@ -835,11 +860,17 @@ export class GatewayCommandRouter {
     const skippedLines = skippedItems.length === 0
       ? []
       : [
-          `已跳过：${skippedItems.length} 条`,
-          ...skippedItems.slice(-3).map((item) =>
-            `  ${item.messageId} · ${item.errorCode ?? "未知原因"} · ${truncatePreview(item.text)}`,
-          ),
-          "  需要重新执行请发送 /retry <消息ID> --confirm",
+          [
+            `**已跳过** · ${skippedItems.length} 条`,
+            [
+              "| 消息 ID | 原因 | 原文 |",
+              "| --- | --- | --- |",
+              ...skippedItems.slice(-3).map((item) =>
+                `| ${item.messageId} | ${item.errorCode ?? "未知"} | ${truncatePreview(item.text)} |`,
+              ),
+            ].join("\n"),
+            "重新执行：`/retry <消息ID> --confirm`",
+          ].join("\n\n"),
         ];
     const projectCount = Object.keys(config.projects).length;
     const projectName = session
@@ -854,17 +885,22 @@ export class GatewayCommandRouter {
       ? `${instance.mode === "ui" ? "前台" : "后台"} · ${formatWorkerState(instance.state)}`
       : "未运行";
     const uiModeLine = this.uiModeCapability
-      ? [`可见 UI 模式：${await this.formatUiModeCapability()}`]
+      ? [`| 可见 UI 模式 | ${await this.formatUiModeCapability()} |`]
       : [];
     return [
-      `**Hub 状态**：${formatGatewayState(snapshot.gateway?.state)}`,
-      `**当前微信会话**：${sessionTitle}`,
-      ...(projectName ? [`**项目**：${projectName}`] : []),
-      `**Pi**：${workerLabel}`,
-      ...uiModeLine,
-      `**未完成消息**：${pendingQueueCount} 条`,
+      "**Hub 状态**",
+      [
+        "| 项 | 值 |",
+        "| --- | --- |",
+        `| 连接 | ${formatGatewayState(snapshot.gateway?.state)} |`,
+        `| 当前会话 | ${sessionTitle} |`,
+        ...(projectName ? [`| 项目 | ${projectName} |`] : []),
+        `| Pi | ${workerLabel} |`,
+        ...uiModeLine,
+        `| 未完成消息 | ${pendingQueueCount} 条 |`,
+        `| 已登记项目 | ${projectCount} 个 |`,
+      ].join("\n"),
       ...skippedLines,
-      `**已登记项目**：${projectCount} 个`,
     ].join("\n\n");
   }
 

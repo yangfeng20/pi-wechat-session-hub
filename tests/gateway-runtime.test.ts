@@ -560,7 +560,7 @@ test("Gateway runtime 通过 fake iLink 端到端路由并按入站 context 回�
     await repliesSent;
     assert.equal(sentMessages.length, 2);
     assert.equal(sentMessages[0].context_token, "runtime-context-new");
-    assert.match(sentMessages[0].item_list[0].text_item.text, /后台 Pi session 已创建/);
+    assert.match(sentMessages[0].item_list[0].text_item.text, /\*\*已创建会话\*\*/);
     assert.equal(sentMessages[1].context_token, "runtime-context-prompt");
     assert.match(sentMessages[1].item_list[0].text_item.text, /测试回复: 请检查 E2E 路由/);
     assert.ok(sentMessages.every((message) => message.to_user_id === AUTHORIZED_USER_ID));

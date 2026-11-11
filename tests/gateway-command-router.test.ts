@@ -88,7 +88,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     assert.ok(route);
     sessionId = route.sessionId;
     assert.equal(afterNew.sessions[sessionId].state, "pending");
-    assert.match(sentReplies.at(-1)?.text ?? "", /后台 Pi session 已创建/);
+    assert.match(sentReplies.at(-1)?.text ?? "", /\*\*已创建会话\*\* 调查应用错误/);
     assert.equal(sentReplies.at(-1)?.replyContext?.contextToken, "context-token-new");
 
     const promptResult = await router.receive({
@@ -372,7 +372,7 @@ test("微信 /new --mode ui 将显式 UI 模式交给 worker manager", async () 
     });
     assert.equal(result.state, "completed");
     assert.equal(requestedMode, "ui");
-    assert.match(replies.at(-1) ?? "", /可见 UI Pi session 已创建: UI 模式测试/);
+    assert.match(replies.at(-1) ?? "", /\*\*已创建会话\*\* UI 模式测试/);
     assert.equal((await registry.readSnapshot()).routes["wx-user-ui-mode"].sessionId, "ui-mode-session");
   } finally {
     await lease.release();
@@ -423,7 +423,7 @@ test("微信 /status 在 UI 模式不可用时明确标注原因", async () => {
       text: "/status",
     });
     assert.equal(result.state, "completed");
-    assert.match(replies[0], /可见 UI 模式：不可用/);
+    assert.match(replies[0], /\| 可见 UI 模式 \| 不可用/);
     assert.match(replies[0], /wt\.exe/);
   } finally {
     await lease.release();
@@ -623,10 +623,10 @@ test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async 
     });
     assert.equal(status.state, "completed");
     const statusText = replies.at(-1) ?? "";
-    assert.match(statusText, /\*\*Hub 状态\*\*：未启动/);
-    assert.match(statusText, new RegExp(`\\*\\*当前微信会话\\*\\*：#${indexedUnnamedSession.publicIndex} ${firstUserMessage}`));
-    assert.match(statusText, /\*\*Pi\*\*：后台 · 空闲/);
-    assert.match(statusText, /\*\*未完成消息\*\*：0 条/);
+    assert.match(statusText, /\| 连接 \| 未启动 \|/);
+    assert.match(statusText, new RegExp(`\\| 当前会话 \\| #${indexedUnnamedSession.publicIndex} ${firstUserMessage} \\|`));
+    assert.match(statusText, /\| Pi \| 后台 · 空闲 \|/);
+    assert.match(statusText, /\| 未完成消息 \| 0 条 \|/);
     assert.doesNotMatch(statusText, /PID|Gateway:|Worker:|Queue:/);
   } finally {
     await lease.release();
@@ -790,9 +790,8 @@ test("/last 只读展示当前会话最近一轮对话, 不切换 route 也不�
     });
     assert.equal(result.state, "completed");
     const reply = replies.at(-1) ?? "";
-    assert.match(reply, new RegExp(`会话 #${indexed.publicIndex}`));
-    assert.match(reply, /最近一轮对话/);
-    const body = reply.slice(reply.indexOf("最近一轮对话"));
+    assert.match(reply, new RegExp(`\\*\\*会话 #${indexed.publicIndex}\\*\\*`));
+    const body = reply.slice(reply.indexOf("**你**"));
     assert.match(body, /把 tokenizer 里的 execCommand 改成 runCommand/);
     assert.match(body, /已把 3 处调用点改为 runCommand/);
     assert.doesNotMatch(body, /这是更早的提问|这是更早的回复|工具输出不应出现|隐藏推理不应出现/);
@@ -1085,7 +1084,7 @@ test("失败消息被跳过时向微信回提示, 且后续消息照常处理", 
 
     const statusReply = sentReplies.find((reply) => reply.messageId === "wx-status-after-fail");
     assert.ok(statusReply);
-    assert.match(statusReply!.text, /已跳过：1 条/);
+    assert.match(statusReply!.text, /\*\*已跳过\*\* · 1 条/);
     assert.match(statusReply!.text, /wx-broken-1/);
   } finally {
     await lease.release();
