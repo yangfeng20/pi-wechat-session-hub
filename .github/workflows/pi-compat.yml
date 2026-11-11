@@ -27,6 +27,29 @@ jobs:
       - run: npm test
       - run: npm run test:pi-runtime
 
+  daemon-loader:
+    name: Gateway npm bootstrap (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 22.22.3
+          - 26.x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Load daemon shim from a packed node_modules install
+        run: |
+          tarball="$(npm pack --pack-destination "$RUNNER_TEMP" --silent)"
+          mkdir -p node_modules/pi-wechat-session-hub
+          tar -xzf "$RUNNER_TEMP/$tarball" -C node_modules/pi-wechat-session-hub --strip-components=1
+          node node_modules/pi-wechat-session-hub/extensions/daemon-entry.mjs
+
   windows:
     name: Pi ${{ matrix.pi-version }} (windows)
     runs-on: windows-latest

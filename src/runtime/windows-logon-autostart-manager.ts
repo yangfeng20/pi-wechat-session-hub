@@ -218,7 +218,7 @@ async function writeAutostartLauncher(
 
   const encoded = encodeGatewayDaemonLaunchSpec(spec);
   const daemonArgs = [
-    "--experimental-transform-types",
+    ...(spec.daemonEntry.endsWith(".ts") ? ["--experimental-transform-types"] : []),
     spec.daemonEntry,
     "--launch-payload",
     encoded,

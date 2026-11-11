@@ -250,3 +250,35 @@ test("失去 Gateway lease 后拒绝写 registry", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+/**
+ * POSIX sun_path 的字节上限: macOS 为 104, Linux 为 108。
+ * 这里按更严格的 104 断言。
+ */
+const SUN_PATH_LIMIT = 104;
+
+test("控制 endpoint 不超过 POSIX sun_path 上限", { skip: process.platform === "win32" }, () => {
+  // macOS 的 tmpdir() 形如 /var/folders/xx/...（约 48 字节）。若 scope 固定取 24 位,
+  // 拼出的路径会达到 108 字节, listen 直接失败 EINVAL。
+  const endpoint = createGatewayControlEndpoint(join(tmpdir(), "pi-wechat-scope-length-check"));
+  const length = Buffer.byteLength(endpoint, "utf8");
+  assert.ok(length <= SUN_PATH_LIMIT, `endpoint 为 ${length} 字节, 超出 sun_path 上限: ${endpoint}`);
+});
+
+test("长 manager 路径下控制 endpoint 仍不超限", { skip: process.platform === "win32" }, () => {
+  // scope 是 manager 目录的散列, 与路径长度无关; 此处确保目录很长时也不影响 endpoint 长度。
+  const deep = join(tmpdir(), "pi-wechat-scope", ...Array.from({ length: 8 }, (_, i) => `segment-${i}`));
+  const endpoint = createGatewayControlEndpoint(deep);
+  assert.ok(Buffer.byteLength(endpoint, "utf8") <= SUN_PATH_LIMIT, `endpoint 超限: ${endpoint}`);
+});
+
+test("不同 manager 目录映射到不同控制 endpoint", () => {
+  const first = createGatewayControlEndpoint(join(tmpdir(), "pi-wechat-scope-a"));
+  const second = createGatewayControlEndpoint(join(tmpdir(), "pi-wechat-scope-b"));
+  assert.notEqual(first, second);
+});
+
+test("同一 manager 目录的控制 endpoint 保持稳定", () => {
+  const directory = join(tmpdir(), "pi-wechat-scope-stable");
+  assert.equal(createGatewayControlEndpoint(directory), createGatewayControlEndpoint(directory));
+});

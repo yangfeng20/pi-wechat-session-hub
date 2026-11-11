@@ -340,9 +340,27 @@ export function createGatewayControlEndpoint(
   const resolved = resolve(managerDirectory);
   const normalized = platform === "win32" ? resolved.toLowerCase() : resolved;
   const scope = createHash("sha256").update(normalized).digest("hex").slice(0, 24);
-  return platform === "win32"
-    ? `\\\\.\\pipe\\pi-wechat-session-hub-${scope}-control`
-    : join(tmpdir(), `pi-wechat-session-hub-${scope}-control.sock`);
+  if (platform === "win32") {
+    return `\\\\.\\pipe\\pi-wechat-session-hub-${scope}-control`;
+  }
+  // POSIX 的 sun_path 有固定上限（macOS 104 字节、Linux 108 字节）。
+  // macOS 的 tmpdir() 形如 /var/folders/xx/...（约 48 字节），
+  // 叠加 22 字节前缀 + 24 位 scope + 13 字节后缀会达到 108 字节，
+  // 超出上限后 listen 直接失败 EINVAL。
+  // 因此按实际可用字节数收缩 scope，必要时改用更短的 /tmp。
+  const endpointPrefix = "pi-wechat-session-hub-";
+  const endpointSuffix = "-control.sock";
+  const endpointBudget = 100; // 为 104 字节上限预留 4 字节余量
+  const endpointFixed = Buffer.byteLength(endpointPrefix, "utf8")
+    + Buffer.byteLength(endpointSuffix, "utf8") + 1; // +1 为分隔符
+  for (const base of [tmpdir(), "/tmp"]) {
+    const available = endpointBudget - Buffer.byteLength(base, "utf8") - endpointFixed;
+    if (available >= 8) {
+      return join(base, `${endpointPrefix}${scope.slice(0, Math.min(24, available))}${endpointSuffix}`);
+    }
+  }
+  // 两个候选目录都放不下的极端情形：取最短组合，保证不产生超长路径。
+  return join("/tmp", `${endpointPrefix}${scope.slice(0, 8)}${endpointSuffix}`);
 }
 
 /**

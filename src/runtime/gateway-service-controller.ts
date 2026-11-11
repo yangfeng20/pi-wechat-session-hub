@@ -217,7 +217,9 @@ export function decodeGatewayDaemonLaunchSpec(encoded: string): GatewayDaemonLau
 export async function launchDetachedGatewayDaemon(spec: GatewayDaemonLaunchSpec): Promise<void> {
   const encoded = encodeGatewayDaemonLaunchSpec(spec);
   const args = [
-    "--experimental-transform-types",
+    // 当前入口是 daemon-entry.mjs，不需要任何 TypeScript flag。
+    // 仍保留对 .ts 入口的条件分支：测试与自定义入口可能直接 spawn 未编译的 .ts。
+    ...(spec.daemonEntry.endsWith(".ts") ? ["--experimental-transform-types"] : []),
     spec.daemonEntry,
     "--launch-payload",
     encoded,

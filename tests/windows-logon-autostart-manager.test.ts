@@ -47,6 +47,7 @@ test("启用时写入隐藏 launcher 与当前用户 Run 项, 关闭时删除两
     const launcher = await readFile(launcherPath, "utf8");
     assert.match(launcher, /Start-Process -FilePath \$node/);
     assert.match(launcher, /-WindowStyle Hidden/);
+    assert.match(launcher, /--experimental-transform-types/);
     assert.match(launcher, /--launch-payload/);
 
     assert.equal(calls.length, 1);
@@ -63,6 +64,29 @@ test("启用时写入隐藏 launcher 与当前用户 Run 项, 关闭时删除两
     await manager.disable();
     assert.ok(calls.at(-1)?.args.includes("DELETE"));
     await assert.rejects(stat(launcherPath));
+  } finally {
+    await rm(managerDirectory, { recursive: true, force: true });
+  }
+});
+
+test(".mjs daemon shim 的 Windows launcher 不传 Node TS flag", async () => {
+  const managerDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-run-key-mjs-"));
+  const spec = {
+    ...launchSpec,
+    managerDirectory,
+    daemonEntry: "C:\\Program Files\\Pi Hub\\extensions\\daemon-entry.mjs",
+  };
+  const manager = new WindowsLogonAutoStartManager(spec, {
+    platform: "win32",
+    execute: async () => ({ code: 0, stdout: "ok", stderr: "" }),
+  });
+  const launcherPath = join(managerDirectory, "gateway-autostart-launcher.ps1");
+  try {
+    await manager.enable();
+    const launcher = await readFile(launcherPath, "utf8");
+    assert.doesNotMatch(launcher, /--experimental-transform-types/);
+    assert.match(launcher, /daemon-entry\.mjs/);
+    assert.match(launcher, /--launch-payload/);
   } finally {
     await rm(managerDirectory, { recursive: true, force: true });
   }
