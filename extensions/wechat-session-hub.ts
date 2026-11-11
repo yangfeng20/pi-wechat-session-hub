@@ -18,7 +18,7 @@ import { getManagerDataDirectory } from "../src/config/paths.ts";
 import { GatewayControlError } from "../src/gateway/gateway-control-ipc.ts";
 import { probeWindowsTerminalCapability } from "../src/gateway/windows-terminal-launcher.ts";
 import { GatewayServiceController, type GatewayDaemonLaunchSpec, type GatewayServiceStatus } from "../src/runtime/gateway-service-controller.ts";
-import { WindowsLogonTaskManager, WindowsLogonTaskManagerError } from "../src/runtime/windows-logon-task-manager.ts";
+import { WindowsLogonAutoStartManager, WindowsLogonAutoStartError } from "../src/runtime/windows-logon-autostart-manager.ts";
 import { registerUiWorkerBridgeHooks, attachCurrentUiWorkerSession, getCurrentUiWorkerBridgeDiagnostics } from "../src/gateway/ui-worker-extension-bridge.ts";
 import { UiWorkerIpcError } from "../src/gateway/ui-worker-ipc.ts";
 import { IlinkApiError } from "../src/gateway/wechat-ilink/api-client.ts";
@@ -69,12 +69,12 @@ function createGatewayServiceControllerSpec(): GatewayDaemonLaunchSpec {
 }
 
 /**
- * 更新 Windows 登录自动启动任务与用户配置, 失败时尽量回滚外部任务。
+ * 更新 Windows 用户登录自动启动项与 Hub 配置, 失败时尽量回滚外部启动项。
  *
  * @param store Hub 全局配置存储。
  * @param launchSpec 独立 daemon 启动参数。
  * @param enabled 是否在当前 Windows 用户登录后自动连接。
- * @returns 配置和 Task Scheduler 状态一致时正常结束。
+ * @returns 配置和当前用户 Run 项状态一致时正常结束。
  */
 async function updateWindowsLogonAutoStart(
   store: ConfigurationStore,
@@ -82,24 +82,24 @@ async function updateWindowsLogonAutoStart(
   enabled: boolean,
 ): Promise<void> {
   const current = (await store.load()).config.autoStartOnWindowsLogon;
-  const taskManager = new WindowsLogonTaskManager(launchSpec);
+  const autoStartManager = new WindowsLogonAutoStartManager(launchSpec);
   try {
     if (enabled) {
-      await taskManager.enable();
+      await autoStartManager.enable();
     } else {
-      await taskManager.disable();
+      await autoStartManager.disable();
     }
     await store.update((config) => ({ ...config, autoStartOnWindowsLogon: enabled }));
   } catch (error) {
     try {
       if (current) {
-        await taskManager.enable();
+        await autoStartManager.enable();
       } else {
-        await taskManager.disable();
+        await autoStartManager.disable();
       }
     } catch {
-      throw new WindowsLogonTaskManagerError(
-        "自动启动配置更新失败, 且无法恢复之前的 Windows 登录任务状态。",
+      throw new WindowsLogonAutoStartError(
+        "自动启动配置更新失败, 且无法恢复之前的 Windows 登录自动启动项状态。",
       );
     }
     throw error;
@@ -574,7 +574,7 @@ function toUserMessage(error: unknown): string {
     error instanceof ConfigurationValidationError ||
     error instanceof WechatManagerCommandParseError ||
     error instanceof GatewayControlError ||
-    error instanceof WindowsLogonTaskManagerError ||
+    error instanceof WindowsLogonAutoStartError ||
     error instanceof IlinkApiError ||
     error instanceof IlinkCredentialStoreError ||
     error instanceof IlinkQrLoginError ||

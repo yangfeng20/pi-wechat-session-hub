@@ -111,11 +111,11 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 
 ## 7. Windows 用户登录自动启动
 
-配置项 `autoStartOnWindowsLogon` 默认 `false`. `/wx autostart on` 使用 `schtasks.exe` 以 `execFile` argv 创建当前用户 `ONLOGON` 任务, 然后更新配置; 若配置或任务更新失败会尽量回滚. `/wx autostart off` 删除任务并更新配置. 不需要为该登录任务安装系统级 Windows service 或请求管理员权限.
+配置项 `autoStartOnWindowsLogon` 默认 `false`. `/wx autostart on` 在当前用户 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 写入启动项, 指向 manager 私有目录中的隐藏 PowerShell launcher; launcher 再用当前 Pi Node 与固定 daemon 参数启动 Gateway. 该方式不受 `schtasks /TR` 261 字符限制, 且不需要管理员权限. `/wx autostart off` 删除当前用户启动项和 launcher, 然后更新配置; 若配置更新失败会尽量回滚.
 
 任务使用已保存的 `credentials.json` 启动 daemon. QR login 必须先由用户在 TUI 完成. 若凭证失效, daemon 不弹出交互窗口; 用户可从任意 Pi TUI 查看状态并重新授权.
 
-此方案在 Windows 用户登录后启动, 不在 Windows 登录界面前运行. 用户注销/系统关机后, 用户级进程终止, 下次登录时任务重新启动 daemon.
+此方案在 Windows 用户登录后启动, 不在 Windows 登录界面前运行. 用户注销/系统关机后, 用户级进程终止, 下次登录时 Run 启动项重新启动 daemon.
 
 ## 8. 路由、队列与 iLink
 
@@ -145,6 +145,6 @@ npm test
 npm run test:pi-runtime
 ```
 
-测试覆盖: config 默认关闭和非法值拒绝, IPC HMAC、detached daemon ready/failure, Task Scheduler argv 构造, route/session index 迁移, background/UI handoff, saved UI route 不再开 tab, durable queue、fake iLink、typing indicator、凭证 create-only 和 Pi RPC command smoke. `npm test` 不启动真实 Windows Terminal、不访问真实微信或模型.
+测试覆盖: config 默认关闭和非法值拒绝, IPC HMAC、detached daemon ready/failure, Windows 当前用户 Run 自动启动命令与 launcher 生成、route/session index 迁移, background/UI handoff, saved UI route 不再开 tab, durable queue、fake iLink、typing indicator、凭证 create-only 和 Pi RPC command smoke. `npm test` 不启动真实 Windows Terminal、不访问真实微信或模型.
 
-Pi 0.85.1、1.0.0、1.3.0 本轮均通过 typecheck、完整测试和 RPC smoke. 本轮完整单测 80 项, 79 pass、1 项 Windows ACL 条件测试 skip. Windows Task Scheduler 与真实用户 logon、微信 QR 和真实模型仍需在用户设备上验收; 本轮未创建用户计划任务或启动真实微信连接.
+Pi 版本兼容矩阵通过 typecheck、完整测试和 RPC smoke. Windows 当前用户登录启动项、真实微信 QR 和真实模型仍需在用户设备上验收; 自动启动项通过 HKCU Run 写入, 不要求系统级 Windows service 或管理员权限.

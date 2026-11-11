@@ -38,7 +38,7 @@ Pi WeChat Session Hub 是一个 Pi 扩展, 用微信管理本机多个 Pi 会话
 
 | 项 | 要求 | 说明 |
 |---|---|---|
-| 操作系统 | **Windows** | 可见 UI 模式依赖 Windows Terminal 与 Windows 登录计划任务 |
+| 操作系统 | **Windows** | 可见 UI 模式依赖 Windows Terminal; 登录后自动启动使用当前用户 Run 注册表项 |
 | Node.js | `>= 22.19.0` | 与 `package.json` 的 `engines` 一致 |
 | Pi | `>= 0.85.1 < 2.0.0` | CI 矩阵覆盖 `0.85.1` / `1.0.0` / `1.3.0` |
 | Windows Terminal | 建议安装 | 缺少 `wt.exe` 时阻塞可见 UI 操作, 后台模式仍可用 |
@@ -349,7 +349,7 @@ Windows 首次创建空 manager 目录时会关闭继承 ACL, 仅授权当前用
 - route 绑定、会话索引和 worker owner 持久保存; session 恢复前重新验证项目路径是否仍位于 `allowedProjectRoots`.
 - 审计事件不记录消息正文、模型输出或凭证. 队列只在未完成期间保存原消息及 `replyContext`; 完成后压缩移除 payload, 并保留最近 1000 个 messageId 的 SHA-256 摘要用于去重.
 - iLink `sendtyping` 仅提供 best-effort "正在输入"提示. Pi turn settled 后 Hub 发送一条完整最终回复, 不做 token 级微信流式回传.
-- 关闭服务后不会自动登录或生成 QR. 自动启动仅由 `autoStartOnWindowsLogon` 和当前用户登录计划任务控制.
+- 关闭服务后不会自动登录或生成 QR. 自动启动仅由 `autoStartOnWindowsLogon` 和当前用户登录启动项控制.
 - 可见 UI 模式在执行前校验平台和 `wt.exe`, 校验不通过即阻塞, 不产生半启动进程.
 
 ## 常见问题
