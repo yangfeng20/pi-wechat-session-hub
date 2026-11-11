@@ -44,7 +44,7 @@ Pi TUI: /wx start|status|stop|restart|autostart
 - `/wx start` 启动独立 daemon; `/wx status|stop|restart` 控制服务. `/wx stop` 需要 TUI 二次确认.
 - Windows 当前用户登录自动启动配置默认关闭. 用户登录任务尚未在本机实际启用或创建.
 - `/new` 默认创建后台会话; 显式 `/new --mode ui` 会启动可见 Windows Terminal UI. 默认不打开新 tab.
-- `/sessions` 默认列出 Hub 管理的活跃前台/后台会话, 每页 5 条, 每个会话单独展示标题、项目、模式和状态; 当前微信 route 在列表摘要和对应会话项中标记. 标题优先使用会话名; 没有名称时仅读取 Pi `/resume` 同样采用的首条用户文本. 标题最长 32 个 Unicode code point, 超出以 `...` 省略; 暂无用户消息时显示“尚无用户消息”.
+- `/sessions` 默认列出 Hub 管理的活跃前台/后台会话, 一次回复展示全部匹配会话, 每项显示标题、项目、模式和状态; 当前微信 route 在列表摘要和对应会话项中标记. 标题优先使用会话名; 没有名称时仅读取 Pi `/resume` 同样采用的首条用户文本. 标题最长 32 个 Unicode code point, 超出以 `...` 省略; 暂无用户消息时显示“尚无用户消息”.
 - 微信 `/resume <索引|名称>` 将该微信 sender 的 route 切换到目标 session. 空闲会话恢复后附带最多 800 个 Unicode 字符的最近回复预览; 内容过长时提示完整回复仍保留在会话记录中. 本机 TUI `/resume` 会进行 UI/background owner 交接.
 
 ## 最近讨论: 活跃 turn 中切换 route
@@ -87,13 +87,13 @@ Gateway 是常驻 daemon, 已运行进程不会自动加载磁盘上的新代码
 
 ## 近期已完成的相关改动
 
-- `/sessions` 改为每页 5 条的窄屏文本卡片, 每项独立显示索引/标题和项目/模式/状态; 当前 route 显示“当前微信路由”和“【当前】”标记. 标题优先取会话名, 否则读取 Pi `/resume` 使用的首条用户文本; 清理控制字符并在 32 个 Unicode code point 后追加 `...`.
+- `/sessions` 使用 markdown 表格一次列出全部匹配会话, 每项显示索引/标题和模式/状态; 当前 route 显示“当前微信路由”和“（当前）”标记. 标题优先取会话名, 否则读取 Pi `/resume` 使用的首条用户文本; 清理控制字符并在 32 个 Unicode code point 后追加 `...`.
 - 微信 `/help` 按会话、项目、Hub 状态分组并缩短长语法行.
 - 微信 `/status` 使用中文状态摘要, 不暴露 PID 或内部技术字段.
 - 空闲会话 `/resume` 回复最多 800 个 Unicode 字符的最近回复预览, 超长时显示开头并说明完整内容仍在 transcript.
 - `/wx start`、`/wx stop`、`/wx restart` 先显示进度, 完成后再通知最终状态. `/wx stop` 的控制请求等待 runtime 安全收尾; `/wx restart` 通过 operationId 和 lifecycle receipt 等待新 daemon ready, Pi 端用本地文件事件唤醒, 不循环轮询网络.
 - `tests/gateway-service-controller.test.ts` 覆盖异步 lifecycle receipt 和 final status; `tests/wechat-session-hub-command.test.ts` 覆盖 restart 进度与完成通知.
-- `tests/gateway-command-router.test.ts` 增加会话卡片、稳定索引、当前 route 标记、分页、状态摘要、帮助分组和恢复预览截断回归测试.
+- `tests/gateway-command-router.test.ts` 覆盖会话全量列表、稳定索引、当前 route 标记、状态摘要、帮助分组和恢复预览截断回归测试.
 
 **文档不一致提醒:** README 配置说明中仍有旧句子称微信 `/new` 固定创建后台会话; 实现现在支持显式 `--mode ui`. 后续可顺手修正文案.
 
@@ -113,7 +113,7 @@ Pi `0.85.1`、`1.0.0`、`1.3.0` 完整兼容矩阵在较早的实现阶段已跑
 1. 用户希望 `/resume`/`/new` 在旧 turn 未完成时立即切换, 还是继续保持 FIFO 等待.
 2. 当前 Pi TUI session 的实际 cwd 是否已精确登记, `allowedProjectRoots` 是否过宽.
 3. 对未登记 cwd 是否应从静默跳过改为给本机 TUI 明确提示, 同时继续 fail-closed.
-4. 在 `/wx restart` 后实测微信 `/help` 分组、`/status` 中文摘要、`/sessions` 卡片/分页和 `/resume` 长回复预览, 以及 `/new --mode ui` 是否打开可见 tab.
+4. 在 `/wx restart` 后实测微信 `/help` 分组、`/status` 中文摘要、`/sessions` 全量表格和 `/resume` 长回复预览, 以及 `/new --mode ui` 是否打开可见 tab.
 5. 是否需要修 README 中旧 `/new` 描述, 并在合并更多改动后重跑 Pi `1.0.0` / `1.3.0` 矩阵.
 
 ## 常用验证命令
