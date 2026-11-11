@@ -893,12 +893,9 @@ export function registerUiWorkerBridgeHooks(
       }
       bridge = undefined;
     }
+    // launch record 首次注册后会被消费, reload 时仅移除旧 UI 回调并保留进程级 bridge。
     if (event.reason === "reload" && bridge) {
       bridge.setStatusSink(undefined);
-      if (bridgeProcess.piWechatUiWorkerBridge === bridge) {
-        delete bridgeProcess.piWechatUiWorkerBridge;
-      }
-      bridge = undefined;
     }
     statusContext = sessionContext;
     sessionContext.ui.setStatus(statusKey, undefined);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -8,7 +8,7 @@ import test from "node:test";
 import { ConfigurationStore } from "../src/config/store.ts";
 import { GatewayCommandRouter } from "../src/gateway/command-router.ts";
 import { DurableMessageQueue } from "../src/gateway/durable-message-queue.ts";
-import { UiWorkerExtensionBridge } from "../src/gateway/ui-worker-extension-bridge.ts";
+import { registerUiWorkerBridgeHooks, UiWorkerExtensionBridge } from "../src/gateway/ui-worker-extension-bridge.ts";
 import { createStableNamedPipe, readUiWorkerLaunchRecord, UiWorkerIpcServer } from "../src/gateway/ui-worker-ipc.ts";
 import { GatewayLease } from "../src/registry/gateway-lease.ts";
 import { ManagerRegistry } from "../src/registry/manager-registry.ts";
@@ -95,6 +95,171 @@ function createFakeUiWorker(
   } as unknown as ExtensionContext;
   bridge = new UiWorkerExtensionBridge(launch, projectService);
   return { instanceId: launch.instanceId, state, pi, context, bridge };
+}
+
+test("已启动 UI worker 在 /reload 后复用已消费的一次性启动记录", { timeout: 20000 }, async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-ui-reload-"));
+  const agentDirectory = join(temporaryDirectory, "pi-agent");
+  const managerDirectory = join(agentDirectory, "wechat-session-manager");
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "byai");
+  const sessionFile = join(temporaryDirectory, "sessions", "ui-reload-session.jsonl");
+  await mkdir(projectPath, { recursive: true });
+  await mkdir(join(temporaryDirectory, "sessions"), { recursive: true });
+  const configStore = new ConfigurationStore(join(agentDirectory, "wechat-session-manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    projects: {
+      ...config.projects,
+      byai: { displayName: "测试项目", path: projectPath },
+    },
+  }));
+  const projectService = new ProjectService(configStore);
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const endpoint = createStableNamedPipe(managerDirectory);
+  const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
+  const sessionId = randomUUID();
+  const notices: string[] = [];
+  let currentSessionName: string | undefined;
+  let launchIdForTest: string | undefined;
+  let firstHooks: Map<string, (...args: unknown[]) => unknown> | undefined;
+  let reloadHooks: Map<string, (...args: unknown[]) => unknown> | undefined;
+  const previousEnvironment = {
+    directory: process.env.PI_WECHAT_MANAGER_DIR,
+    launchId: process.env.PI_WECHAT_MANAGER_LAUNCH_ID,
+    pipe: process.env.PI_WECHAT_MANAGER_PIPE,
+  };
+  const sessionContext = {
+    mode: "tui",
+    cwd: projectPath,
+    ui: {
+      setStatus: () => undefined,
+      setFooter: () => undefined,
+      notify: (message: string) => notices.push(message),
+    },
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+      getCwd: () => projectPath,
+      getSessionName: () => currentSessionName,
+    },
+    isIdle: () => true,
+    abort: () => undefined,
+    shutdown: () => undefined,
+  } as unknown as ExtensionContext;
+  const createHooks = (): Map<string, (...args: unknown[]) => unknown> => {
+    const hooks = new Map<string, (...args: unknown[]) => unknown>();
+    const api = {
+      on: (event: string, handler: unknown) => {
+        hooks.set(event, handler as (...args: unknown[]) => unknown);
+      },
+      setSessionName: (name: string) => {
+        currentSessionName = name;
+      },
+    } as unknown as ExtensionAPI;
+    registerUiWorkerBridgeHooks(api, projectService, managerDirectory);
+    return hooks;
+  };
+  const uiManager = new UiWorkerManager({
+    managerDirectory,
+    projectService,
+    registry,
+    ipcServer: server,
+    launcher: {
+      launch: async (_directory, _cwd, launchId) => {
+        await writeFile(sessionFile, `${JSON.stringify({ id: sessionId })}\n`, "utf8");
+        process.env.PI_WECHAT_MANAGER_DIR = managerDirectory;
+        process.env.PI_WECHAT_MANAGER_LAUNCH_ID = launchId;
+        process.env.PI_WECHAT_MANAGER_PIPE = endpoint;
+        launchIdForTest = launchId;
+        firstHooks = createHooks();
+        const sessionStart = firstHooks.get("session_start");
+        assert.ok(sessionStart);
+        await sessionStart({ reason: "new" }, sessionContext);
+      },
+    },
+    invocation: { command: process.execPath, args: [process.execPath] },
+    extensionPath: join(process.cwd(), "extensions", "wechat-session-hub.ts"),
+    registrationTimeoutMs: 5000,
+    shutdownTimeoutMs: 5000,
+    platform: "win32",
+    probeCapability: async () => ({ supported: true, executable: "C:/WindowsApps/wt.exe" }),
+  });
+
+  try {
+    await server.listen();
+    const created = await uiManager.startNew("byai", "测试字数");
+    assert.equal(created.name, "测试字数");
+    assert.equal(created.sessionId, sessionId);
+    const createdOwner = Object.values((await registry.readSnapshot()).instances).find((instance) =>
+      instance.sessionId === sessionId,
+    );
+    assert.ok(createdOwner);
+    const createdLaunchId = launchIdForTest;
+    assert.ok(createdLaunchId);
+    await assert.rejects(
+      readFile(join(managerDirectory, "launches", `${createdLaunchId}.json`)),
+      { code: "ENOENT" },
+    );
+    await assert.rejects(
+      readUiWorkerLaunchRecord(managerDirectory, createdLaunchId),
+      { code: "launch_record_invalid" },
+    );
+
+    assert.equal(process.env.PI_WECHAT_MANAGER_DIR, managerDirectory);
+    assert.equal(process.env.PI_WECHAT_MANAGER_LAUNCH_ID, createdLaunchId);
+    assert.equal(process.env.PI_WECHAT_MANAGER_PIPE, endpoint);
+
+    const initialShutdown = firstHooks?.get("session_shutdown");
+    assert.ok(initialShutdown);
+    await initialShutdown({ reason: "reload" }, sessionContext);
+
+    const reconnected = new Promise<string>((resolveReconnected) => {
+      server.once(
+        "worker_registered",
+        (connection: { registration: { instanceId: string } }) => resolveReconnected(connection.registration.instanceId),
+      );
+    });
+    reloadHooks = createHooks();
+    const reloadStart = reloadHooks.get("session_start");
+    assert.ok(reloadStart);
+    await reloadStart({ reason: "reload" }, sessionContext);
+
+    assert.equal(
+      notices.some((notice) => notice.includes("无法安全读取 UI worker launch record")),
+      false,
+      `reload 不应再次读取已经消费的一次性 launch record; notices: ${notices.join(" | ")}`,
+    );
+    await reconnected.then((instanceId) => assert.equal(instanceId, createdOwner.instanceId));
+  } finally {
+    const shutdown = firstHooks?.get("session_shutdown");
+    if (shutdown) {
+      await Promise.resolve(shutdown({ reason: "quit" }, sessionContext)).catch(() => undefined);
+    }
+    await uiManager.detachGateway().catch(() => undefined);
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+    restoreEnvironment("PI_WECHAT_MANAGER_DIR", previousEnvironment.directory);
+    restoreEnvironment("PI_WECHAT_MANAGER_LAUNCH_ID", previousEnvironment.launchId);
+    restoreEnvironment("PI_WECHAT_MANAGER_PIPE", previousEnvironment.pipe);
+  }
+});
+
+/**
+ * 恢复单个 manager 环境变量的原值。
+ *
+ * @param key 环境变量名。
+ * @param value 测试前的环境变量值。
+ * @returns 环境变量恢复后正常结束。
+ */
+function restoreEnvironment(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
 }
 
 test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单 writer", { timeout: 20000 }, async () => {
