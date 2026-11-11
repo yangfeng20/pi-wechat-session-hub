@@ -70,13 +70,13 @@ Pi 会从 npm 或 git 拉取包并自动安装依赖, 扩展注册到用户级�
 pi install npm:pi-wechat-session-hub
 
 # 固定版本, 避免升级带来的行为差异
-pi install npm:pi-wechat-session-hub@0.1.0
+pi install npm:pi-wechat-session-hub@0.1.2
 
 # 从 GitHub 安装, 跟随默认分支, 适合追最新提交
 pi install git:github.com/yangfeng20/pi-wechat-session-hub
 
 # 固定到 tag 或 commit
-pi install git:github.com/yangfeng20/pi-wechat-session-hub@v0.1.0
+pi install git:github.com/yangfeng20/pi-wechat-session-hub@v0.1.2
 ```
 
 安装后:
