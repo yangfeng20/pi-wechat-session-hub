@@ -141,8 +141,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
       text: "/sessions --project demo --state all",
     });
     assert.equal(sessionList.state, "completed");
-    assert.match(sentReplies.at(-1)?.text ?? "", /#1 调查应用错误/);
-    assert.match(sentReplies.at(-1)?.text ?? "", /后台/);
+    assert.match(sentReplies.at(-1)?.text ?? "", /\| #1 \| 调查应用错误（当前） \| 后台 \| 活跃 \|/);
 
     const help = await router.receive({
       messageId: "wx-help-1",
@@ -154,7 +153,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     assert.match(helpText, /会话命令/);
     assert.match(helpText, /项目命令/);
     assert.match(helpText, /Hub 状态/);
-    assert.match(helpText, /\/sessions \[筛选条件\]/);
+    assert.match(helpText, /\/sessions \[--project <别名>\]/);
 
     const transcriptSession = (await registry.readSnapshot()).sessions[sessionId!];
     await appendFile(transcriptSession.sessionFile, `${[
@@ -594,13 +593,19 @@ test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async 
     });
     assert.equal(result.state, "completed");
     const reply = replies.at(-1) ?? "";
-    assert.match(reply, /会话列表 · 第 1\/2 页 · 共 6 个/);
-    assert.match(reply, new RegExp(`【当前】#${indexedUnnamedSession.publicIndex} ${firstUserMessage}`));
-    assert.match(reply, /项目：测试项目 · 后台 · 活跃/);
+    assert.match(reply, /\*\*会话列表\*\* · 第 1\/2 页 · 共 6 个/);
+    // 微信 markdown 渲染支持表格 (2026-11-11 实测), 手机端无需横向滚动。
+    assert.match(reply, /\| 索引 \| 标题 \| 模式 \| 状态 \|/);
+    assert.match(reply, /\| --- \| --- \| --- \| --- \|/);
+    assert.match(
+      reply,
+      new RegExp(`\\| #${indexedUnnamedSession.publicIndex} \\| ${firstUserMessage}（当前） \\| 后台 \\| 活跃 \\|`),
+    );
+    // 项目名不逐行重复, 改为汇总在表格下方。
+    assert.match(reply, /项目：测试项目/);
     assert.ok(reply.includes(`${Array.from(longTitle).slice(0, 29).join("")}...`));
-    assert.doesNotMatch(reply, /\|/);
-    assert.match(reply, /切换会话：\/resume <索引或名称>/);
-    assert.match(reply, /下一页：\/sessions --state all --page 2/);
+    assert.match(reply, /切换会话：`\/resume <索引或名称>`/);
+    assert.match(reply, /下一页：`\/sessions --state all --page 2`/);
 
     const secondPage = await router.receive({
       messageId: "wx-sessions-title-page-2",
@@ -608,8 +613,8 @@ test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async 
       text: "/sessions --state all --page 2",
     });
     assert.equal(secondPage.state, "completed");
-    assert.match(replies.at(-1) ?? "", /会话列表 · 第 2\/2 页 · 共 6 个/);
-    assert.match(replies.at(-1) ?? "", /上一页：\/sessions --state all --page 1/);
+    assert.match(replies.at(-1) ?? "", /\*\*会话列表\*\* · 第 2\/2 页 · 共 6 个/);
+    assert.match(replies.at(-1) ?? "", /上一页：`\/sessions --state all --page 1`/);
 
     const status = await router.receive({
       messageId: "wx-sessions-title-status",
@@ -618,10 +623,10 @@ test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async 
     });
     assert.equal(status.state, "completed");
     const statusText = replies.at(-1) ?? "";
-    assert.match(statusText, /Hub 状态：未启动/);
-    assert.match(statusText, new RegExp(`当前微信会话：#${indexedUnnamedSession.publicIndex} ${firstUserMessage}`));
-    assert.match(statusText, /Pi：后台 · 空闲/);
-    assert.match(statusText, /未完成消息：0 条/);
+    assert.match(statusText, /\*\*Hub 状态\*\*：未启动/);
+    assert.match(statusText, new RegExp(`\\*\\*当前微信会话\\*\\*：#${indexedUnnamedSession.publicIndex} ${firstUserMessage}`));
+    assert.match(statusText, /\*\*Pi\*\*：后台 · 空闲/);
+    assert.match(statusText, /\*\*未完成消息\*\*：0 条/);
     assert.doesNotMatch(statusText, /PID|Gateway:|Worker:|Queue:/);
   } finally {
     await lease.release();
@@ -1201,6 +1206,83 @@ test("任何回复都必须压到单条 iLink 消息的安全长度内, 不触�
       );
     }
     assert.match(replies.at(-1) ?? "", /已截断/, "超长回复应明确提示已截断");
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("/sessions 输出使用 markdown 块级结构, 避免单换行被渲染器吞掉", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-md-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-md-route" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "演示项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  for (let index = 0; index < 3; index += 1) {
+    await registry.upsertSession({
+      sessionId: `md-session-${index}`,
+      sessionFile: join(temporaryDirectory, `md-session-${index}.jsonl`),
+      cwd: projectPath,
+      projectAlias: "demo",
+      name: `会话标题 ${index + 1}`,
+      mode: "background",
+      state: "saved",
+      lastActivityAt: new Date(Date.now() - index * 1000).toISOString(),
+    });
+  }
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: { prompt: async () => "不应被调用" } as unknown as GatewayWorkerService,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    await router.receive({
+      messageId: "wx-md-sessions",
+      senderId: "wx-md-route",
+      text: "/sessions --state all",
+    });
+    const reply = replies.at(-1) ?? "";
+
+    // 微信按 markdown 渲染, 表格行是块级元素, 每个会话独占一行。
+    // 同时不能用普通列表项: 单换行会被渲染器当作空格合并。
+    const dataRows = reply
+      .split("\n")
+      .filter((line) => line.startsWith("| #"));
+    assert.equal(dataRows.length, 3, "每个会话应各自成为一行表格数据");
+    for (const line of dataRows) {
+      assert.match(line, /^\| #\d+ \| .+ \| (前台|后台) \| (活跃|等待首条记录|已保存) \|$/);
+    }
+    assert.match(reply, /\| 索引 \| 标题 \| 模式 \| 状态 \|/, "表头应固定为四列");
+    assert.match(reply, /\| --- \| --- \| --- \| --- \|/, "表格需要分隔行");
+
+    await router.receive({
+      messageId: "wx-md-help",
+      senderId: "wx-md-route",
+      text: "/help",
+    });
+    const help = replies.at(-1) ?? "";
+    assert.match(help, /\*\*微信命令帮助\*\*/, "帮助标题应使用加粗");
+    const helpItems = help.split("\n").filter((line) => line.startsWith("- "));
+    assert.ok(helpItems.length >= 5, "帮助内容应以列表项组织");
   } finally {
     await lease.release();
     await rm(temporaryDirectory, { recursive: true, force: true });

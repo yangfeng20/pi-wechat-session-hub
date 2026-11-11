@@ -587,29 +587,45 @@ export class GatewayCommandRouter {
     const currentRouteLabel = currentRouteSession
       ? `当前微信路由：#${currentRouteSession.publicIndex ?? "?"}`
       : undefined;
-    const cards = displaySessions.map(({ session, title }) => {
-      const projectName = Object.hasOwn(config.projects, session.projectAlias)
-        ? config.projects[session.projectAlias].displayName
-        : session.projectAlias;
+    const rows = displaySessions.map(({ session, title }) => {
       const status = activeSessionIds.has(session.sessionId)
         ? session.state === "pending" ? "等待首条记录" : "活跃"
         : session.state === "pending" ? "等待首条记录" : "已保存";
       const mode = activeSessionIds.has(session.sessionId) && session.mode === "ui" ? "前台" : "后台";
-      const currentMark = currentRouteSessionId === session.sessionId ? "【当前】" : "";
-      return `${currentMark}#${session.publicIndex ?? "?"} ${title}\n项目：${projectName} · ${mode} · ${status}`;
+      const index = `#${session.publicIndex ?? "?"}`;
+      const markedTitle = currentRouteSessionId === session.sessionId
+        ? `${title}（当前）`
+        : title;
+      return `| ${index} | ${markedTitle} | ${mode} | ${status} |`;
     });
+    // 项目名逐行重复会显著撑宽表格, 改为按项目分组在表格下方一次性说明。
+    const projectSummary = [...new Set(displaySessions.map(({ session }) =>
+      Object.hasOwn(config.projects, session.projectAlias)
+        ? config.projects[session.projectAlias].displayName
+        : session.projectAlias,
+    ))];
     const pageHint = pageCount > 1
       ? page < pageCount
-        ? `下一页：${buildSessionsPageCommand(page + 1, projectAlias, state)}`
-        : `上一页：${buildSessionsPageCommand(page - 1, projectAlias, state)}`
+        ? `下一页：\`${buildSessionsPageCommand(page + 1, projectAlias, state)}\``
+        : `上一页：\`${buildSessionsPageCommand(page - 1, projectAlias, state)}\``
       : undefined;
-    return [
-      `会话列表 · 第 ${page}/${pageCount} 页 · 共 ${sessions.length} 个`,
+    // 微信 markdown 渲染支持表格, 且手机端无需横向滚动 (2026-11-11 实测)。
+    // 列表项与表格行都是块级元素, 不受“单换行被吞”影响, 因此不用空行分隔。
+    const intro = [
+      `**会话列表** · 第 ${page}/${pageCount} 页 · 共 ${sessions.length} 个`,
       ...(currentRouteLabel ? [currentRouteLabel] : []),
-      ...cards,
-      "切换会话：/resume <索引或名称>",
+    ].join("\n\n");
+    const table = [
+      "| 索引 | 标题 | 模式 | 状态 |",
+      "| --- | --- | --- | --- |",
+      ...rows,
+    ].join("\n");
+    const outro = [
+      ...(projectSummary.length > 0 ? [`项目：${projectSummary.join("、")}`] : []),
+      `切换会话：\`/resume <索引或名称>\``,
       ...(pageHint ? [pageHint] : []),
     ].join("\n\n");
+    return [intro, table, outro].join("\n\n");
   }
 
   /**
@@ -841,15 +857,15 @@ export class GatewayCommandRouter {
       ? [`可见 UI 模式：${await this.formatUiModeCapability()}`]
       : [];
     return [
-      `Hub 状态：${formatGatewayState(snapshot.gateway?.state)}`,
-      `当前微信会话：${sessionTitle}`,
-      ...(projectName ? [`项目：${projectName}`] : []),
-      `Pi：${workerLabel}`,
+      `**Hub 状态**：${formatGatewayState(snapshot.gateway?.state)}`,
+      `**当前微信会话**：${sessionTitle}`,
+      ...(projectName ? [`**项目**：${projectName}`] : []),
+      `**Pi**：${workerLabel}`,
       ...uiModeLine,
-      `未完成消息：${pendingQueueCount} 条`,
+      `**未完成消息**：${pendingQueueCount} 条`,
       ...skippedLines,
-      `已登记项目：${projectCount} 个`,
-    ].join("\n");
+      `**已登记项目**：${projectCount} 个`,
+    ].join("\n\n");
   }
 
   /**
@@ -1550,32 +1566,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const GATEWAY_HELP_TEXT = [
-  "微信命令帮助",
+  "**微信命令帮助**",
   "",
-  "会话命令",
-  "/new [--mode background|ui]",
-  "  [--project <别名>] [--name <名称>]",
-  "/sessions [筛选条件]",
-  "  --project <别名> --state <状态> --page <页码>",
-  "  状态：default / active / saved / pending / all",
-  "/resume <索引或名称>",
-  "/last [索引或名称]",
-  "  只读查看最近一轮对话",
-  "/stop [索引或名称]",
+  "**会话命令**",
+  "- `/new [--mode background|ui] [--project <别名>] [--name <名称>]`",
+  "- `/sessions [--project <别名>] [--state active|saved|pending|all] [--page <页码>]`",
+  "- `/resume <索引或名称>` 切换会话",
+  "- `/last [索引或名称]` 只读查看最近一轮对话",
+  "- `/stop [索引或名称]` 停止会话",
   "",
-  "项目命令",
-  "/projects",
-  "/projects add <别名>",
-  "  --name <名称> --path <绝对路径>",
-  "/projects remove <别名>",
-  "/projects default <别名>",
+  "**项目命令**",
+  "- `/projects` 列出已登记项目",
+  "- `/projects add <别名> --name <名称> --path <绝对路径>`",
+  "- `/projects remove <别名>`",
+  "- `/projects default <别名>`",
   "",
-  "Hub 状态与队列",
-  "/status",
-  "/retry <message-id> --confirm",
-  "  会重新执行原消息, 可能产生副作用。",
+  "**Hub 状态与队列**",
+  "- `/status` 查看连接与会话状态",
+  "- `/retry <message-id> --confirm` 重新执行失败消息 (可能产生副作用)",
   "",
-  "发送 /help 查看此帮助。",
+  "发送 `/help` 查看此帮助。",
 ].join("\n");
 
 /**
