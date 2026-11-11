@@ -607,7 +607,8 @@ export class GatewayCommandRouter {
         ? session.state === "pending" ? "等待首条记录" : "活跃"
         : session.state === "pending" ? "等待首条记录" : "已保存";
       const mode = activeSessionIds.has(session.sessionId) && session.mode === "ui" ? "前台" : "后台";
-      const index = `#${session.publicIndex ?? "?"}`;
+      // 表头已明确写有“索引”, 单元格内不必再加 # 前缀; 该值可直接用于 /resume。
+      const index = String(session.publicIndex ?? "?");
       const markedTitle = currentRouteSessionId === session.sessionId
         ? `${title}（当前）`
         : title;

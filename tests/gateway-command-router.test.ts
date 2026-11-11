@@ -141,7 +141,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
       text: "/sessions --project demo --state all",
     });
     assert.equal(sessionList.state, "completed");
-    assert.match(sentReplies.at(-1)?.text ?? "", /\| #1 \| 调查应用错误（当前） \| 后台 \| 活跃 \|/);
+    assert.match(sentReplies.at(-1)?.text ?? "", /\| 1 \| 调查应用错误（当前） \| 后台 \| 活跃 \|/);
 
     const help = await router.receive({
       messageId: "wx-help-1",
@@ -599,7 +599,7 @@ test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async 
     assert.match(reply, /\| --- \| --- \| --- \| --- \|/);
     assert.match(
       reply,
-      new RegExp(`\\| #${indexedUnnamedSession.publicIndex} \\| ${firstUserMessage}（当前） \\| 后台 \\| 活跃 \\|`),
+      new RegExp(`\\| ${indexedUnnamedSession.publicIndex} \\| ${firstUserMessage}（当前） \\| 后台 \\| 活跃 \\|`),
     );
     // 项目名不逐行重复, 改为汇总在表格下方。
     assert.match(reply, /项目：测试项目/);
@@ -1265,10 +1265,10 @@ test("/sessions 输出使用 markdown 块级结构, 避免单换行被渲染器�
     // 同时不能用普通列表项: 单换行会被渲染器当作空格合并。
     const dataRows = reply
       .split("\n")
-      .filter((line) => line.startsWith("| #"));
+      .filter((line) => /^\| \d+ \|/.test(line));
     assert.equal(dataRows.length, 3, "每个会话应各自成为一行表格数据");
     for (const line of dataRows) {
-      assert.match(line, /^\| #\d+ \| .+ \| (前台|后台) \| (活跃|等待首条记录|已保存) \|$/);
+      assert.match(line, /^\| \d+ \| .+ \| (前台|后台) \| (活跃|等待首条记录|已保存) \|$/);
     }
     assert.match(reply, /\| 索引 \| 标题 \| 模式 \| 状态 \|/, "表头应固定为四列");
     assert.match(reply, /\| --- \| --- \| --- \| --- \|/, "表格需要分隔行");
