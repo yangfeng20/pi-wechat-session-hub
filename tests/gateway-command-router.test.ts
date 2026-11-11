@@ -154,6 +154,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     assert.match(helpText, /项目命令/);
     assert.match(helpText, /Hub 状态/);
     assert.match(helpText, /\/sessions \[--project <别名>\]/);
+    assert.doesNotMatch(helpText, /--page/);
 
     const transcriptSession = (await registry.readSnapshot()).sessions[sessionId!];
     await appendFile(transcriptSession.sessionFile, `${[
@@ -477,7 +478,7 @@ test("微信 /new 的项目 alias 错误会回复微信并把 queue 标记 compl
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
-test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async () => {
+test("/sessions 一页展示全部匹配会话并标记当前 route", async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-sessions-title-"));
   const projectRoot = join(temporaryDirectory, "projects");
   const projectPath = join(projectRoot, "demo");
@@ -593,10 +594,11 @@ test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async 
     });
     assert.equal(result.state, "completed");
     const reply = replies.at(-1) ?? "";
-    assert.match(reply, /\*\*会话列表\*\* · 第 1\/2 页 · 共 6 个/);
+    assert.match(reply, /\*\*会话列表\*\* · 共 6 个/);
     // 微信 markdown 渲染支持表格 (2026-11-11 实测), 手机端无需横向滚动。
     assert.match(reply, /\| 索引 \| 标题 \| 模式 \| 状态 \|/);
     assert.match(reply, /\| --- \| --- \| --- \| --- \|/);
+    assert.equal(reply.split("\n").filter((line) => /^\| \d+ \|/.test(line)).length, 6);
     assert.match(
       reply,
       new RegExp(`\\| ${indexedUnnamedSession.publicIndex} \\| ${firstUserMessage}（当前） \\| 后台 \\| 活跃 \\|`),
@@ -605,16 +607,7 @@ test("/sessions 使用窄屏会话卡片、分页和当前 route 标记", async 
     assert.match(reply, /项目：测试项目/);
     assert.ok(reply.includes(`${Array.from(longTitle).slice(0, 29).join("")}...`));
     assert.match(reply, /切换会话：`\/resume <索引或名称>`/);
-    assert.match(reply, /下一页：`\/sessions --state all --page 2`/);
-
-    const secondPage = await router.receive({
-      messageId: "wx-sessions-title-page-2",
-      senderId: "wx-sessions-title",
-      text: "/sessions --state all --page 2",
-    });
-    assert.equal(secondPage.state, "completed");
-    assert.match(replies.at(-1) ?? "", /\*\*会话列表\*\* · 第 2\/2 页 · 共 6 个/);
-    assert.match(replies.at(-1) ?? "", /上一页：`\/sessions --state all --page 1`/);
+    assert.doesNotMatch(reply, /第 \d+\/\d+ 页|下一页|上一页|--page/);
 
     const status = await router.receive({
       messageId: "wx-sessions-title-status",
@@ -1282,6 +1275,163 @@ test("/sessions 输出使用 markdown 块级结构, 避免单换行被渲染器�
     assert.match(help, /\*\*微信命令帮助\*\*/, "帮助标题应使用加粗");
     const helpItems = help.split("\n").filter((line) => line.startsWith("- "));
     assert.ok(helpItems.length >= 5, "帮助内容应以列表项组织");
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("/watch 总览运行、错误与空闲会话, /last 显示真实 429 错误", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-watch-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-watch-route" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "演示项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const runningFile = join(temporaryDirectory, "running.jsonl");
+  const errorFile = join(temporaryDirectory, "quota-error.jsonl");
+  const idleFile = join(temporaryDirectory, "idle.jsonl");
+  const errorMessage = '429: {"message":"You have exceeded the weekly usage quota. It will reset at 2026-11-16 00:00:00 +0800 CST.","type":"TooManyRequests","code":"AccountQuotaExceeded"}';
+  await writeFile(runningFile, `${JSON.stringify({
+    type: "message",
+    id: "running-assistant",
+    parentId: "running-user",
+    timestamp: new Date().toISOString(),
+    message: { role: "assistant", content: [{ type: "text", text: "还在运行" }], stopReason: "stop" },
+  })}\n`, "utf8");
+  await writeFile(errorFile, [
+    JSON.stringify({
+      type: "message",
+      id: "quota-user",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: { role: "user", content: [{ type: "text", text: "检查额度" }] },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "quota-assistant",
+      parentId: "quota-user",
+      timestamp: new Date().toISOString(),
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage },
+    }),
+  ].join("\n") + "\n", "utf8");
+  await writeFile(idleFile, `${JSON.stringify({ type: "session", version: 3, id: "idle-session", cwd: projectPath })}\n`, "utf8");
+
+  const runningSession = await registry.upsertSession({
+    sessionId: "running-session",
+    sessionFile: runningFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: "运行会话",
+    mode: "background",
+    state: "active",
+    lastActivityAt: new Date().toISOString(),
+  });
+  const errorSession = await registry.upsertSession({
+    sessionId: "quota-session",
+    sessionFile: errorFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: "额度错误会话",
+    mode: "background",
+    state: "active",
+    lastActivityAt: new Date().toISOString(),
+  });
+  const idleSession = await registry.upsertSession({
+    sessionId: "idle-session",
+    sessionFile: idleFile,
+    cwd: projectPath,
+    projectAlias: "demo",
+    name: "空闲会话",
+    mode: "background",
+    state: "saved",
+    lastActivityAt: new Date(Date.now() - 3600000).toISOString(),
+  });
+  const birth = `${process.pid}:watch-test`;
+  for (const [instanceId, session, state, suffix] of [
+    ["watch-running", runningSession, "running", "running"],
+    ["watch-error", errorSession, "idle", "error"],
+  ] as const) {
+    await registry.upsertInstance({
+      instanceId,
+      pid: process.pid,
+      processBirthId: `${birth}:${suffix}`,
+      sessionId: session.sessionId,
+      sessionFile: session.sessionFile,
+      cwd: projectPath,
+      projectAlias: "demo",
+      mode: "background",
+      state,
+      heartbeatAt: "2020-01-01T00:00:00.000Z",
+    });
+  }
+  await registry.setRoute("wx-watch-route", {
+    sessionId: errorSession.sessionId,
+    workerInstanceId: "watch-error",
+    generation: 1,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: { prompt: async () => "不应调用模型" } as unknown as GatewayWorkerService,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const watchResult = await router.receive({
+      messageId: "watch-default",
+      senderId: "wx-watch-route",
+      text: "/watch",
+    });
+    assert.equal(watchResult.state, "completed");
+    const watchText = replies.at(-1) ?? "";
+    assert.match(watchText, /总览/);
+    assert.match(watchText, /运行会话/);
+    assert.match(watchText, /🟢 运行中/);
+    assert.match(watchText, /额度错误会话/);
+    assert.match(watchText, /🔴 错误/);
+    assert.match(watchText, /周额度已耗尽/);
+    assert.match(watchText, /2026-11-16 00:00:00 \+0800 CST/);
+    assert.doesNotMatch(watchText, /空闲会话/);
+
+    const allResult = await router.receive({
+      messageId: "watch-all",
+      senderId: "wx-watch-route",
+      text: "/watch --all",
+    });
+    assert.equal(allResult.state, "completed");
+    assert.match(replies.at(-1) ?? "", /空闲会话/);
+
+    const lastResult = await router.receive({
+      messageId: "last-error",
+      senderId: "wx-watch-route",
+      text: "/last",
+    });
+    assert.equal(lastResult.state, "completed");
+    const lastText = replies.at(-1) ?? "";
+    assert.match(lastText, /\*\*AI（错误）\*\*/);
+    assert.match(lastText, /周额度已耗尽/);
+    assert.match(lastText, /2026-11-16 00:00:00 \+0800 CST/);
+    assert.doesNotMatch(lastText, /尚未产生回复/);
+    assert.ok(idleSession.publicIndex);
   } finally {
     await lease.release();
     await rm(temporaryDirectory, { recursive: true, force: true });

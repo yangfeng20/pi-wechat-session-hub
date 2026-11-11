@@ -24,24 +24,23 @@ test("解析新建后台 session, 支持带空格的 session name", () => {
   });
 });
 
-test("解析 session 分页、恢复和显式重试确认", () => {
+test("解析会话列表筛选、恢复和显式重试确认", () => {
   assert.deepEqual(
     parseGatewayCommand("/sessions"),
     {
       kind: "sessions",
       state: "active",
-      page: 1,
     },
   );
   assert.deepEqual(
-    parseGatewayCommand("/sessions --project demo --state saved --page 2"),
+    parseGatewayCommand("/sessions --project demo --state saved"),
     {
       kind: "sessions",
       projectAlias: "demo",
       state: "saved",
-      page: 2,
     },
   );
+  assert.throws(() => parseGatewayCommand("/sessions --page 2"), GatewayCommandParseError);
   assert.deepEqual(
     parseGatewayCommand('/resume "调查应用错误"'),
     {
@@ -57,6 +56,18 @@ test("解析 session 分页、恢复和显式重试确认", () => {
       confirmed: true,
     },
   );
+});
+
+test("解析 /watch 总览参数", () => {
+  assert.deepEqual(parseGatewayCommand("/watch"), { kind: "watch", all: false });
+  assert.deepEqual(parseGatewayCommand("/watch --all"), { kind: "watch", all: true });
+  assert.throws(() => parseGatewayCommand("/watch --project demo"), GatewayCommandParseError);
+});
+
+test("解析 /watch 总览参数", () => {
+  assert.deepEqual(parseGatewayCommand("/watch"), { kind: "watch", all: false });
+  assert.deepEqual(parseGatewayCommand("/watch --all"), { kind: "watch", all: true });
+  assert.throws(() => parseGatewayCommand("/watch --project demo"), GatewayCommandParseError);
 });
 
 test("解析 /last 只读查询参数", () => {

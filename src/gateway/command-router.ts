@@ -16,10 +16,18 @@ import {
 } from "./durable-message-queue.ts";
 import { ManagerRegistry } from "../registry/manager-registry.ts";
 import { GatewayLease } from "../registry/gateway-lease.ts";
-import type { SessionIndexRecord } from "../registry/types.ts";
+import type { SessionIndexRecord, WorkerInstanceRecord } from "../registry/types.ts";
 import { BackgroundWorkerManagerError } from "../runtime/background-worker-manager.ts";
 import type { GatewayWorkerService } from "../runtime/gateway-worker-manager.ts";
 import { UiWorkerManagerError } from "../runtime/ui-worker-manager.ts";
+import {
+  evaluateHealth,
+  formatHealthState,
+  readLatestFailure,
+  classifyFailure,
+  type SessionHealth,
+  type TurnFailure,
+} from "./turn-health.ts";
 
 export type InboundGatewayMessage = GatewayInboundMessage;
 
@@ -545,20 +553,18 @@ export class GatewayCommandRouter {
   }
 
   /**
-   * 列出 sessions, 不更改当前 route。
+   * 一页列出符合筛选条件的所有 sessions, 不更改当前 route。
    *
    * @param routeId 当前微信 route ID。
    * @param projectAlias 可选项目筛选。
    * @param state 状态筛选。
-   * @param page 页码。
    * @param config 当前配置快照。
-   * @returns 分页清单文本。
+   * @returns 完整会话清单文本。
    */
   private async formatSessions(
     routeId: string,
     projectAlias: string | undefined,
     state: "default" | "active" | "saved" | "pending" | "all",
-    page: number,
     config: ManagerConfiguration,
   ): Promise<string> {
     const snapshot = await this.registry.readSnapshot();
@@ -583,16 +589,10 @@ export class GatewayCommandRouter {
         return session.state === state;
       })
       .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
-    const pageSize = 5;
-    const pageCount = Math.max(1, Math.ceil(sessions.length / pageSize));
-    if (page > pageCount) {
-      return `没有第 ${page} 页; 共 ${pageCount} 页。`;
-    }
-    const pageSessions = sessions.slice((page - 1) * pageSize, page * pageSize);
-    if (pageSessions.length === 0) {
+    if (sessions.length === 0) {
       return "没有匹配的会话。";
     }
-    const displaySessions = await Promise.all(pageSessions.map(async (session) => ({
+    const displaySessions = await Promise.all(sessions.map(async (session) => ({
       session,
       title: await resolveSessionTitle(session),
     })));
@@ -620,15 +620,10 @@ export class GatewayCommandRouter {
         ? config.projects[session.projectAlias].displayName
         : session.projectAlias,
     ))];
-    const pageHint = pageCount > 1
-      ? page < pageCount
-        ? `下一页：\`${buildSessionsPageCommand(page + 1, projectAlias, state)}\``
-        : `上一页：\`${buildSessionsPageCommand(page - 1, projectAlias, state)}\``
-      : undefined;
     // 微信 markdown 渲染支持表格, 且手机端无需横向滚动 (2026-11-11 实测)。
     // 列表项与表格行都是块级元素, 不受“单换行被吞”影响, 因此不用空行分隔。
     const intro = [
-      `**会话列表** · 第 ${page}/${pageCount} 页 · 共 ${sessions.length} 个`,
+      `**会话列表** · 共 ${sessions.length} 个`,
       ...(currentRouteLabel ? [currentRouteLabel] : []),
     ].join("\n\n");
     const table = [
@@ -639,9 +634,120 @@ export class GatewayCommandRouter {
     const outro = [
       ...(projectSummary.length > 0 ? [`项目：${projectSummary.join("、")}`] : []),
       `切换会话：\`/resume <索引或名称>\``,
-      ...(pageHint ? [pageHint] : []),
     ].join("\n\n");
     return [intro, table, outro].join("\n\n");
+  }
+
+  /**
+   * 展示所有受管会话的运行与错误总览。
+   *
+   * 默认只展示运行中、启动中、异常或断连的会话; `--all` 会包含空闲会话。
+   * 失败原因直接从 Pi transcript 最后一条 assistant 记录读取, 不触发模型请求。
+   *
+   * @param all 是否包含空闲会话。
+   * @param config 当前配置快照。
+   * @returns markdown 总览表格。
+   */
+  private async formatWatch(all: boolean, config: ManagerConfiguration): Promise<string> {
+    const snapshot = await this.registry.readSnapshot();
+    const workersBySession = new Map<string, WorkerInstanceRecord>();
+    for (const worker of Object.values(snapshot.instances)) {
+      const previous = workersBySession.get(worker.sessionId);
+      if (!previous || (previous.state === "stale" && worker.state !== "stale")) {
+        workersBySession.set(worker.sessionId, worker);
+      }
+    }
+
+    const sessions = Object.values(snapshot.sessions)
+      .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
+    if (sessions.length === 0) {
+      return "尚无已登记会话。";
+    }
+
+    const healthRows: Array<SessionHealth & { title: string; projectName: string }> = await Promise.all(
+      sessions.map(async (session) => {
+        const worker = workersBySession.get(session.sessionId);
+        const failure = await readLatestFailure(session.sessionFile);
+        const { state } = evaluateHealth(session, worker, failure);
+        const title = await resolveSessionTitle(session);
+        const projectName = Object.hasOwn(config.projects, session.projectAlias)
+          ? config.projects[session.projectAlias].displayName
+          : session.projectAlias;
+        return {
+          session,
+          ...(worker ? { worker } : {}),
+          state,
+          ...(failure ? { failure } : {}),
+          title,
+          projectName,
+        };
+      }),
+    );
+
+    const runningCount = healthRows.filter((row) => row.state === "running").length;
+    const startingCount = healthRows.filter((row) => row.state === "starting").length;
+    const errorCount = healthRows.filter((row) => row.state === "error").length;
+    const stoppingCount = healthRows.filter((row) => row.state === "stopping").length;
+    const disconnectedCount = healthRows.filter((row) => row.state === "disconnected").length;
+    const idleCount = healthRows.filter((row) => row.state === "idle").length;
+    const summary = [
+      `**总览** · ${healthRows.length} 个会话`,
+      `${runningCount} 运行中`,
+      ...(startingCount ? [`${startingCount} 启动中`] : []),
+      `${errorCount + disconnectedCount + stoppingCount} 异常`,
+      `${idleCount} 空闲`,
+    ].join(" · ");
+
+    const visibleRows = all
+      ? healthRows
+      : healthRows.filter((row) => row.state !== "idle");
+    if (visibleRows.length === 0) {
+      return [
+        summary,
+        "当前没有运行中或异常会话。",
+        "发送 `/watch --all` 查看全部会话。",
+      ].join("\n\n");
+    }
+
+    const tableRows = visibleRows.map((row) => {
+      const index = String(row.session.publicIndex ?? "?");
+      const title = escapeMarkdownTableCell(row.title);
+      const project = escapeMarkdownTableCell(row.projectName);
+      const state = formatHealthState(row.state);
+      const lastActivity = formatLocalMinute(row.session.lastActivityAt);
+      return `| ${index} | ${title} | ${project} | ${state} | ${lastActivity} |`;
+    });
+    const table = [
+      "| 索引 | 会话 | 项目 | 状态 | 最后活动 |",
+      "| --- | --- | --- | --- | --- |",
+      ...tableRows,
+    ].join("\n");
+
+    const attentionRows = visibleRows.filter((row) =>
+      row.state === "error" || row.state === "disconnected" || row.state === "stopping",
+    );
+    const attention = attentionRows.length === 0
+      ? []
+      : [
+          "**需要处理**",
+          ...attentionRows.map((row) => {
+            const index = row.session.publicIndex ?? "?";
+            const title = row.title;
+            if (row.state === "error" && row.failure) {
+              const recovery = !row.worker || row.worker.state === "stale"
+                ? `; 可发送 \`/resume ${index}\` 重连`
+                : "";
+              return `- **${index} ${title}**：${formatFailureSummary(row.failure)}${recovery}`;
+            }
+            if (row.state === "disconnected") {
+              const failureNote = row.failure ? `; ${formatFailureSummary(row.failure)}` : "";
+              return `- **${index} ${title}**：会话断连${failureNote}, 可发送 \`/resume ${index}\` 重连`;
+            }
+            return `- **${index} ${title}**：正在停止`;
+          }),
+        ];
+
+    return [summary, table, ...attention].join("\n\n");
   }
 
   /**
@@ -649,7 +755,6 @@ export class GatewayCommandRouter {
    *
    * @param routeId 微信 route ID。
    * @param selector session ID 前缀或名称。
-   * @param mode 用户指定恢复模式。
    * @returns 恢复结果。
    */
   private async handleResume(
@@ -678,6 +783,13 @@ export class GatewayCommandRouter {
     const confirmation = `已恢复会话 #${session.publicIndex ?? "?"} ${session.name ?? "未命名"} (${session.projectAlias})。`;
     if (previousRoute?.sessionId === session.sessionId || owner.state !== "idle") {
       return confirmation;
+    }
+    const latestFailure = await readLatestFailure(session.sessionFile);
+    if (latestFailure) {
+      return [
+        confirmation,
+        `**最近一次回复失败**\n\n${formatFailureSummary(latestFailure)}`,
+      ].join("\n\n");
     }
     const latestAssistantText = await readLatestAssistantText(session.sessionFile);
     if (!latestAssistantText) {
@@ -751,7 +863,12 @@ export class GatewayCommandRouter {
         ].join("\n\n"),
       );
     }
-    if (turn.assistantText) {
+    if (turn.assistantFailure) {
+      body.push([
+        "**AI（错误）**",
+        formatFailureSummary(turn.assistantFailure),
+      ].join("\n\n"));
+    } else if (turn.assistantText) {
       const assistantPreview = truncateTail(turn.assistantText, LAST_ASSISTANT_TEXT_LIMIT);
       body.push(
         [
@@ -998,7 +1115,9 @@ export class GatewayCommandRouter {
         case "new":
           return await this.handleNew(routeId, command.mode, command.projectAlias, command.name, config);
         case "sessions":
-          return await this.formatSessions(routeId, command.projectAlias, command.state, command.page, config);
+          return await this.formatSessions(routeId, command.projectAlias, command.state, config);
+        case "watch":
+          return await this.formatWatch(command.all, config);
         case "resume":
           return await this.handleResume(routeId, command.selector);
         case "last":
@@ -1080,30 +1199,6 @@ const LAST_USER_TEXT_LIMIT = 1200;
 const LAST_ASSISTANT_TEXT_LIMIT = 3800;
 const TAIL_READ_BYTES = 256 * 1024;
 const TAIL_READ_MAX_BYTES = 8 * 1024 * 1024;
-
-/**
- * 生成保留当前筛选条件的会话翻页命令.
- *
- * @param page 目标页码.
- * @param projectAlias 可选项目 alias.
- * @param state 当前会话状态筛选.
- * @returns 可直接发送到微信的下一页或上一页命令.
- */
-function buildSessionsPageCommand(
-  page: number,
-  projectAlias: string | undefined,
-  state: "default" | "active" | "saved" | "pending" | "all",
-): string {
-  const arguments_: string[] = [];
-  if (projectAlias) {
-    arguments_.push(`--project ${projectAlias}`);
-  }
-  if (state !== "default") {
-    arguments_.push(`--state ${state}`);
-  }
-  arguments_.push(`--page ${page}`);
-  return `/sessions ${arguments_.join(" ")}`;
-}
 
 /**
  * 将 Gateway 生命周期状态转换为面向微信用户的中文说明.
@@ -1355,15 +1450,18 @@ async function readLatestTurn(sessionFile: string): Promise<LatestTurn | undefin
         buffer = firstNewline < 0 ? "" : text.slice(firstNewline + 1);
       }
       const turn = scanTurnLines(buffer);
-      if (turn.assistantText !== undefined && turn.userText !== undefined) {
+      const hasAssistantResult = turn.assistantText !== undefined || turn.assistantFailure !== undefined;
+      if (hasAssistantResult && turn.userText !== undefined) {
         return turn;
       }
       if (start === 0) {
-        return turn.assistantText === undefined && turn.userText === undefined ? undefined : turn;
+        return !hasAssistantResult && turn.userText === undefined ? undefined : turn;
       }
       if (windowBytes >= TAIL_READ_MAX_BYTES) {
         const fallback = await fullScanLatestTurn(sessionFile);
-        return fallback.assistantText === undefined && fallback.userText === undefined
+        return fallback.assistantText === undefined &&
+          fallback.assistantFailure === undefined &&
+          fallback.userText === undefined
           ? undefined
           : fallback;
       }
@@ -1383,6 +1481,8 @@ async function readLatestTurn(sessionFile: string): Promise<LatestTurn | undefin
 function scanTurnLines(buffer: string): LatestTurn {
   const lines = buffer.split("\n");
   let assistantText: string | undefined;
+  let assistantFailure: TurnFailure | undefined;
+  let assistantResolved = false;
   let userText: string | undefined;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index];
@@ -1398,24 +1498,34 @@ function scanTurnLines(buffer: string): LatestTurn {
     if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
       continue;
     }
-    const role = entry.message.role;
+    const message = entry.message;
+    const role = message.role;
     if (role !== "user" && role !== "assistant") {
       continue;
     }
-    const text = extractMessageText(entry.message.content);
-    if (!text) {
-      continue;
+    if (role === "assistant" && !assistantResolved) {
+      const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : "";
+      const stopReason = typeof message.stopReason === "string" ? message.stopReason : "";
+      if (errorMessage || stopReason === "error") {
+        assistantFailure = errorMessage
+          ? classifyFailure(errorMessage)
+          : { kind: "unknown", summary: "上游返回错误但未提供详情", raw: "stopReason=error" };
+        assistantResolved = true;
+      } else {
+        const text = extractMessageText(message.content);
+        if (text) {
+          assistantText = text;
+          assistantResolved = true;
+        }
+      }
+    } else if (role === "user" && userText === undefined) {
+      userText = extractMessageText(message.content);
     }
-    if (role === "assistant") {
-      assistantText ??= text;
-    } else if (userText === undefined) {
-      userText = text;
-    }
-    if (assistantText !== undefined && userText !== undefined) {
+    if (assistantResolved && userText !== undefined) {
       break;
     }
   }
-  return { userText, assistantText };
+  return { userText, assistantText, assistantFailure };
 }
 
 /**
@@ -1428,6 +1538,7 @@ async function fullScanLatestTurn(sessionFile: string): Promise<LatestTurn> {
   let input: ReturnType<typeof createReadStream> | undefined;
   let lines: ReturnType<typeof createInterface> | undefined;
   let assistantText: string | undefined;
+  let assistantFailure: TurnFailure | undefined;
   let userText: string | undefined;
   try {
     input = createReadStream(sessionFile, { encoding: "utf8" });
@@ -1442,27 +1553,41 @@ async function fullScanLatestTurn(sessionFile: string): Promise<LatestTurn> {
       if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
         continue;
       }
-      const role = entry.message.role;
-      if (role !== "user" && role !== "assistant") {
+      const message = entry.message;
+      if (message.role === "user") {
+        const text = extractMessageText(message.content);
+        if (text) {
+          userText = text;
+          assistantText = undefined;
+          assistantFailure = undefined;
+        }
         continue;
       }
-      const text = extractMessageText(entry.message.content);
-      if (!text) {
+      if (message.role !== "assistant") {
         continue;
       }
-      if (role === "assistant") {
+      const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : "";
+      const stopReason = typeof message.stopReason === "string" ? message.stopReason : "";
+      if (errorMessage || stopReason === "error") {
+        assistantText = undefined;
+        assistantFailure = errorMessage
+          ? classifyFailure(errorMessage)
+          : { kind: "unknown", summary: "上游返回错误但未提供详情", raw: "stopReason=error" };
+        continue;
+      }
+      const text = extractMessageText(message.content);
+      if (text) {
         assistantText = text;
-      } else {
-        userText = text;
+        assistantFailure = undefined;
       }
     }
   } catch {
-    return { userText, assistantText };
+    return { userText, assistantText, assistantFailure };
   } finally {
     lines?.close();
     input?.destroy();
   }
-  return { userText, assistantText };
+  return { userText, assistantText, assistantFailure };
 }
 
 /**
@@ -1490,6 +1615,7 @@ function extractMessageText(content: unknown): string | undefined {
 interface LatestTurn {
   userText?: string;
   assistantText?: string;
+  assistantFailure?: TurnFailure;
 }
 
 /**
@@ -1578,6 +1704,28 @@ function truncateSessionTitle(title: string): string {
 }
 
 /**
+ * 将 markdown 表格单元格中的特殊字符转义, 避免内容破坏列结构。
+ *
+ * @param value 单元格原始内容。
+ * @returns 单行且竖线已转义的内容。
+ */
+function escapeMarkdownTableCell(value: string): string {
+  return value.replace(/[|\r\n]+/g, " ").trim();
+}
+
+/**
+ * 将归一化失败信息格式化为简洁的人类可读说明。
+ *
+ * @param failure 已分类的 turn 失败。
+ * @returns 含重置时间 (若有) 的说明。
+ */
+function formatFailureSummary(failure: TurnFailure): string {
+  return failure.resetAt
+    ? `${failure.summary}, 重置时间 ${failure.resetAt}`
+    : failure.summary;
+}
+
+/**
  * 将失败消息正文压缩为单行预览, 避免提示占用过多屏幕。
  *
  * @param text 消息原文。
@@ -1607,7 +1755,7 @@ const GATEWAY_HELP_TEXT = [
   "",
   "**会话命令**",
   "- `/new [--mode background|ui] [--project <别名>] [--name <名称>]`",
-  "- `/sessions [--project <别名>] [--state active|saved|pending|all] [--page <页码>]`",
+  "- `/sessions [--project <别名>] [--state active|saved|pending|all]`",
   "- `/resume <索引或名称>` 切换会话",
   "- `/last [索引或名称]` 只读查看最近一轮对话",
   "- `/stop [索引或名称]` 停止会话",
@@ -1619,7 +1767,8 @@ const GATEWAY_HELP_TEXT = [
   "- `/projects default <别名>`",
   "",
   "**Hub 状态与队列**",
-  "- `/status` 查看连接与会话状态",
+  "- `/status` 查看连接与当前会话状态",
+  "- `/watch [--all]` 总览运行中与异常会话, `--all` 查看全部",
   "- `/retry <message-id> --confirm` 重新执行失败消息 (可能产生副作用)",
   "",
   "发送 `/help` 查看此帮助。",

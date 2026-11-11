@@ -6,11 +6,12 @@ export type GatewayCommand =
   | { kind: "status" }
   | { kind: "projects"; arguments: string }
   | { kind: "new"; mode?: RuntimeMode; projectAlias?: string; name?: string }
-  | { kind: "sessions"; projectAlias?: string; state: "default" | "active" | "saved" | "pending" | "all"; page: number }
+  | { kind: "sessions"; projectAlias?: string; state: "default" | "active" | "saved" | "pending" | "all" }
   | { kind: "resume"; selector: string }
   | { kind: "last"; selector?: string }
   | { kind: "stop"; selector?: string }
   | { kind: "retry"; messageId: string; confirmed: boolean }
+  | { kind: "watch"; all: boolean }
   | { kind: "prompt"; text: string };
 
 /**
@@ -91,6 +92,9 @@ export function parseGatewayCommand(text: string): GatewayCommand {
       ...(arguments_[0] ? { selector: arguments_[0] } : {}),
     };
   }
+  if (commandName === "watch") {
+    return parseWatchCommand(arguments_);
+  }
   if (commandName === "retry") {
     if (
       arguments_.length < 1 ||
@@ -110,6 +114,24 @@ export function parseGatewayCommand(text: string): GatewayCommand {
   throw new GatewayCommandParseError(
     `未知命令: /${commandName}。发送 /help 查看支持的命令。`,
   );
+}
+
+/**
+ * 解析 /watch 参数。
+ *
+ * 不带参数时只展示运行中与异常会话; 带 --all 时展示全部。
+ *
+ * @param arguments_ 去掉命令名后的 token 列表。
+ * @returns watch 参数。
+ */
+function parseWatchCommand(arguments_: string[]): GatewayCommand {
+  if (arguments_.length === 0) {
+    return { kind: "watch", all: false };
+  }
+  if (arguments_.length === 1 && arguments_[0] === "--all") {
+    return { kind: "watch", all: true };
+  }
+  throw usageError();
 }
 
 /**
@@ -144,14 +166,9 @@ function parseNewCommand(arguments_: string[]): GatewayCommand {
  * @returns session 列表过滤参数。
  */
 function parseSessionsCommand(arguments_: string[]): GatewayCommand {
-  const options = readOptions(arguments_, ["project", "state", "page"]);
+  const options = readOptions(arguments_, ["project", "state"]);
   const projectAlias = options.get("project");
   const state = options.get("state") ?? "active";
-  const pageText = options.get("page") ?? "1";
-  const page = Number(pageText);
-  if (!Number.isInteger(page) || page < 1) {
-    throw new GatewayCommandParseError("page 必须是大于 0 的整数。");
-  }
   if (
     state !== "default" &&
     state !== "active" &&
@@ -165,7 +182,6 @@ function parseSessionsCommand(arguments_: string[]): GatewayCommand {
     kind: "sessions",
     ...(projectAlias ? { projectAlias } : {}),
     state,
-    page,
   };
 }
 
@@ -279,7 +295,7 @@ function extractRawArguments(input: string): string {
 }
 
 const GATEWAY_COMMAND_USAGE =
-  "用法: /new [--mode background|ui] [--project <alias>] [--name <名称>] | /sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>] | /resume <会话索引|名称> | /last [会话索引|名称] | /stop [会话索引|名称] | /retry <message-id> --confirm | /status | /projects | /help";
+  "用法: /new [--mode background|ui] [--project <alias>] [--name <名称>] | /sessions [--project <alias>] [--state active|saved|pending|all] | /watch [--all] | /resume <会话索引|名称> | /last [会话索引|名称] | /stop [会话索引|名称] | /retry <message-id> --confirm | /status | /projects | /help";
 
 /**
  * 创建统一格式的 command usage 错误。

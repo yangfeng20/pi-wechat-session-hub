@@ -184,11 +184,12 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 
 ```text
 /new [--mode background|ui] [--project <alias>] [--name <名称>]
-/sessions [--project <alias>] [--state active|saved|pending|all] [--page <n>]
+/sessions [--project <alias>] [--state active|saved|pending|all]
 /resume <会话索引|名称>
 /last [会话索引|名称]
 /stop [会话索引|名称]
 /retry <message-id> --confirm
+/watch [--all]
 /status
 /projects
 /help
@@ -197,18 +198,19 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 | 命令 | 是否改变状态 | 作用 |
 |---|---|---|
 | `/new` | 是 | 新建会话并绑定当前微信 route |
-| `/sessions` | 否 | 分页列出 Hub 管理的会话 |
+| `/sessions` | 否 | 一次列出 Hub 管理的全部匹配会话 |
 | `/resume` | 是 | 把当前微信 route 切到目标会话 |
 | `/last` | **否** | 只读回顾目标会话最近一轮对话 |
 | `/stop` | 是 | 停止目标会话的 Pi worker |
 | `/retry` | 是 | 重新执行指定消息, 可能产生副作用 |
+| `/watch` | 否 | 默认总览运行中与异常会话; `--all` 查看全部, 含最后活动时间 |
 | `/status` | 否 | 展示 Hub、当前会话与 UI 模式可用性 |
 | `/projects` | 否 | 列出已登记项目 |
 | `/help` | 否 | 查看命令帮助 |
 
-`/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 每页 5 条, 以 **markdown 表格**展示索引、标题、模式与状态, 当前微信路由在标题后标记为 `（当前）`, 表头下方汇总涉及的项目. 标题优先显示 session name; 未命名时使用 Pi `/resume` 同样采用的首条用户文本, 最长 32 个 Unicode 字符, 超出以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 如果切换目标的 agent 已处于 idle, 回复会附带最近一次回复预览; 超过 3800 个 Unicode 字符时只显示结尾并提示完整内容仍在会话中. 如果 agent 正在运行, 只确认切换, 不发送旧回复. 索引在会话排序变化后保持不变, 不因列表重排而复用.
+`/new` 默认在后台创建会话, 也可显式使用 `/new --mode ui` 在新 Windows Terminal tab 中创建可见 UI 会话. `/sessions` 默认列出 Hub 管理的全部活跃前台和后台会话, 一次回复展示全部匹配会话, 以 **markdown 表格**展示索引、标题、模式与状态, 当前微信路由在标题后标记为 `（当前）`, 表格下方汇总涉及的项目. 标题优先显示 session name; 未命名时使用 Pi `/resume` 同样采用的首条用户文本, 最长 32 个 Unicode 字符, 超出以 `...` 省略. `/resume 3` 把微信 route 切换到索引为 `3` 的会话. 如果切换目标的 agent 已处于 idle, 回复会附带最近一次回复预览; 超过 3800 个 Unicode 字符时只显示结尾并提示完整内容仍在会话中. 如果 agent 正在运行, 只确认切换, 不发送旧回复. 索引在会话排序变化后保持不变, 不因列表重排而复用.
 
-`/status` 会额外输出 `可见 UI 模式` 一行; 平台不支持或缺少 `wt.exe` 时显示 `不可用` 及具体原因.
+`/watch` 默认只展示运行中、启动中、异常或断连会话; `/watch --all` 展示全部, 包含空闲会话和最后活动时间. 失败类型直接从 Pi transcript 的 `stopReason` 与 `errorMessage` 读取, 可识别周/5 小时/月额度、TPM 限流、网络错误和鉴权错误; 如果上游错误提供重置时间, 会原样显示. 当前 worker 的 `running` 状态可直接读取, 但 Hub 没有独立的 turn 定时心跳, 因此不臆测“卡住”状态. `/status` 额外输出 `可见 UI 模式`; 平台不支持或缺少 `wt.exe` 时显示 `不可用` 及具体原因.
 
 ## 在微信端找回上下文
 
