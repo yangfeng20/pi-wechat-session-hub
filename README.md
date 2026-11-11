@@ -174,7 +174,7 @@ Node.js 需满足 `package.json` 中的最低版本. 首次使用顺序:
 | `/wx autostart off` | 关闭并移除 Windows 登录任务 |
 | `/wx help` | 查看本机命令帮助 |
 
-停止时, Gateway 先停止接收新微信消息, 再 drain 已入队 route 工作并等待正在处理的 Pi turn 收尾. `/wx stop` 在后台收尾期间提示"正在停止", 完成后再通知最终状态. `/wx restart` 会安全停止旧后台进程并启动新进程, 等待新服务就绪或报告失败; 它不会启动新旧并行 poller. 如果 daemon 非正常退出, durable queue 会保留未完成项并阻断后续 FIFO, 需要显式 `/retry <message-id> --confirm`.
+停止时, Gateway 先停止接收新微信消息, 再 drain 已入队 route 工作并等待正在处理的 Pi turn 收尾. `/wx stop` 在后台收尾期间提示"正在停止", 完成后再通知最终状态. `/wx restart` 会安全停止旧后台进程并启动新进程, 等待新服务就绪或报告失败; 它不会启动新旧并行 poller. 如果 daemon 非正常退出, durable queue 会保留未完成项; 这些项会在下次处理时被自动跳过并向微信回一条提示, 不会卡死后续消息. 需要重新执行时用 `/retry <message-id> --confirm`.
 
 Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使用已保存授权连接. 它不在 Windows 登录桌面前运行, 也不会在启动时弹出扫码窗口. 如果尚未完成微信授权或授权失效, 需要先在 Pi TUI 执行 `/wx login`. 非 Windows 平台执行 `/wx autostart on` 会被明确拒绝.
 
@@ -316,7 +316,7 @@ Windows 首次创建空 manager 目录时会关闭继承 ACL, 仅授权当前用
 凭证文件只在不存在时 create-only 写入, 不会覆盖. 若授权失效, 重新执行 `/wx login` 覆盖 Hub 自己的凭证文件即可.
 
 **Q: 微信消息一直没回复?**
-先 `/wx status` 看当前终端接入状态与未完成消息数. 若队列被非正常退出留下的失败项阻断, 需要 `/retry <message-id> --confirm` 重新执行, 该操作可能产生副作用.
+先 `/wx status` 看当前终端接入状态与未完成消息数. 单条消息处理或回复投递失败时, 该消息会被自动跳过, 微信会收到一条包含消息 ID 的提示, 后续消息不受影响; 需要重新执行时用 `/retry <message-id> --confirm`, 该操作可能产生副作用.
 
 **Q: 为什么 `/sessions` 看不到我在别的目录开的会话?**
 Hub 只管理 `allowedProjectRoots` 内的会话, 且不扫描本机其他 session 文件. 用 `/wx roots add <绝对路径>` 授权该目录后重新打开会话即可接入.

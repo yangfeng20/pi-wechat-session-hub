@@ -117,6 +117,34 @@ export class GatewayCommandRouter {
     this.replySink = options.replySink;
     this.processingIndicator = options.processingIndicator;
     this.uiModeCapability = options.uiModeCapability;
+    this.queue.setSkippedNotifier((routeId, item) =>
+      this.notifySkippedItem(routeId, item),
+    );
+  }
+
+  /**
+   * 向上游告知某条消息已被自动跳过, 避免用户以为消息没发出去。
+   *
+   * 提示使用该消息自己的 replyContext 投递; 若该项本来就没有上下文,
+   * 或投递失败, 只放弃提示, 不影响队列继续处理后续消息。
+   *
+   * @param routeId route 稳定 ID。
+   * @param item 被跳过的 queue 项。
+   * @returns 无返回值。
+   */
+  private async notifySkippedItem(routeId: string, item: DurableQueueItem): Promise<void> {
+    if (!this.replySink) {
+      return;
+    }
+    const notice = [
+      "你有一条消息没有处理成功, 已自动跳过, 后续消息不受影响。",
+      `消息 ID: ${item.messageId}`,
+      `原文: ${truncatePreview(item.text)}`,
+      item.errorCode ? `原因: ${item.errorCode}` : undefined,
+      `要重新执行请发送 /retry ${item.messageId} --confirm`,
+      "(注意: 重新执行可能重复产生副作用)",
+    ].filter((line): line is string => line !== undefined).join("\n");
+    await this.replySink(routeId, `${item.messageId}:skipped`, notice, item.replyContext);
   }
 
   /**
@@ -778,6 +806,16 @@ export class GatewayCommandRouter {
     const pendingQueueCount = queueItems.filter((item) =>
       item.state === "queued" || item.state === "failed" || item.state === "interrupted",
     ).length;
+    const skippedItems = await this.queue.listSkipped(routeId);
+    const skippedLines = skippedItems.length === 0
+      ? []
+      : [
+          `已跳过：${skippedItems.length} 条`,
+          ...skippedItems.slice(-3).map((item) =>
+            `  ${item.messageId} · ${item.errorCode ?? "未知原因"} · ${truncatePreview(item.text)}`,
+          ),
+          "  需要重新执行请发送 /retry <消息ID> --confirm",
+        ];
     const projectCount = Object.keys(config.projects).length;
     const projectName = session
       ? Object.hasOwn(config.projects, session.projectAlias)
@@ -800,6 +838,7 @@ export class GatewayCommandRouter {
       `Pi：${workerLabel}`,
       ...uiModeLine,
       `未完成消息：${pendingQueueCount} 条`,
+      ...skippedLines,
       `已登记项目：${projectCount} 个`,
     ].join("\n");
   }
@@ -1392,6 +1431,21 @@ function truncateSessionTitle(title: string): string {
     return title;
   }
   return `${characters.slice(0, SESSION_TITLE_LIMIT - 3).join("")}...`;
+}
+
+/**
+ * 将失败消息正文压缩为单行预览, 避免提示占用过多屏幕。
+ *
+ * @param text 消息原文。
+ * @returns 最多 24 个 Unicode code point 的单行预览。
+ */
+function truncatePreview(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const characters = Array.from(normalized);
+  if (characters.length <= 24) {
+    return normalized;
+  }
+  return `${characters.slice(0, 24).join("")}...`;
 }
 
 /**

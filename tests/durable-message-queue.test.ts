@@ -129,7 +129,7 @@ test("队列达到上限时拒绝新消息且不覆盖已有消息", async () =>
   }
 });
 
-test("崩溃遗留 processing 会阻断 FIFO, 显式 retry 后按原顺序恢复", async () => {
+test("崩溃遗留 processing 会被自动跳过, 后续消息继续按原顺序处理", async () => {
   const { directory, lease, queue } = await createQueueFixture();
   try {
     await queue.enqueue("route-1", "message-1", "第一条", 5);
@@ -138,24 +138,132 @@ test("崩溃遗留 processing 会阻断 FIFO, 显式 retry 后按原顺序恢复
     assert.equal(firstClaim.kind, "claimed");
 
     const restartedQueue = new DurableMessageQueue(directory, lease);
-    const blockedClaim = await restartedQueue.claimNext("route-1");
-    assert.equal(blockedClaim.kind, "blocked");
-    if (blockedClaim.kind === "blocked") {
-      assert.equal(blockedClaim.item.state, "interrupted");
+    const skippedClaim = await restartedQueue.claimNext("route-1");
+    assert.equal(skippedClaim.kind, "skipped");
+    if (skippedClaim.kind === "skipped") {
+      assert.equal(skippedClaim.item.state, "skipped");
+      assert.equal(skippedClaim.item.messageId, "message-1");
     }
+    assert.equal((await restartedQueue.listSkipped("route-1")).length, 1);
 
-    await restartedQueue.retry("route-1", "message-1");
-    const retriedFirst = await restartedQueue.claimNext("route-1");
-    assert.equal(retriedFirst.kind, "claimed");
-    if (retriedFirst.kind !== "claimed") {
-      throw new Error("第一条 queue 消息未按预期恢复。");
-    }
-    await restartedQueue.complete("route-1", retriedFirst.item.id);
     const second = await restartedQueue.claimNext("route-1");
     assert.equal(second.kind, "claimed");
     if (second.kind === "claimed") {
       assert.equal(second.item.messageId, "message-2");
+      await restartedQueue.complete("route-1", second.item.id);
     }
+
+    assert.deepEqual(await restartedQueue.list("route-1"), []);
+    assert.equal((await restartedQueue.listSkipped("route-1")).length, 1);
+  } finally {
+    await lease.release();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("单条消息处理失败不会让后续消息一起卡死", async () => {
+  const { directory, lease, queue } = await createQueueFixture();
+  const processed: string[] = [];
+  const processor = async (item: { messageId: string }): Promise<string> => {
+    processed.push(item.messageId);
+    if (item.messageId === "message-bad") {
+      throw Object.assign(new Error("投递失败"), { name: "IlinkApiError", code: "api_error" });
+    }
+    return `reply-${item.messageId}`;
+  };
+
+  try {
+    const badResult = queue.dispatch("route-1", "message-bad", "会失败的消息", 5, processor);
+    const badRejected = assert.rejects(badResult);
+    const goodResult = queue.dispatch("route-1", "message-good", "应当成功的消息", 5, processor);
+
+    await badRejected;
+    const good = await goodResult;
+    assert.equal(good.reply, "reply-message-good");
+    assert.deepEqual(processed, ["message-bad", "message-good"]);
+
+    const skipped = await queue.listSkipped("route-1");
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0].messageId, "message-bad");
+    assert.equal(skipped[0].errorCode, "api_error");
+    assert.deepEqual(await queue.list("route-1"), []);
+  } finally {
+    await lease.release();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("失败项被跳过时会通知用户, 通知失败也不影响后续消息", async () => {
+  const { directory, lease, queue } = await createQueueFixture();
+  const notices: Array<{ routeId: string; item: { messageId: string; state: string } }> = [];
+  let notifierThrows = true;
+  queue.setSkippedNotifier(async (routeId, item) => {
+    if (notifierThrows) {
+      notifierThrows = false;
+      throw new Error("提示投递失败");
+    }
+    notices.push({ routeId, item });
+  });
+
+  try {
+    await queue.enqueue("route-1", "message-failed", "失败的消息", 5);
+    const claim = await queue.claimNext("route-1");
+    assert.equal(claim.kind, "claimed");
+    if (claim.kind !== "claimed") {
+      throw new Error("测试队列未能声明消息。");
+    }
+    await queue.fail("route-1", claim.item.id, "api_error");
+
+    const skippedClaim = await queue.claimNext("route-1");
+    assert.equal(skippedClaim.kind, "skipped");
+
+    await queue.setSkippedNotifier(undefined);
+    assert.equal(notices.length, 0);
+
+    const secondQueue = new DurableMessageQueue(directory, lease);
+    secondQueue.setSkippedNotifier(async (routeId, item) => {
+      notices.push({ routeId, item });
+    });
+    await secondQueue.enqueue("route-1", "message-next", "后续消息", 5);
+    const processing = await secondQueue.dispatch(
+      "route-1",
+      "message-next",
+      "后续消息",
+      5,
+      async () => "ok",
+    );
+    assert.equal(processing.reply, "ok");
+  } finally {
+    await lease.release();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("被跳过的消息仍可通过 retry 重新执行", async () => {
+  const { directory, lease, queue } = await createQueueFixture();
+  try {
+    await queue.enqueue("route-1", "message-retry", "需要重试的消息", 5);
+    const claim = await queue.claimNext("route-1");
+    assert.equal(claim.kind, "claimed");
+    if (claim.kind !== "claimed") {
+      throw new Error("测试队列未能声明消息。");
+    }
+    await queue.fail("route-1", claim.item.id, "api_error");
+
+    const skippedClaim = await queue.claimNext("route-1");
+    assert.equal(skippedClaim.kind, "skipped");
+
+    const retried = await queue.retry("route-1", "message-retry");
+    assert.equal(retried.state, "queued");
+
+    const reclaimed = await queue.claimNext("route-1");
+    assert.equal(reclaimed.kind, "claimed");
+    if (reclaimed.kind === "claimed") {
+      assert.equal(reclaimed.item.messageId, "message-retry");
+      assert.equal(reclaimed.item.attempts, 2);
+      await queue.complete("route-1", reclaimed.item.id);
+    }
+    assert.deepEqual(await queue.list("route-1"), []);
   } finally {
     await lease.release();
     await rm(directory, { recursive: true, force: true });

@@ -1011,3 +1011,72 @@ test("/last 在单条消息超过尾部窗口时仍能取到最近一轮", async
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("失败消息被跳过时向微信回提示, 且后续消息照常处理", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-skip-notice-"));
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    wechat: { ...config.wechat, authorizedUserId: "wx-skip-route" },
+  }));
+  const projectService = new ProjectService(configStore);
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const sentReplies: Array<{ routeId: string; messageId: string; text: string }> = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: new BackgroundWorkerManager({
+      projectService,
+      registry,
+      invocation: { command: process.execPath, args: ["unused"] },
+      disableDiscoveredResources: true,
+    }),
+    registry,
+    queue,
+    lease,
+    replySink: async (routeId, messageId, text) => {
+      sentReplies.push({ routeId, messageId, text });
+    },
+  });
+
+  try {
+    await queue.enqueue(
+      "wx-skip-route",
+      "wx-broken-1",
+      "这条回复会投递失败",
+      20,
+      { recipientId: "wx-skip-route", contextToken: "context-token-broken" },
+    );
+    const claim = await queue.claimNext("wx-skip-route");
+    assert.equal(claim.kind, "claimed");
+    if (claim.kind !== "claimed") {
+      throw new Error("测试队列未能声明消息。");
+    }
+    await queue.fail("wx-skip-route", claim.item.id, "api_error");
+
+    const statusResult = await router.receive({
+      messageId: "wx-status-after-fail",
+      senderId: "wx-skip-route",
+      text: "/status",
+      replyContext: { recipientId: "wx-skip-route", contextToken: "context-token-status" },
+    });
+    assert.equal(statusResult.state, "completed");
+
+    const skipNotice = sentReplies.find((reply) => reply.messageId === "wx-broken-1:skipped");
+    assert.ok(skipNotice, "应当向微信回一条跳过提示");
+    assert.match(skipNotice!.text, /已自动跳过/);
+    assert.match(skipNotice!.text, /wx-broken-1/);
+    assert.match(skipNotice!.text, /api_error/);
+
+    const statusReply = sentReplies.find((reply) => reply.messageId === "wx-status-after-fail");
+    assert.ok(statusReply);
+    assert.match(statusReply!.text, /已跳过：1 条/);
+    assert.match(statusReply!.text, /wx-broken-1/);
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});

@@ -120,7 +120,7 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 - 每个微信 route 使用 durable FIFO queue 和 `messageId` 去重. `context_token` 只随 pending queue 项持久化, 完成后删除.
 - Queue processing 使用 iLink `getconfig` / `sendtyping` best-effort 显示“正在输入”; typing 失败不影响 Pi turn.
 - Pi turn settled 后发送一条完整最终回复. Hub 不提供 token 级微信流式回传.
-- Gateway stop 先停止 poller, 再等待活动 route drain. 如果进程非正常退出, `processing` queue item 会阻断后续消息, 需用户显式 `/retry ... --confirm`.
+- Gateway stop 先停止 poller, 再等待活动 route drain. 如果进程非正常退出, 遗留 `processing` 项会在下次处理时被标为 `skipped` 并自动放行后续消息, 同时向微信发一条包含 messageId 的跳过提示; 需要重新执行时用 `/retry ... --confirm`.
 
 ## 9. 安全与数据约束
 

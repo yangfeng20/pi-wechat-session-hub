@@ -4,7 +4,13 @@ import { dirname, join } from "node:path";
 import { GatewayLease } from "../registry/gateway-lease.ts";
 import type { IlinkReplyContext } from "./channel-types.ts";
 
-export type QueueItemState = "queued" | "processing" | "completed" | "failed" | "interrupted";
+export type QueueItemState =
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "skipped";
 
 export interface DurableQueueItem {
   id: string;
@@ -22,7 +28,7 @@ export interface DurableQueueItem {
 export type QueueClaimResult =
   | { kind: "claimed"; item: DurableQueueItem }
   | { kind: "empty" }
-  | { kind: "blocked"; item: DurableQueueItem };
+  | { kind: "skipped"; item: DurableQueueItem };
 
 export interface QueueDispatchResult {
   item: DurableQueueItem;
@@ -38,6 +44,8 @@ type QueueWaiter = {
   resolve: (result: QueueDispatchResult) => void;
   reject: (error: Error) => void;
 };
+
+type SkippedNotifier = (routeId: string, item: DurableQueueItem) => Promise<void>;
 
 interface EnqueueEvent {
   type: "enqueue";
@@ -104,6 +112,8 @@ export class QueueCorruptionError extends Error {
 
 const MAX_RECENT_DEDUPE_IDS = 1000;
 
+const MAX_RETAINED_SKIPPED_ITEMS = 20;
+
 /**
  * 将路由消息保存为按 route 分片的 append-only JSONL 队列。
  */
@@ -114,6 +124,8 @@ export class DurableMessageQueue {
   private readonly idleWaiters = new Set<() => void>();
   private readonly waiters = new Map<string, QueueWaiter>();
   private readonly waiterRoutes = new Map<string, string>();
+  private readonly skippedNotices = new Map<string, DurableQueueItem[]>();
+  private skippedNotifier?: SkippedNotifier;
 
   /**
    * 创建 durable queue。
@@ -297,7 +309,19 @@ export class DurableMessageQueue {
   }
 
   /**
-   * 恢复某 route 的 queued 消息处理; processing 项会转为 interrupted 并阻断 FIFO。
+   * 注册失败项被自动跳过时的通知回调。
+   *
+   * 通知为 best-effort: 回调失败不会阻塞队列继续处理后续消息。
+   *
+   * @param notifier 跳过通知回调, 传 undefined 取消注册。
+   * @returns 无返回值。
+   */
+  setSkippedNotifier(notifier: SkippedNotifier | undefined): void {
+    this.skippedNotifier = notifier;
+  }
+
+  /**
+   * 恢复某 route 的 queued 消息处理; 失败或中断项会被自动跳过而不是阻塞 FIFO。
    *
    * @param routeId route 稳定 ID。
    * @param processor 单条消息处理函数。
@@ -338,28 +362,34 @@ export class DurableMessageQueue {
   }
 
   /**
-   * 声明 route 上最早的 queued 消息为 processing。
+   * 声明 route 上最早的可执行消息为 processing。
    *
-   * 遇到上次进程遗留的 processing、failed 或 interrupted 项时阻塞后续消息, 防止无提示跳过。
+   * 上次进程遗留的 processing、failed 或 interrupted 项会被标记为 skipped 并返回,
+   * 由调用方通知用户后继续处理后续消息, 不再阻塞整个 route。
    *
    * @param routeId route 稳定 ID。
-   * @returns 已声明项、空队列或阻塞项。
+   * @returns 已声明项、空队列或刚被跳过的项。
    */
   async claimNext(routeId: string): Promise<QueueClaimResult> {
     return this.withWriteQueue(async () => {
       await this.lease.assertOwned();
       const items = [...(await this.loadRoute(routeId)).values()];
-      const firstUnfinished = items.find((item) => item.state !== "completed");
+      const firstUnfinished = items.find((item) =>
+        item.state !== "completed" && item.state !== "skipped",
+      );
       if (!firstUnfinished) {
         await this.compactRouteUnlocked(routeId, items);
         return { kind: "empty" };
       }
-      if (firstUnfinished.state === "processing") {
-        const interrupted = await this.writeState(routeId, firstUnfinished, "interrupted");
-        return { kind: "blocked", item: interrupted };
-      }
-      if (firstUnfinished.state === "interrupted" || firstUnfinished.state === "failed") {
-        return { kind: "blocked", item: firstUnfinished };
+      if (
+        firstUnfinished.state === "processing" ||
+        firstUnfinished.state === "failed" ||
+        firstUnfinished.state === "interrupted"
+      ) {
+        const skipped = await this.writeState(routeId, firstUnfinished, "skipped");
+        this.recordSkippedNotice(routeId, skipped);
+        await this.pruneSkippedUnlocked(routeId);
+        return { kind: "skipped", item: skipped };
       }
 
       const claimed = await this.writeState(routeId, firstUnfinished, "processing", {
@@ -422,18 +452,14 @@ export class DurableMessageQueue {
       if (!item) {
         throw new DurableQueueError("queue_item_not_found", "未找到要重试的 queue 消息。");
       }
-      if (item.state !== "failed" && item.state !== "interrupted") {
+      if (
+        item.state !== "failed" &&
+        item.state !== "interrupted" &&
+        item.state !== "skipped"
+      ) {
         throw new DurableQueueError(
           "invalid_queue_transition",
-          `只有 failed 或 interrupted 消息可重试, 当前状态为 ${item.state}。`,
-        );
-      }
-      const firstUnfinished = [...(await this.loadRoute(routeId)).values()]
-        .find((candidate) => candidate.state !== "completed");
-      if (firstUnfinished?.id !== item.id) {
-        throw new DurableQueueError(
-          "queue_blocked",
-          "只能先重试 route 中最早的失败或中断消息。",
+          `只有 failed、interrupted 或 skipped 消息可重试, 当前状态为 ${item.state}。`,
         );
       }
       return this.writeState(routeId, item, "queued", { errorCode: undefined });
@@ -441,10 +467,12 @@ export class DurableMessageQueue {
   }
 
   /**
-   * 列出指定 route 的队列项, 按入队顺序返回。
+   * 列出指定 route 尚未处理完的队列项, 按入队顺序返回。
+   *
+   * 已完成与已自动跳过的项不在此列表内, 跳过项用 {@link listSkipped} 查询。
    *
    * @param routeId route 稳定 ID。
-   * @returns 队列状态列表。
+   * @returns 待处理队列状态列表。
    */
   async list(routeId: string): Promise<DurableQueueItem[]> {
     return this.withWriteQueue(async () => {
@@ -453,7 +481,9 @@ export class DurableMessageQueue {
       if ([...items.values()].some((item) => item.state === "completed")) {
         await this.compactRouteUnlocked(routeId, items.values());
       }
-      return [...items.values()].filter((item) => item.state !== "completed");
+      return [...items.values()].filter((item) =>
+        item.state !== "completed" && item.state !== "skipped",
+      );
     });
   }
 
@@ -495,15 +525,11 @@ export class DurableMessageQueue {
       this.finishDrain(routeId, processor);
       return;
     }
-    if (claim.kind === "blocked") {
-      this.rejectRouteWaiters(
-        routeId,
-        new DurableQueueError(
-          "queue_blocked",
-          `route 队列被 ${claim.item.state} 消息阻塞; 未自动跳过或重复执行。`,
-        ),
-      );
-      this.finishDrain(routeId, processor);
+    if (claim.kind === "skipped") {
+      await this.notifySkipped(routeId, claim.item);
+      setImmediate(() => {
+        void this.processNext(routeId, processor);
+      });
       return;
     }
 
@@ -520,7 +546,7 @@ export class DurableMessageQueue {
         void this.processNext(routeId, processor);
       });
     } catch (error) {
-      const failureCode = error instanceof Error ? error.name : "UnknownError";
+      const failureCode = describeFailureCode(error);
       try {
         await this.fail(routeId, item.id, failureCode);
       } catch {
@@ -530,14 +556,27 @@ export class DurableMessageQueue {
         ));
       }
       this.rejectWaiter(item.id, asError(error));
-      this.rejectRouteWaiters(
-        routeId,
-        new DurableQueueError(
-          "queue_blocked",
-          "前序消息处理失败, 后续消息仍保留在队列中等待显式恢复。",
-        ),
-      );
-      this.finishDrain(routeId, processor);
+      setImmediate(() => {
+        void this.processNext(routeId, processor);
+      });
+    }
+  }
+
+  /**
+   * 对刚被自动跳过的失败项发送一次用户可见提示, 失败不影响后续处理。
+   *
+   * @param routeId route 稳定 ID。
+   * @param item 被跳过的 queue 项。
+   * @returns 无返回值。
+   */
+  private async notifySkipped(routeId: string, item: DurableQueueItem): Promise<void> {
+    if (!this.skippedNotifier) {
+      return;
+    }
+    try {
+      await this.skippedNotifier(routeId, item);
+    } catch {
+      // 通知本身依赖 iLink 投递, 失败时只放弃提示, 不阻塞队列。
     }
   }
 
@@ -709,9 +748,9 @@ export class DurableMessageQueue {
       entries: [...recent.values()].slice(-MAX_RECENT_DEDUPE_IDS),
     });
 
-    const pendingItems = items.filter((item) => item.state !== "completed");
+    const retainedItems = items.filter((item) => item.state !== "completed");
     const queuePath = this.routeFilePath(routeId);
-    if (pendingItems.length === 0) {
+    if (retainedItems.length === 0) {
       try {
         await unlink(queuePath);
       } catch (error) {
@@ -722,7 +761,7 @@ export class DurableMessageQueue {
       return;
     }
 
-    const pendingIds = new Set(pendingItems.map((item) => item.id));
+    const retainedIds = new Set(retainedItems.map((item) => item.id));
     const rawContents = await readFile(queuePath, "utf8");
     const rawLines = rawContents.split("\n");
     if (rawLines.at(-1) === "") {
@@ -733,12 +772,60 @@ export class DurableMessageQueue {
         return false;
       }
       const event = JSON.parse(line) as QueueEvent;
-      return pendingIds.has(event.id);
+      return retainedIds.has(event.id);
     });
     if (preservedLines.length === 0) {
       throw new QueueCorruptionError("route queue 压缩时未找到待处理记录。");
     }
     await this.writeFileAtomically(queuePath, `${preservedLines.join("\n")}\n`);
+  }
+
+  /**
+   * 记录一次自动跳过提示, 同一条消息不会被重复提示。
+   *
+   * @param routeId route 稳定 ID。
+   * @param item 被跳过的 queue 项。
+   * @returns 无返回值。
+   */
+  private recordSkippedNotice(routeId: string, item: DurableQueueItem): void {
+    const notices = this.skippedNotices.get(routeId) ?? [];
+    if (notices.some((notice) => notice.id === item.id)) {
+      return;
+    }
+    notices.push(item);
+    this.skippedNotices.set(routeId, notices.slice(-MAX_RETAINED_SKIPPED_ITEMS));
+  }
+
+  /**
+   * 将超出保留上限的 skipped 项转为 completed, 避免队列无限增长。
+   *
+   * @param routeId route 稳定 ID。
+   * @returns 无返回值。
+   */
+  private async pruneSkippedUnlocked(routeId: string): Promise<void> {
+    const items = await this.loadRoute(routeId);
+    const skippedItems = [...items.values()].filter((item) => item.state === "skipped");
+    if (skippedItems.length <= MAX_RETAINED_SKIPPED_ITEMS) {
+      return;
+    }
+    const expired = skippedItems.slice(0, skippedItems.length - MAX_RETAINED_SKIPPED_ITEMS);
+    for (const item of expired) {
+      await this.writeState(routeId, item, "completed");
+    }
+  }
+
+  /**
+   * 列出近期被自动跳过的消息, 供 /status 展示。
+   *
+   * @param routeId route 稳定 ID。
+   * @returns 最近跳过的 queue 项, 按入队顺序排列。
+   */
+  async listSkipped(routeId: string): Promise<DurableQueueItem[]> {
+    return this.withWriteQueue(async () => {
+      await this.lease.assertOwned();
+      const items = await this.loadRoute(routeId);
+      return [...items.values()].filter((item) => item.state === "skipped");
+    });
   }
 
   /**
@@ -821,13 +908,15 @@ export class DurableMessageQueue {
   ): Promise<DurableQueueItem> {
     validateTransition(current.state, state);
     const updatedAt = new Date().toISOString();
+    const hasErrorCodeOverride = Object.hasOwn(extra, "errorCode");
+    const errorCode = hasErrorCodeOverride ? extra.errorCode : current.errorCode;
     const event: StateEvent = {
       type: "state",
       id: current.id,
       state,
       updatedAt,
       attempts: extra.attempts ?? current.attempts,
-      ...(extra.errorCode ? { errorCode: extra.errorCode } : {}),
+      ...(errorCode ? { errorCode } : {}),
     };
     await this.appendEvent(routeId, event);
     return {
@@ -1000,11 +1089,12 @@ function hashRouteId(routeId: string): string {
  */
 function validateTransition(current: QueueItemState, next: QueueItemState): void {
   const allowed: Record<QueueItemState, QueueItemState[]> = {
-    queued: ["processing"],
-    processing: ["completed", "failed", "interrupted"],
+    queued: ["processing", "skipped"],
+    processing: ["completed", "failed", "interrupted", "skipped"],
     completed: [],
-    failed: ["queued"],
-    interrupted: ["queued"],
+    failed: ["queued", "skipped"],
+    interrupted: ["queued", "skipped"],
+    skipped: ["completed", "queued"],
   };
   if (!allowed[current].includes(next)) {
     throw new DurableQueueError(
@@ -1025,11 +1115,32 @@ function isQueueItemState(value: unknown): value is QueueItemState {
     value === "processing" ||
     value === "completed" ||
     value === "failed" ||
-    value === "interrupted";
+    value === "interrupted" ||
+    value === "skipped";
 }
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error("未知 queue 处理错误。");
+}
+
+/**
+ * 将处理异常转换为可持久化的稳定错误码。
+ *
+ * 优先使用异常自带的 `code` 字段 (如 iLink 的 session_expired / api_error),
+ * 以便事后能区分“回复投递失败”和“Pi turn 失败”; 都没有时退回异常类型名。
+ *
+ * @param error 处理阶段抛出的异常。
+ * @returns 只含字母数字下划线点的错误码。
+ */
+function describeFailureCode(error: unknown): string {
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(code)) {
+      return code;
+    }
+    return error.name;
+  }
+  return "UnknownError";
 }
 
 /**
