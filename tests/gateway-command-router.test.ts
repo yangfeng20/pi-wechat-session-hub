@@ -172,7 +172,7 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
         timestamp: new Date().toISOString(),
         message: {
           role: "assistant",
-          content: [{ type: "thinking", thinking: "隐藏推理" }, { type: "text", text: `测试回复: 重试这条普通 prompt\n${"较长的回复内容。".repeat(100)}` }],
+          content: [{ type: "thinking", thinking: "隐藏推理" }, { type: "text", text: `测试回复: 重试这条普通 prompt\n${"较长的回复内容。".repeat(4000)}\n末尾结论标记` }],
           timestamp: Date.now(),
         },
       },
@@ -194,10 +194,13 @@ test("Gateway router 串行处理命令和 prompt, 并维护 route 与 session o
     assert.equal(resumed.state, "completed");
     assert.equal((await registry.readSnapshot()).routes["wx-user-1"].sessionId, sessionId);
     const resumeReply = sentReplies.at(-1)?.text ?? "";
-    assert.match(resumeReply, /最近一次回复（节选）/);
-    assert.match(resumeReply, /测试回复: 重试这条普通 prompt/);
+    assert.match(resumeReply, /最近一次回复（末段节选）/);
+    assert.match(resumeReply, /末尾结论标记/, "应当保留回复结尾");
     assert.match(resumeReply, /完整回复仍保留在会话记录中/);
-    assert.ok(Array.from(resumeReply).length < 1000);
+    assert.ok(
+      Buffer.byteLength(resumeReply, "utf8") <= 16500,
+      "恢复预览必须能装进单条 iLink 消息的字节预算",
+    );
     assert.doesNotMatch(resumeReply, /这是更早的回复|隐藏推理/);
   } finally {
     if (sessionId) {
@@ -1002,10 +1005,14 @@ test("/last 在单条消息超过尾部窗口时仍能取到最近一轮", async
     const reply = replies.at(-1) ?? "";
     assert.match(reply, /超大记录会话/);
     assert.match(reply, /请阅读这段超大内容/);
-    assert.match(reply, /开头标记/);
-    assert.match(reply, /AI（节选）/);
-    assert.match(reply, /完整内容仍在会话记录中/);
-    assert.ok(Array.from(reply).length < 2000, "回复必须能装进单条 iLink 文本");
+    assert.match(reply, /结尾标记/, "应当保留回复结尾而不是开头");
+    assert.doesNotMatch(reply, /开头标记/, "超长回复的开头应被截断");
+    assert.match(reply, /AI（末段节选）/);
+    assert.match(reply, /以上为结尾 3800 字/);
+    assert.ok(
+      Buffer.byteLength(reply, "utf8") <= 16500,
+      "回复必须能装进单条 iLink 消息的字节预算",
+    );
   } finally {
     await lease.release();
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -1075,6 +1082,125 @@ test("失败消息被跳过时向微信回提示, 且后续消息照常处理", 
     assert.ok(statusReply);
     assert.match(statusReply!.text, /已跳过：1 条/);
     assert.match(statusReply!.text, /wx-broken-1/);
+  } finally {
+    await lease.release();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("任何回复都必须压到单条 iLink 消息的安全长度内, 不触发多 item 切分", async () => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-length-"));
+  const projectRoot = join(temporaryDirectory, "projects");
+  const projectPath = join(projectRoot, "demo");
+  await mkdir(projectPath, { recursive: true });
+  const configStore = new ConfigurationStore(join(temporaryDirectory, "manager.json"));
+  await configStore.update((config) => ({
+    ...config,
+    allowedProjectRoots: [projectRoot],
+    wechat: { ...config.wechat, authorizedUserId: "wx-length-route" },
+  }));
+  const projectService = new ProjectService(configStore);
+  await projectService.add("demo", "测试项目", projectPath);
+  const managerDirectory = join(temporaryDirectory, "manager-data");
+  const lease = await GatewayLease.acquire(managerDirectory);
+  const registry = new ManagerRegistry(managerDirectory, lease);
+  const queue = new DurableMessageQueue(managerDirectory, lease);
+  const replies: string[] = [];
+  const router = new GatewayCommandRouter({
+    configStore,
+    projectService,
+    workerManager: {
+      prompt: async () => `超长回复开头\n${"长内容。".repeat(2000)}\n超长回复结尾`,
+      resume: async () => ({ sessionId: "huge-session" }),
+    } as unknown as GatewayWorkerService,
+    registry,
+    queue,
+    lease,
+    replySink: async (_routeId, _messageId, text) => {
+      replies.push(text);
+    },
+  });
+
+  try {
+    const sessionFile = join(temporaryDirectory, "huge-session.jsonl");
+    await writeFile(sessionFile, [
+      JSON.stringify({ type: "session", version: 3, id: "huge-session", cwd: projectPath }),
+      JSON.stringify({
+        type: "message",
+        id: "huge-user-1",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        message: { role: "user", content: [{ type: "text", text: "提".repeat(5000) }] },
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "huge-assistant-1",
+        parentId: "huge-user-1",
+        timestamp: new Date().toISOString(),
+        message: { role: "assistant", content: [{ type: "text", text: "回".repeat(20000) }] },
+      }),
+    ].join("\n") + "\n", "utf8");
+    const indexed = await registry.upsertSession({
+      sessionId: "huge-session",
+      sessionFile,
+      cwd: projectPath,
+      projectAlias: "demo",
+      name: "超长会话",
+      mode: "background",
+      state: "active",
+      lastActivityAt: new Date().toISOString(),
+    });
+    await registry.upsertInstance({
+      instanceId: "huge-owner",
+      pid: process.pid,
+      processBirthId: `${process.pid}:huge-length-test`,
+      sessionId: indexed.sessionId,
+      sessionFile,
+      cwd: projectPath,
+      projectAlias: "demo",
+      mode: "background",
+      state: "idle",
+      heartbeatAt: new Date().toISOString(),
+    });
+    await registry.setRoute("wx-length-route", {
+      sessionId: indexed.sessionId,
+      workerInstanceId: "huge-owner",
+      generation: 1,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const lastResult = await router.receive({
+      messageId: "wx-length-last",
+      senderId: "wx-length-route",
+      text: "/last",
+    });
+    assert.equal(lastResult.state, "completed");
+
+    const resumeResult = await router.receive({
+      messageId: "wx-length-resume",
+      senderId: "wx-length-route",
+      text: "/resume 1",
+    });
+    assert.equal(resumeResult.state, "completed");
+
+    const promptResult = await router.receive({
+      messageId: "wx-length-prompt",
+      senderId: "wx-length-route",
+      text: "生成超长回复",
+    });
+    assert.equal(promptResult.state, "completed");
+
+    assert.equal(replies.length, 3);
+    for (const reply of replies) {
+      // iLink 只接受单 text_item, 且请求体超过约 16800 字节会被服务端拒绝,
+      // 所以每条回复都必须落在 16500 字节预算内 (留余量)。
+      const bytes = Buffer.byteLength(reply, "utf8");
+      assert.ok(
+        bytes <= 16500,
+        `回复 ${bytes} 字节超过单条 iLink 消息预算, 会被服务端以 ret=-2 拒绝`,
+      );
+    }
+    assert.match(replies.at(-1) ?? "", /已截断/, "超长回复应明确提示已截断");
   } finally {
     await lease.release();
     await rm(temporaryDirectory, { recursive: true, force: true });

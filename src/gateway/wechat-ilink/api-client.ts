@@ -239,28 +239,31 @@ export class IlinkApiClient {
     if (!text.trim()) {
       throw new IlinkApiError("invalid_response", "不能发送空的 iLink 文本消息。");
     }
-    if (Array.from(text).length > 32000) {
+    // iLink 只接受单 text_item 消息: 实测 item_list 含 2 项时即使总长只有 30 字
+    // 也会返回 ret=-2 prepare failed, 所以绝不拆分正文。
+    const body = {
+      msg: {
+        from_user_id: "",
+        to_user_id: recipientId,
+        client_id: clientId,
+        message_type: 2,
+        message_state: 2,
+        context_token: contextToken,
+        item_list: [{ type: 1, text_item: { text } }],
+      },
+      base_info: { channel_version: this.channelVersion },
+    };
+    const bodyBytes = Buffer.byteLength(JSON.stringify(body), "utf8");
+    if (bodyBytes > MAX_SENDMESSAGE_BODY_BYTES) {
       throw new IlinkApiError(
         "message_too_long",
-        "iLink 回复超过单次 sendmessage 的 32000 字符上限。",
+        `iLink 回复请求体 ${bodyBytes} 字节, 超过实测上限 ${MAX_SENDMESSAGE_BODY_BYTES} 字节。`,
       );
     }
-    const textItems = splitTextItems(text, 2000);
 
     const response = await this.post<Record<string, unknown>>(
       "sendmessage",
-      {
-        msg: {
-          from_user_id: "",
-          to_user_id: recipientId,
-          client_id: clientId,
-          message_type: 2,
-          message_state: 2,
-          context_token: contextToken,
-          item_list: textItems.map((textItem) => ({ type: 1, text_item: { text: textItem } })),
-        },
-        base_info: { channel_version: this.channelVersion },
-      },
+      body,
       this.apiTimeoutMs,
     );
     this.assertApiSuccess(
@@ -364,20 +367,13 @@ export class IlinkApiClient {
 }
 
 /**
- * 将回复文本切分为多个 text item, 由单次 sendmessage 顺序提交。
+ * 单次 `sendmessage` 请求体的最大 UTF-8 字节数。
  *
- * @param text 回复正文。
- * @param maxChars 每个 text item 的最大 Unicode 字符数。
- * @returns 有序文本片段列表。
+ * 2026-11-11 用真实 iLink 服务端二分实测: 16791 字节时返回成功,
+ * 16926 字节时返回 `ret=-2`. 这里取 16500 字节保留余量。
+ * 注意限制的是字节数而非字符数, 一个汉字占 3 字节。
  */
-function splitTextItems(text: string, maxChars: number): string[] {
-  const characters = Array.from(text);
-  const chunks: string[] = [];
-  for (let offset = 0; offset < characters.length; offset += maxChars) {
-    chunks.push(characters.slice(offset, offset + maxChars).join(""));
-  }
-  return chunks;
-}
+const MAX_SENDMESSAGE_BODY_BYTES = 16500;
 
 /**
  * 为每次 iLink 请求生成随机 X-WECHAT-UIN。

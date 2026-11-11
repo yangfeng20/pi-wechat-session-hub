@@ -21,7 +21,7 @@ async function createIlinkFixture(): Promise<{ directory: string; lease: Gateway
   return { directory, lease: await GatewayLease.acquire(directory) };
 }
 
-test("iLink client 使用协议头、context_token 和单次请求多 text item", async () => {
+test("iLink client 使用协议头、context_token, 且正文始终只发单 text item", async () => {
   const requests: Array<{ url: string; init: RequestInit }> = [];
   const fetcher: typeof fetch = async (input, init) => {
     requests.push({ url: String(input), init: init ?? {} });
@@ -33,7 +33,7 @@ test("iLink client 使用协议头、context_token 和单次请求多 text item"
   });
   const contextToken = "context-token-only-for-test";
 
-  await client.sendText("wx-user-1", `${"A".repeat(2000)}${"B".repeat(501)}`, contextToken, "stable-client-id");
+  await client.sendText("wx-user-1", "A".repeat(3000), contextToken, "stable-client-id");
 
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, "https://ilinkai.weixin.qq.com/ilink/bot/sendmessage");
@@ -60,7 +60,10 @@ test("iLink client 使用协议头、context_token 和单次请求多 text item"
   assert.equal(body.msg.message_type, 2);
   assert.equal(body.msg.message_state, 2);
   assert.equal(body.msg.context_token, contextToken);
-  assert.deepEqual(body.msg.item_list.map((item) => item.text_item.text.length), [2000, 501]);
+  // 实测 iLink 只接受单 text_item, 多个 item 会返回 ret=-2 prepare failed,
+  // 因此正文不允许被拆分成多段。
+  assert.equal(body.msg.item_list.length, 1, "正文必须始终是单个 text_item");
+  assert.equal(body.msg.item_list[0].text_item.text, "A".repeat(3000));
 });
 
 test("iLink getconfig/sendtyping 获取 ticket 并发出 begin/end 状态", async () => {

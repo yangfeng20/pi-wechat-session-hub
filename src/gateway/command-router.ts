@@ -295,7 +295,12 @@ export class GatewayCommandRouter {
       try {
         const reply = await this.processQueueItem(routeId, item, config);
         if (this.replySink) {
-          await this.replySink(routeId, item.messageId, reply, item.replyContext);
+          await this.replySink(
+            routeId,
+            item.messageId,
+            truncateToSingleMessage(reply),
+            item.replyContext,
+          );
         }
         return reply;
       } finally {
@@ -646,9 +651,11 @@ export class GatewayCommandRouter {
     if (!latestAssistantText) {
       return confirmation;
     }
-    const preview = truncateResumeAssistantText(latestAssistantText);
-    return `${confirmation}\n\n最近一次回复${preview.truncated ? "（节选）" : ""}：\n${preview.text}${
-      preview.truncated ? "\n\n[内容较长, 完整回复仍保留在会话记录中。]" : ""
+    const preview = truncateTail(latestAssistantText, RESUME_ASSISTANT_TEXT_LIMIT);
+    return `${confirmation}\n\n最近一次回复${preview.truncated ? "（末段节选）" : ""}：\n${preview.text}${
+      preview.truncated
+        ? `\n\n[回复较长, 以上为结尾 ${RESUME_ASSISTANT_TEXT_LIMIT} 字; 完整回复仍保留在会话记录中。]`
+        : ""
     }`;
   }
 
@@ -701,14 +708,16 @@ export class GatewayCommandRouter {
 
     const body: string[] = [];
     if (turn.userText) {
-      const userPreview = truncateTurnText(turn.userText);
+      const userPreview = truncateHead(turn.userText, LAST_USER_TEXT_LIMIT);
       body.push(`你：\n${userPreview.text}`, ...(userPreview.truncated ? ["[提问较长, 已截断。]"] : []));
     }
     if (turn.assistantText) {
-      const assistantPreview = truncateTurnText(turn.assistantText);
+      const assistantPreview = truncateTail(turn.assistantText, LAST_ASSISTANT_TEXT_LIMIT);
       body.push(
-        `AI${assistantPreview.truncated ? "（节选）" : ""}：\n${assistantPreview.text}`,
-        ...(assistantPreview.truncated ? ["[回复较长, 完整内容仍在会话记录中。]"] : []),
+        `AI${assistantPreview.truncated ? "（末段节选）" : ""}：\n${assistantPreview.text}`,
+        ...(assistantPreview.truncated
+          ? [`[回复较长, 以上为结尾 ${LAST_ASSISTANT_TEXT_LIMIT} 字; 完整内容仍保留在会话记录中。]`]
+          : []),
       );
     } else {
       body.push("AI：尚未产生回复。");
@@ -987,8 +996,35 @@ export class GatewayCommandRouter {
 }
 
 const SESSION_TITLE_LIMIT = 32;
-const RESUME_ASSISTANT_TEXT_LIMIT = 800;
-const LAST_TURN_TEXT_LIMIT = 600;
+
+/**
+ * 单条 iLink 消息的 JSON 请求体安全上限 (字节)。
+ *
+ * 2026-11-11 用真实 iLink 服务端二分实测: `sendmessage` 的 body 在
+ * 16791 字节时成功, 16926 字节时返回 `ret=-2`. 这里取 15000 字节并保留
+ * 约 1800 字节余量, 容忍 base_info 字段或服务端额外校验的变化。
+ *
+ * 注意限制的是 **UTF-8 字节数** 而非字符数: 一个汉字占 3 字节, ASCII 占
+ * 1 字节, 所以同一个字节预算下中文比英文能装的字数少得多。
+ */
+const MAX_SINGLE_MESSAGE_BYTES = 15000;
+
+/**
+ * iLink 单条消息里 `item_list` 只能是 1 个元素。
+ *
+ * 实测 2 个 item 时即使总长只有 30 字也会返回 `ret=-2 prepare failed`,
+ * 因此任何回复都必须压到单 item 可容纳的字节预算内。
+ */
+const MAX_SINGLE_MESSAGE_ITEMS = 1;
+
+/**
+ * 截断提示占用的字节预算, 从总预算中预先扣除。
+ */
+const TRUNCATION_NOTICE = "\n\n[回复过长, 已截断。]";
+
+const RESUME_ASSISTANT_TEXT_LIMIT = 3800;
+const LAST_USER_TEXT_LIMIT = 1200;
+const LAST_ASSISTANT_TEXT_LIMIT = 3800;
 const TAIL_READ_BYTES = 256 * 1024;
 const TAIL_READ_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -1193,18 +1229,42 @@ function formatLocalMinute(isoTimestamp: string): string {
 }
 
 /**
- * 将发往微信的最近一轮文本限制在固定长度内, 按 Unicode code point 截断。
+ * 将用户提问限制在固定长度内, 保留开头。
  *
- * @param text 原始消息文本。
+ * 提问通常开头就说明主题, 因此保留前段更利于判断“我在问什么”。
+ *
+ * @param text 原始提问文本。
+ * @param limit 最大 Unicode code point 数。
  * @returns 可安全发送的完整或截断文本。
  */
-function truncateTurnText(text: string): { text: string; truncated: boolean } {
+function truncateHead(text: string, limit: number): { text: string; truncated: boolean } {
   const characters = Array.from(text);
-  if (characters.length <= LAST_TURN_TEXT_LIMIT) {
+  if (characters.length <= limit) {
     return { text, truncated: false };
   }
   return {
-    text: characters.slice(0, LAST_TURN_TEXT_LIMIT).join(""),
+    text: characters.slice(0, limit).join(""),
+    truncated: true,
+  };
+}
+
+/**
+ * 将助手回复限制在固定长度内, 保留结尾。
+ *
+ * “最近聊到哪”的结论与下一步通常落在回复末尾, 因此保留后段更贴近
+ * 用户在手机上回顾上下文时的真实需求。
+ *
+ * @param text 原始回复文本。
+ * @param limit 最大 Unicode code point 数。
+ * @returns 可安全发送的完整或截断文本。
+ */
+function truncateTail(text: string, limit: number): { text: string; truncated: boolean } {
+  const characters = Array.from(text);
+  if (characters.length <= limit) {
+    return { text, truncated: false };
+  }
+  return {
+    text: characters.slice(-limit).join(""),
     truncated: true,
   };
 }
@@ -1393,21 +1453,52 @@ function normalizeAssistantText(text: string): string {
 }
 
 /**
- * 限制发往微信的恢复预览长度, 超长时保留开头内容.
+ * 将任意回复压到单条 iLink 消息能安全发送的字节预算内。
  *
- * @param text 最近一次 assistant 文本.
- * @returns 可安全发送的完整或截断文本.
+ * 这是发往微信前的最后一道保险. iLink 只接受单 `text_item` 消息且 body
+ * 总字节数有上限, 两者任一越界都会得到 `ret=-2` 并导致投递失败, 所以这
+ * 里按 UTF-8 字节数精确截断, 而不是按字符数估算。
+ *
+ * @param reply 即将发送的回复正文。
+ * @returns UTF-8 字节数在 {@link MAX_SINGLE_MESSAGE_BYTES} 以内的回复。
  */
-function truncateResumeAssistantText(text: string): { text: string; truncated: boolean } {
-  const characters = Array.from(text);
-  if (characters.length <= RESUME_ASSISTANT_TEXT_LIMIT) {
-    return { text, truncated: false };
+function truncateToSingleMessage(reply: string): string {
+  if (Buffer.byteLength(reply, "utf8") <= MAX_SINGLE_MESSAGE_BYTES) {
+    return reply;
   }
-  return {
-    text: characters.slice(0, RESUME_ASSISTANT_TEXT_LIMIT).join(""),
-    truncated: true,
-  };
+  const noticeBytes = Buffer.byteLength(TRUNCATION_NOTICE, "utf8");
+  const budget = Math.max(0, MAX_SINGLE_MESSAGE_BYTES - noticeBytes - REQUEST_ENVELOPE_BYTES);
+  return `${takeUtf8Prefix(reply, budget)}${TRUNCATION_NOTICE}`;
 }
+
+/**
+ * 按 UTF-8 字节预算截取字符串前缀, 不切断代理对与多字节字符。
+ *
+ * @param text 原始文本。
+ * @param maxBytes 最大 UTF-8 字节数。
+ * @returns 字节数不超过 maxBytes 的最长前缀。
+ */
+function takeUtf8Prefix(text: string, maxBytes: number): string {
+  let total = 0;
+  let result = "";
+  for (const character of text) {
+    const bytes = Buffer.byteLength(character, "utf8");
+    if (total + bytes > maxBytes) {
+      break;
+    }
+    total += bytes;
+    result += character;
+  }
+  return result;
+}
+
+/**
+ * 估算 `sendmessage` 请求中除正文外固定字段占用的字节数。
+ *
+ * 包括 JSON 结构、`context_token`、`recipientId` 与 `base_info` 等字段,
+ * 实测空消息体约 430 字节, 这里取略大的值以保安全。
+ */
+const REQUEST_ENVELOPE_BYTES = 600;
 
 /**
  * 清理标题中的控制字符并折叠空白, 保证每个会话只占一行。
