@@ -4,7 +4,14 @@ import type { WorkerInstanceRecord, SessionIndexRecord } from "../registry/types
 /**
  * 会话健康状态, 用于 /watch 总览。
  */
-export type HealthState = "starting" | "running" | "stopping" | "error" | "disconnected" | "idle";
+export type HealthState =
+  | "starting"
+  | "running"
+  | "stopping"
+  | "error"
+  | "disconnected"
+  | "interrupted"
+  | "idle";
 
 /**
  * 上游失败的归一化分类。
@@ -16,6 +23,7 @@ export type FailureKind =
   | "rate_limit"
   | "usage_limit"
   | "auth"
+  | "policy_blocked"
   | "service_unavailable"
   | "network"
   | "aborted"
@@ -32,6 +40,13 @@ export interface TurnFailure {
   resetAt?: string;
   /** 归一化前的原始错误前缀, 用于排查。 */
   raw: string;
+  /**
+   * 该失败发生的时刻, 取自 transcript 记录的 timestamp。
+   *
+   * 用于区分“当前故障”与“历史记录”: transcript 不会再变化, 若不看时间,
+   * 十几天前的一次失败会永久显示为异常。
+   */
+  detectedAt?: string;
 }
 
 /**
@@ -54,20 +69,60 @@ const TAIL_READ_MAX_BYTES = 2 * 1024 * 1024;
 const MAX_RAW_ERROR_CHARS = 200;
 
 /**
+ * 失败被视为“当前故障”的最大年龄, 超过后只当作历史记录。
+ *
+ * 取 24 小时: 足以覆盖一次夜间失败到次日晚间的排查窗口, 又不会让
+ * 早已结束的会话永久占据 /watch 的异常列表。
+ */
+export const FAILURE_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 判断一条失败记录是否已经超出“当前故障”的时间窗口。
+ *
+ * 缺少可信时间戳时一律视为未过期, 避免因为解析不到 timestamp 而漏报真实故障。
+ *
+ * @param failure 失败信息。
+ * @param nowMs 当前时间毫秒数。
+ * @param windowMs 判定窗口, 默认 {@link FAILURE_ACTIVE_WINDOW_MS}。
+ * @returns 已超出窗口返回 true。
+ */
+export function isFailureExpired(
+  failure: TurnFailure,
+  nowMs: number,
+  windowMs: number = FAILURE_ACTIVE_WINDOW_MS,
+): boolean {
+  if (!failure.detectedAt) {
+    return false;
+  }
+  const detectedMs = Date.parse(failure.detectedAt);
+  if (!Number.isFinite(detectedMs)) {
+    return false;
+  }
+  return nowMs - detectedMs > windowMs;
+}
+
+/**
  * 计算会话健康状态。
  *
  * 只使用 registry 中明确记录的 worker state, 不从静态 heartbeatAt 推断“卡住”:
  * heartbeatAt 只在状态变化时更新, 并非定时心跳, 用它判卡住会误报长时间运行的 turn。
  *
+ * 失败信息只在“确实需要用户处理”时才算异常:
+ *
+ * - `aborted` 表示用户主动中断, 不是故障, 归为已中断
+ * - 超出 {@link FAILURE_ACTIVE_WINDOW_MS} 的失败属于历史记录, 不再报异常
+ *
  * @param session 会话索引记录。
  * @param worker 该会话当前的 worker 实例, 可为空。
  * @param failure 最近一次 turn 的失败信息, 可为空。
+ * @param nowMs 当前时间毫秒数, 用于判定失败是否过期。
  * @returns 当前健康状态。
  */
 export function evaluateHealth(
   session: SessionIndexRecord,
   worker: WorkerInstanceRecord | undefined,
   failure: TurnFailure | undefined,
+  nowMs: number = Date.now(),
 ): { state: HealthState } {
   if (worker?.state === "stale") {
     return { state: "disconnected" };
@@ -81,7 +136,10 @@ export function evaluateHealth(
   if (worker?.state === "running") {
     return { state: "running" };
   }
-  if (failure) {
+  if (failure?.kind === "aborted") {
+    return { state: "interrupted" };
+  }
+  if (failure && !isFailureExpired(failure, nowMs)) {
     return { state: "error" };
   }
   if (!worker && session.state === "active") {
@@ -129,6 +187,16 @@ export function classifyFailure(errorMessage: string): TurnFailure {
   if (lowered.includes("not supported for this image model") || lowered.includes("complexity")) {
     return { kind: "unknown", summary: "模型不支持该请求参数", raw };
   }
+  // 上游把第三方客户端或账号合规拦截归在这里, 与网络/额度无关, 换模型或换账号才能解决。
+  if (
+    lowered.includes("request blocked") ||
+    lowered.includes("not allowed") ||
+    lowered.includes("violates") ||
+    lowered.includes("unsupported_country") ||
+    lowered.includes("account suspension")
+  ) {
+    return { kind: "policy_blocked", summary: "请求被上游合规策略拦截", raw };
+  }
   if (lowered.includes("auth_unavailable") || lowered.includes("unauthorized") || lowered.includes("401")) {
     return { kind: "auth", summary: "上游鉴权不可用", raw };
   }
@@ -175,8 +243,7 @@ export function extractResetTime(errorMessage: string): string | undefined {
  *
  * @param sessionFile Pi session 文件路径。
  * @returns 失败信息; 最后一条 assistant 正常结束或无法读取时返回 undefined。
- */
-export async function readLatestFailure(sessionFile: string): Promise<TurnFailure | undefined> {
+ */export async function readLatestFailure(sessionFile: string): Promise<TurnFailure | undefined> {
   const handle = await open(sessionFile, "r").catch(() => undefined);
   if (!handle) {
     return undefined;
@@ -235,15 +302,30 @@ function scanFailureLines(buffer: string): TurnFailure | undefined {
     }
     const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
     const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+    const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : undefined;
     if (errorMessage) {
-      return classifyFailure(errorMessage);
+      return withTimestamp(classifyFailure(errorMessage), timestamp);
     }
     if (stopReason === "error") {
-      return { kind: "unknown", summary: "上游返回错误但未提供详情", raw: "stopReason=error" };
+      return withTimestamp(
+        { kind: "unknown", summary: "上游返回错误但未提供详情", raw: "stopReason=error" },
+        timestamp,
+      );
     }
     return undefined;
   }
   return undefined;
+}
+
+/**
+ * 把 transcript 记录的 timestamp 附到失败信息上。
+ *
+ * @param failure 已分类的失败信息。
+ * @param timestamp transcript 条目上的时间戳。
+ * @returns 带 detectedAt 的新对象; 无可用时间戳时原样返回。
+ */
+function withTimestamp(failure: TurnFailure, timestamp: string | undefined): TurnFailure {
+  return timestamp ? { ...failure, detectedAt: timestamp } : failure;
 }
 
 /**
@@ -289,6 +371,8 @@ export function formatHealthState(state: HealthState): string {
       return "🔴 错误";
     case "disconnected":
       return "⚫ 断连";
+    case "interrupted":
+      return "⚪ 已中断";
     case "idle":
       return "⚪ 空闲";
   }

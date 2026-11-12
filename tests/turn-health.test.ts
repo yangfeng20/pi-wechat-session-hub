@@ -8,6 +8,8 @@ import {
   classifyFailure,
   evaluateHealth,
   extractResetTime,
+  FAILURE_ACTIVE_WINDOW_MS,
+  isFailureExpired,
   readLatestFailure,
 } from "../src/gateway/turn-health.ts";
 
@@ -161,4 +163,75 @@ test("健康状态只使用真实 worker state, 不把旧 heartbeat 误报成卡
 
 test("重置时间缺失时不误解析", () => {
   assert.equal(extractResetTime("429 TooManyRequests"), undefined);
+});
+
+test("用户主动中断不算故障", () => {
+  const failure = classifyFailure("Operation aborted");
+  assert.equal(failure.kind, "aborted");
+  assert.deepEqual(evaluateHealth(createSession({ state: "saved" }), undefined, failure), {
+    state: "interrupted",
+  });
+});
+
+test("超出时间窗口的失败归为历史记录, 不再报异常", () => {
+  const now = Date.parse("2026-11-11T12:00:00.000Z");
+  const fresh = { ...classifyFailure("429: rate limit"), detectedAt: "2026-11-11T11:00:00.000Z" };
+  const stale = { ...classifyFailure("429: rate limit"), detectedAt: "2026-10-30T03:28:08.176Z" };
+  assert.deepEqual(evaluateHealth(createSession({ state: "saved" }), undefined, fresh, now), {
+    state: "error",
+  });
+  assert.deepEqual(evaluateHealth(createSession({ state: "saved" }), undefined, stale, now), {
+    state: "idle",
+  });
+});
+
+test("缺少时间戳的失败视为未过期, 避免漏报真实故障", () => {
+  const failure = classifyFailure("429: rate limit");
+  assert.equal(failure.detectedAt, undefined);
+  assert.equal(isFailureExpired(failure, Date.now()), false);
+  assert.deepEqual(evaluateHealth(createSession({ state: "saved" }), undefined, failure), {
+    state: "error",
+  });
+});
+
+test("时间窗口边界", () => {
+  const now = Date.parse("2026-11-11T12:00:00.000Z");
+  const exactly = { ...classifyFailure("boom"), detectedAt: new Date(now - FAILURE_ACTIVE_WINDOW_MS).toISOString() };
+  const justOver = {
+    ...classifyFailure("boom"),
+    detectedAt: new Date(now - FAILURE_ACTIVE_WINDOW_MS - 1000).toISOString(),
+  };
+  assert.equal(isFailureExpired(exactly, now), false);
+  assert.equal(isFailureExpired(justOver, now), true);
+});
+
+test("上游合规拦截归类为 policy_blocked", () => {
+  const failure = classifyFailure(
+    '400 {"error":{"type":"<nil>","message":"Request blocked: Unofficial Claude Code clone tools (OpenCode/RooCode/KiloCode/Clawdbot/etc.) are not allowed. This usage violates Anthropic\'s terms and may result in account suspension."},"type":"error"}',
+  );
+  assert.equal(failure.kind, "policy_blocked");
+  assert.equal(failure.summary, "请求被上游合规策略拦截");
+});
+
+test("readLatestFailure 会带上 transcript 时间戳", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-wechat-turn-health-"));
+  const sessionFile = join(directory, "session.jsonl");
+  const entries = [
+    {
+      type: "message",
+      id: "assistant-aborted",
+      parentId: "user-1",
+      timestamp: "2026-11-11T09:49:31.856Z",
+      message: { role: "assistant", content: [], stopReason: "aborted", errorMessage: "Operation aborted" },
+    },
+  ];
+  await writeFile(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+  try {
+    const failure = await readLatestFailure(sessionFile);
+    assert.ok(failure);
+    assert.equal(failure.kind, "aborted");
+    assert.equal(failure.detectedAt, "2026-11-11T09:49:31.856Z");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

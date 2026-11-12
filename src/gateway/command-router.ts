@@ -690,17 +690,20 @@ export class GatewayCommandRouter {
     const stoppingCount = healthRows.filter((row) => row.state === "stopping").length;
     const disconnectedCount = healthRows.filter((row) => row.state === "disconnected").length;
     const idleCount = healthRows.filter((row) => row.state === "idle").length;
+    const interruptedCount = healthRows.filter((row) => row.state === "interrupted").length;
     const summary = [
       `**总览** · ${healthRows.length} 个会话`,
       `${runningCount} 运行中`,
       ...(startingCount ? [`${startingCount} 启动中`] : []),
       `${errorCount + disconnectedCount + stoppingCount} 异常`,
+      ...(interruptedCount ? [`${interruptedCount} 已中断`] : []),
       `${idleCount} 空闲`,
     ].join(" · ");
 
+    // 已中断属于用户自己的操作遗留, 不构成待处理事项, 默认与空闲会话一起收起。
     const visibleRows = all
       ? healthRows
-      : healthRows.filter((row) => row.state !== "idle");
+      : healthRows.filter((row) => row.state !== "idle" && row.state !== "interrupted");
     if (visibleRows.length === 0) {
       return [
         summary,
@@ -737,7 +740,10 @@ export class GatewayCommandRouter {
               const recovery = !row.worker || row.worker.state === "stale"
                 ? `; 可发送 \`/resume ${index}\` 重连`
                 : "";
-              return `- **${index} ${title}**：${formatFailureSummary(row.failure)}${recovery}`;
+              const when = row.failure.detectedAt
+                ? `（${formatLocalMinute(row.failure.detectedAt)}）`
+                : "";
+              return `- **${index} ${title}**：${formatFailureSummary(row.failure)}${when}${recovery}`;
             }
             if (row.state === "disconnected") {
               const failureNote = row.failure ? `; ${formatFailureSummary(row.failure)}` : "";

@@ -6,6 +6,32 @@
 
 暂无.
 
+## [0.1.3] - 2026-11-11
+
+本版修复 `/watch` 会话健康总览的误报: 用户主动中断与历史遗留失败被长期当作「需要处理」的异常.
+
+### 修复
+
+- **`/watch` 把用户主动中断当成错误**
+  - transcript 中 `stopReason: aborted` / `errorMessage: Operation aborted` 表示用户自己按了中断, 属于正常操作痕迹, 但原逻辑只看到 `errorMessage` 非空就判为失败, 结果在总览里永久显示错误并进入「需要处理」列表
+  - 新增 `interrupted` 状态: 主动中断显示为「已中断」, 默认与空闲会话一起收起, `--all` 仍可查看
+  - 实测样本: 本机 248 个会话中有 3 个属于此类误报
+- **历史遗留失败被当作当前故障**
+  - 健康状态由 transcript 最后一条 assistant 记录推导, 而 transcript 不会再变化, 因此一个多月前的一次失败会每天出现在「需要处理」里
+  - 失败信息现在带上 transcript 条目的 `timestamp`(`detectedAt`), 超过 24 小时的失败视为历史记录, 不再报异常; 「需要处理」列表同时显示失败发生时间
+  - 缺少可信时间戳时按未过期处理, 避免因解析不到时间而漏报真实故障
+- **上游合规拦截被归为「未知错误」**
+  - 新增 `policy_blocked` 分类, 识别 `Request blocked` / `are not allowed` / `violates` / `account suspension` 等文本, 显示为「请求被上游合规策略拦截」, 便于判断应该换模型或换账号, 而不是当成偶发故障重试
+
+### 测试
+
+- 新增主动中断不算故障、时间窗口生效与边界、缺少时间戳不漏报、合规拦截分类、`readLatestFailure` 带时间戳等用例
+- 全量测试 134 条, 131 通过 / 0 失败 / 3 跳过
+
+### 升级提示
+
+- 升级后需重启 Pi TUI, 让新的健康判定生效
+
 ## [0.1.2] - 2026-11-11
 
 本版核心是**修复 npm 安装场景下后台服务无法启动**, 并新增 Windows 登录后自动启动、会话健康总览, 以及一批微信端展示修复.
@@ -89,7 +115,8 @@
 - 授权根目录白名单与 fail-closed 命令处理
 - AGPL-3.0 许可证与安装文档
 
-[未发布]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.2...HEAD
+[未发布]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yangfeng20/pi-wechat-session-hub/releases/tag/v0.1.0

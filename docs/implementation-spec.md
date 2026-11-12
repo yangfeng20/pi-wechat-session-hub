@@ -95,7 +95,9 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 
 `/sessions` 默认状态为 `active`, active 集合由当前 UI 和 background owner 共同构成. 需要查看已保存/待启动 session 时可使用 `--state all` 或相应过滤项. 一次回复列出全部匹配会话, 每个会话展示稳定索引、标题、项目、模式和状态; 当前微信 route 在会话项和列表摘要中标记. 标题优先使用 session name, 未命名时读取 Pi `/resume` 同样采用的首条 user 文本, 并在 32 个 Unicode 字符后以 `...` 省略. 微信命令帮助按会话、项目和 Hub 状态分组; `/status` 使用中文状态和会话摘要, 不显示 PID. 空闲会话的 `/resume` 回复附带最近 assistant 文本预览, 最多 800 个 Unicode 字符, 超长时明确提示剩余内容仍保留在 transcript.
 
-`/watch` 默认只显示运行中、启动中、错误和断连的会话; `--all` 加入空闲会话. 健康状态读取 worker registry, 错误分类读取每个 Pi transcript 最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 不调用模型也不更改 session. 当前 worker 心跳不是定时刷新, 因此不据此推断 turn 卡住. `/last` 遇到最近一轮 assistant 错误时显示错误摘要 (例如额度耗尽及上游提供的重置时间), 不再显示“尚未产生回复”。
+`/watch` 默认只显示运行中、启动中、错误和断连的会话; `--all` 加入空闲会话. 健康状态读取 worker registry, 错误分类读取每个 Pi transcript 最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 不调用模型也不更改 session. 当前 worker 心跳不是定时刷新, 因此不据此推断 turn 卡住.
+
+失败只在“确实需要用户处理”时算异常: 用户主动中断(`aborted`)归为「已中断」并从默认视图收起; 失败时间取自 transcript 条目的 `timestamp`, 超过 24 小时视为历史记录, 不再报异常. 缺少可信时间戳时按未过期处理, 避免漏报真实故障. `/last` 遇到最近一轮 assistant 错误时显示错误摘要 (例如额度耗尽及上游提供的重置时间), 不再显示“尚未产生回复”。
 
 `SessionIndexRecord.publicIndex` 在首次写入时分配, 旧 registry 首次读取时按最近活动时间排序迁移. 索引持久保存, 不随列表排序变化; app 不主动删除旧 session 索引, 新会话递增分配. `session-index.json` 的 UUID 仍仅供内部关联使用.
 
