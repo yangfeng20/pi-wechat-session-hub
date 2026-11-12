@@ -6,6 +6,34 @@
 
 暂无.
 
+## [0.1.4] - 2026-11-12
+
+本版重做 `/watch` 会话健康总览: 默认视图改为「当前打开着的会话」, 并新增「最后提问」列.
+
+### 改进
+
+- **`/watch` 默认视图改为按「是否还开在后台」筛选**
+  - 原规则按会话状态筛选(非空闲), 结果是 256 个会话里有 250 个长期空闲的历史会话被藏起来, 而真正开在后台但刚跑完的会话(worker 状态 idle)反而看不见
+  - 改为按 registry 中是否还有 worker 实例判断: 有 worker = 当前可操作, 直接展示, 不论 running 还是 idle; 异常与断连会话始终展示
+  - 汇总行改为「打开 N 个（共 M）」, 不再用总数误导; 页尾补充「共 M 个会话, 发 `/watch --all` 查看全部」
+  - 实测本机: 默认视图从 2 行变为 7 行, 正好对应当前开着的 7 个会话
+- **新增「最后提问」列, 取代会话标题**
+  - 取 transcript 中最后一条 user 消息, 即你自己最后一句话, 比会话标题更能帮助回忆起该会话在干什么
+  - 超长内容按 Unicode code point 截断到 22 字并加省略号, 避免手机端横向滚动
+  - 仅对会被展示的行读取, 不为几百个历史会话做无意义 IO
+  - 读取采用与 `readLatestFailure` 相同的动态扩窗策略(64KB → 2MB): 长会话中最后一条用户消息会被大量 assistant 输出挤出初始窗口, 固定窗口会误报「暂无提问」
+- **活动时间改为相对描述**: `2026-11-12 14:54` 改为 `14m` / `2h` / `1d`, 手机上无需心算
+- 移除表格中的 PID 列(手机端无用且撑宽), 需要诊断时用 `/wx status`
+
+### 测试
+
+- 更新 `/watch` 用例: 断言默认视图按 worker 实例筛选、展示最后提问而非会话标题、`--all` 不再输出分页提示
+- 全量测试 134 条, 131 通过 / 0 失败 / 3 跳过
+
+### 升级提示
+
+- 升级后需重启 Pi TUI 并执行 `/wx restart`, 否则 daemon 仍跑旧代码
+
 ## [0.1.3] - 2026-11-11
 
 本版修复 `/watch` 会话健康总览的误报: 用户主动中断与历史遗留失败被长期当作「需要处理」的异常.
@@ -115,7 +143,8 @@
 - 授权根目录白名单与 fail-closed 命令处理
 - AGPL-3.0 许可证与安装文档
 
-[未发布]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.3...HEAD
+[未发布]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.0...v0.1.1

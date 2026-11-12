@@ -23,6 +23,8 @@ import { UiWorkerManagerError } from "../runtime/ui-worker-manager.ts";
 import {
   evaluateHealth,
   formatHealthState,
+  formatRelativeAge,
+  readLastUserQuestion,
   readLatestFailure,
   classifyFailure,
   type SessionHealth,
@@ -641,10 +643,12 @@ export class GatewayCommandRouter {
   /**
    * 展示所有受管会话的运行与错误总览。
    *
-   * 默认只展示运行中、启动中、异常或断连的会话; `--all` 会包含空闲会话。
-   * 失败原因直接从 Pi transcript 最后一条 assistant 记录读取, 不触发模型请求。
+   * 默认只显示「打开着」的会话(有 worker 实例)与异常会话; 纯历史会话需要
+   * `--all` 才展开。这样总览才对应「当前能操作的会话」, 而不会被上百个
+   * 早已关闭的历史会话淹没。
+   * 失败原因与最后提问都直接从 transcript 读取, 不触发模型请求。
    *
-   * @param all 是否包含空闲会话。
+   * @param all 是否包含全部历史会话。
    * @param config 当前配置快照。
    * @returns markdown 总览表格。
    */
@@ -664,71 +668,81 @@ export class GatewayCommandRouter {
       return "尚无已登记会话。";
     }
 
-    const healthRows: Array<SessionHealth & { title: string; projectName: string }> = await Promise.all(
-      sessions.map(async (session) => {
-        const worker = workersBySession.get(session.sessionId);
-        const failure = await readLatestFailure(session.sessionFile);
-        const { state } = evaluateHealth(session, worker, failure);
-        const title = await resolveSessionTitle(session);
-        const projectName = Object.hasOwn(config.projects, session.projectAlias)
-          ? config.projects[session.projectAlias].displayName
-          : session.projectAlias;
-        return {
-          session,
-          ...(worker ? { worker } : {}),
-          state,
-          ...(failure ? { failure } : {}),
-          title,
-          projectName,
-        };
-      }),
-    );
+    const nowMs = Date.now();
+    const healthRows: Array<SessionHealth & { title: string; projectName: string; question?: string }> =
+      await Promise.all(
+        sessions.map(async (session) => {
+          const worker = workersBySession.get(session.sessionId);
+          const failure = await readLatestFailure(session.sessionFile);
+          const { state } = evaluateHealth(session, worker, failure, nowMs);
+          const title = await resolveSessionTitle(session);
+          const projectName = Object.hasOwn(config.projects, session.projectAlias)
+            ? config.projects[session.projectAlias].displayName
+            : session.projectAlias;
+          // 只有会被展示的行才读最后提问, 避免为几百个历史会话做无意义 IO。
+          const shown = all || worker !== undefined || state === "error" ||
+            state === "disconnected" || state === "starting" || state === "stopping";
+          const question = shown ? await readLastUserQuestion(session.sessionFile) : undefined;
+          return {
+            session,
+            ...(worker ? { worker } : {}),
+            state,
+            ...(failure ? { failure } : {}),
+            title,
+            projectName,
+            ...(question ? { question } : {}),
+          };
+        }),
+      );
 
-    const runningCount = healthRows.filter((row) => row.state === "running").length;
-    const startingCount = healthRows.filter((row) => row.state === "starting").length;
-    const errorCount = healthRows.filter((row) => row.state === "error").length;
-    const stoppingCount = healthRows.filter((row) => row.state === "stopping").length;
-    const disconnectedCount = healthRows.filter((row) => row.state === "disconnected").length;
-    const idleCount = healthRows.filter((row) => row.state === "idle").length;
-    const interruptedCount = healthRows.filter((row) => row.state === "interrupted").length;
+    // 打开着 = registry 中还有 worker 实例; 这是区分「当前可操作会话」与历史记录的唯一可靠依据。
+    const isOpen = (row: SessionHealth): boolean => row.worker !== undefined;
+    const isAbnormal = (row: SessionHealth): boolean =>
+      row.state === "error" || row.state === "disconnected" || row.state === "stopping";
+
+    const visibleRows = all ? healthRows : healthRows.filter((row) => isOpen(row) || isAbnormal(row));
+    const openRows = visibleRows.filter(isOpen);
+    const runningCount = openRows.filter((row) => row.state === "running").length;
+    const startingCount = openRows.filter((row) => row.state === "starting").length;
+    const stoppingCount = openRows.filter((row) => row.state === "stopping").length;
+    const idleCount = openRows.filter((row) => row.state === "idle") .length;
+    const errorCount = visibleRows.filter((row) => row.state === "error" || row.state === "disconnected").length;
+
+    const scope = all
+      ? `${healthRows.length} 个会话`
+      : `打开 ${openRows.length} 个（共 ${healthRows.length}）`;
     const summary = [
-      `**总览** · ${healthRows.length} 个会话`,
-      `${runningCount} 运行中`,
+      `**总览** · ${scope}`,
+      ...(runningCount ? [`${runningCount} 运行中`] : []),
       ...(startingCount ? [`${startingCount} 启动中`] : []),
-      `${errorCount + disconnectedCount + stoppingCount} 异常`,
-      ...(interruptedCount ? [`${interruptedCount} 已中断`] : []),
-      `${idleCount} 空闲`,
+      ...(stoppingCount ? [`${stoppingCount} 停止中`] : []),
+      ...(idleCount ? [`${idleCount} 空闲`] : []),
+      ...(errorCount ? [`🔴 ${errorCount} 异常`] : []),
     ].join(" · ");
 
-    // 已中断属于用户自己的操作遗留, 不构成待处理事项, 默认与空闲会话一起收起。
-    const visibleRows = all
-      ? healthRows
-      : healthRows.filter((row) => row.state !== "idle" && row.state !== "interrupted");
     if (visibleRows.length === 0) {
       return [
         summary,
-        "当前没有运行中或异常会话。",
+        "当前没有打开着或异常的会话。",
         "发送 `/watch --all` 查看全部会话。",
       ].join("\n\n");
     }
 
     const tableRows = visibleRows.map((row) => {
       const index = String(row.session.publicIndex ?? "?");
-      const title = escapeMarkdownTableCell(row.title);
+      const question = escapeMarkdownTableCell(truncateMiddle(row.question ?? "(暂无提问)", 22));
       const project = escapeMarkdownTableCell(row.projectName);
       const state = formatHealthState(row.state);
-      const lastActivity = formatLocalMinute(row.session.lastActivityAt);
-      return `| ${index} | ${title} | ${project} | ${state} | ${lastActivity} |`;
+      const activity = formatRelativeAge(row.session.lastActivityAt, nowMs);
+      return `| ${index} | ${question} | ${project} | ${state} | ${activity} |`;
     });
     const table = [
-      "| 索引 | 会话 | 项目 | 状态 | 最后活动 |",
+      "| 索引 | 最后提问 | 项目 | 状态 | 活动 |",
       "| --- | --- | --- | --- | --- |",
       ...tableRows,
     ].join("\n");
 
-    const attentionRows = visibleRows.filter((row) =>
-      row.state === "error" || row.state === "disconnected" || row.state === "stopping",
-    );
+    const attentionRows = visibleRows.filter(isAbnormal);
     const attention = attentionRows.length === 0
       ? []
       : [
@@ -753,7 +767,11 @@ export class GatewayCommandRouter {
           }),
         ];
 
-    return [summary, table, ...attention].join("\n\n");
+    const footnotes = all
+      ? []
+      : [`共 ${healthRows.length} 个会话，发 \`/watch --all\` 查看全部。`];
+
+    return [summary, table, ...attention, ...footnotes].join("\n\n");
   }
 
   /**
@@ -1421,6 +1439,24 @@ function truncateTail(text: string, limit: number): { text: string; truncated: b
     text: characters.slice(-limit).join(""),
     truncated: true,
   };
+}
+
+/**
+ * 按 Unicode code point 截断文本并在末尾加省略号。
+ *
+ * 用于总览表格中的「最后提问」列: 手机端表格宽度有限, 过长内容会把表格
+ * 撑到需要横向滚动。用 code point 切割避免拆坏 emoji。
+ *
+ * @param text 原始文本。
+ * @param limit 最大 code point 数, 超出时末尾追加省略号。
+ * @returns 可安全放进表格单元格的短文本。
+ */
+function truncateMiddle(text: string, limit: number): string {
+  const characters = Array.from(text);
+  if (characters.length <= limit) {
+    return text;
+  }
+  return `${characters.slice(0, limit).join("")}…`;
 }
 
 /**

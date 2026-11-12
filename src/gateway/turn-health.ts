@@ -329,6 +329,129 @@ function withTimestamp(failure: TurnFailure, timestamp: string | undefined): Tur
 }
 
 /**
+ * 从 session transcript 尾部读取最后一条 user 消息的文本。
+ *
+ * 用于 `/watch` 总览的「最后提问」列: 相比会话标题, 用户自己最后一句话
+ * 更能帮助回忆起这个会话在干什么。只读文件尾部有限窗口, 不扫全文。
+ *
+ * @param sessionFile Pi session 文件路径。
+ * @returns 清理过空白的提问文本; 无提问或无法读取时返回 undefined。
+ */
+export async function readLastUserQuestion(sessionFile: string): Promise<string | undefined> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(sessionFile, "r");
+    const { size } = await handle.stat();
+    if (size === 0) {
+      return undefined;
+    }
+    // 一条 turn 可能包含大量 assistant 工具输出, 把最后一条 user 消息挤到
+    // 初始窗口之外, 因此和 readLatestFailure 一样逐次扩大窗口直到找到为止。
+    let windowBytes = Math.min(size, TAIL_READ_BYTES);
+    for (;;) {
+      const start = size - windowBytes;
+      const chunk = Buffer.alloc(windowBytes);
+      await handle.read(chunk, 0, windowBytes, start);
+      const text = chunk.toString("utf8");
+      const buffer = start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
+      const question = scanLastUserQuestion(buffer);
+      if (question !== undefined) {
+        return question;
+      }
+      if (start === 0 || windowBytes >= TAIL_READ_MAX_BYTES) {
+        return undefined;
+      }
+      windowBytes = Math.min(size, windowBytes * 2);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close();
+  }
+}
+
+/**
+ * 在一段 transcript 文本中从后向前定位最后一条 user 消息的文本。
+ *
+ * @param buffer 已剔除尾部半行的 transcript 文本片段。
+ * @returns 提问文本; 未找到时返回 undefined。
+ */
+function scanLastUserQuestion(buffer: string): string | undefined {
+  const lines = buffer.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line.trim()) {
+      continue;
+    }
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line) as unknown;
+    } catch {
+      continue;
+    }
+    if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
+      continue;
+    }
+    if (entry.message.role !== "user") {
+      continue;
+    }
+    const question = extractMessageText(entry.message.content);
+    if (question) {
+      return question;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 从 message.content 中提取纯文本。
+ *
+ * content 两种形态都要兼容: 纯字符串, 或带 type 的内容块数组。
+ *
+ * @param content transcript 中记录的 message.content。
+ * @returns 合并空白后的文本; 无文本时返回 undefined。
+ */
+function extractMessageText(content: unknown): string | undefined {
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .filter((block): block is Record<string, unknown> => isRecord(block) && block.type === "text")
+      .map((block) => (typeof block.text === "string" ? block.text : ""))
+      .join(" ");
+  }
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+/**
+ * 将时间格式化为相对描述, 用于总览表格。
+ *
+ * @param isoTimestamp ISO 时间戳。
+ * @param nowMs 当前毫秒数。
+ * @returns 形如 `刚刚` / `5m` / `3h` / `2d` 的短文本。
+ */
+export function formatRelativeAge(isoTimestamp: string, nowMs: number = Date.now()): string {
+  const parsed = Date.parse(isoTimestamp);
+  if (!Number.isFinite(parsed)) {
+    return isoTimestamp;
+  }
+  const minutes = Math.floor((nowMs - parsed) / 60000);
+  if (minutes < 1) {
+    return "刚刚";
+  }
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h`;
+  }
+  return `${Math.floor(hours / 24)}d`;
+}
+
+/**
  * 将心跳年龄格式化为简短的中文描述。
  *
  * @param ageMs 距今毫秒数。

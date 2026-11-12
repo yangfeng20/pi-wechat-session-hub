@@ -1404,10 +1404,16 @@ test("/watch 总览运行、错误与空闲会话, /last 显示真实 429 错误
     assert.equal(watchResult.state, "completed");
     const watchText = replies.at(-1) ?? "";
     assert.match(watchText, /总览/);
-    assert.match(watchText, /运行会话/);
+    // 默认视图只展示「打开着」的会话(有 worker)与异常会话, 历史空会话不出现。
+    assert.match(watchText, /打开 2 个（共 3）/);
+    assert.match(watchText, /最后提问/);
+    // 「最后提问」列展示用户最后一句话, 比会话标题更能帮助回忆上下文。
+    assert.match(watchText, /检查额度/);
+    assert.match(watchText, /\(暂无提问\)/);
     assert.match(watchText, /🟢 运行中/);
-    assert.match(watchText, /额度错误会话/);
     assert.match(watchText, /🔴 错误/);
+    // 「需要处理」段仍用会话标题定位问题会话。
+    assert.match(watchText, /额度错误会话/);
     assert.match(watchText, /周额度已耗尽/);
     assert.match(watchText, /2026-11-16 00:00:00 \+0800 CST/);
     assert.doesNotMatch(watchText, /空闲会话/);
@@ -1418,7 +1424,9 @@ test("/watch 总览运行、错误与空闲会话, /last 显示真实 429 错误
       text: "/watch --all",
     });
     assert.equal(allResult.state, "completed");
-    assert.match(replies.at(-1) ?? "", /空闲会话/);
+    // --all 展开全部会话, 页面级提示不再出现。
+    assert.match(replies.at(-1) ?? "", /3 个会话/);
+    assert.doesNotMatch(replies.at(-1) ?? "", /查看全部/);
 
     const lastResult = await router.receive({
       messageId: "last-error",
