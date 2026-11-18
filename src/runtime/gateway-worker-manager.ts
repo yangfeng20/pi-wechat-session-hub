@@ -10,14 +10,15 @@ import { UiWorkerManager } from "./ui-worker-manager.ts";
 export interface GatewayWorkerService {
   startNew(projectAlias: string, name?: string, mode?: RuntimeMode): Promise<SessionIndexRecord>;
   resume(sessionId: string, mode?: RuntimeMode): Promise<SessionIndexRecord>;
-  prompt(sessionId: string, message: string): Promise<string>;
-  stop(sessionId: string, abortRunning?: boolean): Promise<void>;
+  prompt(sessionId: string, message: string, instanceId?: string): Promise<string>;
+  stop(sessionId: string, abortRunning?: boolean, instanceId?: string): Promise<void>;
+  getAvailableOwner?(sessionId: string, preferredInstanceId?: string): Promise<WorkerInstanceRecord | undefined>;
   stopAll(): Promise<void>;
   listSessions(): Promise<SessionIndexRecord[]>;
 }
 
 /**
- * 根据 registry owner mode 将 route 操作分发给 background 或 UI worker manager。
+ * 按微信 route 选中的 Pi runtime mode 将消息和生命周期操作分发给后台或 UI worker manager。
  */
 export class GatewayWorkerManager implements GatewayWorkerService {
   /**
@@ -53,7 +54,7 @@ export class GatewayWorkerManager implements GatewayWorkerService {
   }
 
   /**
-   * 按显式 mode 或当前活跃 owner 模式恢复 Pi session; 没有 UI owner 时恢复到后台。
+   * 绑定到已可用 runtime; 需要指定模式时启动或复用该模式的 runtime, 允许与其他 Pi runtime 并存。
    *
    * @param sessionId Pi session ID。
    * @param mode 可选强制恢复模式。
@@ -65,21 +66,14 @@ export class GatewayWorkerManager implements GatewayWorkerService {
     if (!session) {
       return this.background.resume(sessionId);
     }
-    const owner = findOwner(snapshot, sessionId);
-    const requestedMode = mode ?? (owner?.mode ?? "background");
-    if (owner) {
-      if (owner.mode === requestedMode && this.hasAvailableOwner(owner)) {
-        return session;
-      }
-      throw new BackgroundWorkerManagerError(
-        "session_owned_by_other_process",
-        `session ${sessionId} 当前由 ${owner.mode} runtime 持有; 先停止 owner 后再切换模式。`,
-      );
+    const availableOwner = await this.getAvailableOwner(sessionId);
+    const requestedMode = mode ?? availableOwner?.mode ?? "background";
+    if (availableOwner?.mode === requestedMode) {
+      return session;
     }
-    if (requestedMode === "ui") {
-      return this.ui.resume(sessionId);
-    }
-    return this.background.resume(sessionId);
+    return requestedMode === "ui"
+      ? this.ui.resume(sessionId)
+      : this.background.resume(sessionId);
   }
 
   /**
@@ -87,21 +81,20 @@ export class GatewayWorkerManager implements GatewayWorkerService {
    *
    * @param sessionId Pi session ID。
    * @param message 用户消息正文。
+   * @param instanceId 可选的指定路由 Pi runtime 实例 ID。
    * @returns 最终 assistant 回复文本。
    */
-  async prompt(sessionId: string, message: string): Promise<string> {
-    const snapshot = await this.registry.readSnapshot();
-    const owner = findOwner(snapshot, sessionId);
+  async prompt(sessionId: string, message: string, instanceId?: string): Promise<string> {
+    const owner = await this.getAvailableOwner(sessionId, instanceId);
     if (!owner) {
       throw new BackgroundWorkerManagerError(
         "worker_not_found",
-        `session ${sessionId} 当前没有活跃 Pi worker owner。`,
+        `session ${sessionId} 当前没有可用于微信路由的 Pi runtime。`,
       );
     }
-    if (owner.mode === "ui") {
-      return this.ui.prompt(sessionId, message);
-    }
-    return this.background.prompt(sessionId, message);
+    return owner.mode === "ui"
+      ? this.ui.prompt(sessionId, message, owner.instanceId)
+      : this.background.prompt(sessionId, message);
   }
 
   /**
@@ -109,19 +102,19 @@ export class GatewayWorkerManager implements GatewayWorkerService {
    *
    * @param sessionId Pi session ID。
    * @param abortRunning 是否明确允许 abort 正在运行的 turn。
+   * @param instanceId 可选的指定路由 Pi runtime 实例 ID。
    * @returns 无返回值。
    */
-  async stop(sessionId: string, abortRunning = false): Promise<void> {
-    const snapshot = await this.registry.readSnapshot();
-    const owner = findOwner(snapshot, sessionId);
+  async stop(sessionId: string, abortRunning = false, instanceId?: string): Promise<void> {
+    const owner = await this.getAvailableOwner(sessionId, instanceId);
     if (!owner) {
       throw new BackgroundWorkerManagerError(
         "worker_not_found",
-        `session ${sessionId} 当前没有活跃 Pi worker owner。`,
+        `session ${sessionId} 当前没有可停止的 Pi runtime。`,
       );
     }
     if (owner.mode === "ui") {
-      await this.ui.stop(sessionId, abortRunning);
+      await this.ui.stop(sessionId, abortRunning, owner.instanceId);
       return;
     }
     await this.background.stop(sessionId, abortRunning);
@@ -149,6 +142,33 @@ export class GatewayWorkerManager implements GatewayWorkerService {
   }
 
   /**
+   * 按首选实例或最近接入的可用 TUI 查找一个微信路由目标。
+   *
+   * @param sessionId Pi session ID。
+   * @param preferredInstanceId 可选的路由绑定实例 ID。
+   * @returns 可用路由目标; 没有可用实例时返回 undefined。
+   */
+  async getAvailableOwner(
+    sessionId: string,
+    preferredInstanceId?: string,
+  ): Promise<WorkerInstanceRecord | undefined> {
+    const snapshot = await this.registry.readSnapshot();
+    if (preferredInstanceId) {
+      const preferred = snapshot.instances[preferredInstanceId];
+      if (
+        preferred?.sessionId === sessionId &&
+        this.hasAvailableOwner(preferred)
+      ) {
+        return preferred;
+      }
+    }
+    const candidates = [...Object.values(snapshot.instances)].reverse().filter((instance) =>
+      instance.sessionId === sessionId && this.hasAvailableOwner(instance),
+    );
+    return candidates.find((instance) => instance.mode === "ui") ?? candidates[0];
+  }
+
+  /**
    * 判断 registry owner 是否由当前 Gateway manager 持有可用连接。
    *
    * @param instance worker owner 记录。
@@ -162,20 +182,4 @@ export class GatewayWorkerManager implements GatewayWorkerService {
       ? this.background.hasWorker(instance.sessionId)
       : this.ui.hasConnection(instance.instanceId);
   }
-}
-
-/**
- * 查找 session 当前唯一的活跃 registry owner。
- *
- * @param snapshot registry 快照。
- * @param sessionId Pi session ID。
- * @returns 非 stale/stopping owner 或 undefined。
- */
-function findOwner(
-  snapshot: Awaited<ReturnType<ManagerRegistry["readSnapshot"]>>,
-  sessionId: string,
-): WorkerInstanceRecord | undefined {
-  return Object.values(snapshot.instances).find((instance) =>
-    instance.sessionId === sessionId && instance.state !== "stale" && instance.state !== "stopping",
-  );
 }

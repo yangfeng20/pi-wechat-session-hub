@@ -85,7 +85,6 @@ export class UiWorkerManager {
       onRegister: (registration, authHash, launchRecord, connection) =>
         this.registerWorker(registration, authHash, launchRecord, connection),
       onWorkerEvent: (connection, name, data) => this.handleWorkerEvent(connection, name, data),
-      onRequest: (connection, method, params) => this.handleWorkerRequest(connection, method, params),
       onDisconnect: (connection, serverStopping) => this.handleDisconnect(connection, serverStopping),
     });
   }
@@ -131,11 +130,11 @@ export class UiWorkerManager {
   }
 
   /**
-   * 在新 Windows Terminal tab 中恢复已保存的 UI session。
+   * 在新 Windows Terminal tab 中恢复已保存或仍由其他 Pi runtime 打开的 UI session。
    *
    * @param sessionId Pi session ID。
    * @returns 已重新注册的 session 记录。
-   * @throws {UiWorkerManagerError} session 无法安全恢复或 owner 仍活跃时抛出。
+   * @throws {UiWorkerManagerError} session 文件缺失或项目路径校验失败时抛出。
    */
   async resume(sessionId: string): Promise<SessionIndexRecord> {
     await this.assertUiModeAvailable();
@@ -144,44 +143,23 @@ export class UiWorkerManager {
     if (!session) {
       throw new UiWorkerManagerError("session_not_found", `未找到 session: ${sessionId}。`);
     }
-    const priorOwner = Object.values(snapshot.instances).find((instance) => instance.sessionId === sessionId);
-    if (priorOwner && priorOwner.state !== "stale" && priorOwner.state !== "stopping") {
-      if (priorOwner.mode === "ui" && this.connections.has(priorOwner.instanceId)) {
-        return session;
-      }
-      throw new UiWorkerManagerError(
-        "session_owned_by_other_process",
-        `session ${sessionId} 仍由 ${priorOwner.mode} owner PID ${priorOwner.pid} 持有; 拒绝双 writer。`,
-      );
+    const activeOwners = Object.values(snapshot.instances).filter((instance) =>
+      instance.sessionId === sessionId && instance.state !== "stale" && instance.state !== "stopping",
+    );
+    const connectedUiOwner = [...activeOwners].reverse().find((instance) =>
+      instance.mode === "ui" && this.connections.has(instance.instanceId),
+    );
+    if (connectedUiOwner) {
+      return session;
     }
-    if (priorOwner) {
-      if (isProcessAlive(priorOwner.pid)) {
-        throw new UiWorkerManagerError(
-          "session_owned_by_other_process",
-          `session ${sessionId} 的旧 UI owner PID ${priorOwner.pid} 仍存活但 IPC 不可用; 拒绝双开。`,
-        );
-      }
-      await this.markStopped(priorOwner.instanceId);
-      snapshot = await this.options.registry.readSnapshot();
-      session = snapshot.sessions[sessionId];
-      if (!session) {
-        throw new UiWorkerManagerError("session_not_found", `未找到 session: ${sessionId}。`);
-      }
-    }
-    if (session.state === "active") {
-      session = {
-        ...session,
-        state: await isPersistedSessionFile(session.sessionFile) ? "saved" : "pending",
-      };
-      await this.options.registry.upsertSession(session);
-    }
-    if (!(await isPersistedSessionFile(session.sessionFile))) {
+    const transcriptExists = await isPersistedSessionFile(session.sessionFile);
+    if (!transcriptExists) {
       throw new UiWorkerManagerError(
         "session_not_found",
         `session ${sessionId} 尚无可恢复的 Pi transcript 文件。`,
       );
     }
-    if (session.state !== "saved") {
+    if (activeOwners.length === 0 && session.state !== "saved") {
       session = { ...session, state: "saved" };
       await this.options.registry.upsertSession(session);
     }
@@ -215,17 +193,27 @@ export class UiWorkerManager {
    *
    * @param sessionId Pi session ID。
    * @param message 用户消息正文。
+   * @param instanceId 可选的指定 UI worker 实例 ID。
    * @returns UI Pi agent 最终 assistant 文本。
    * @throws {UiWorkerManagerError} worker 断连、忙碌或回复结构无效时抛出。
    */
-  async prompt(sessionId: string, message: string): Promise<string> {
+  async prompt(sessionId: string, message: string, instanceId?: string): Promise<string> {
     const snapshot = await this.options.registry.readSnapshot();
-    const instance = Object.values(snapshot.instances).find((candidate) =>
-      candidate.sessionId === sessionId && candidate.mode === "ui" &&
-      candidate.state !== "stale" && candidate.state !== "stopping",
-    );
-    if (!instance) {
-      throw new UiWorkerManagerError("worker_not_found", `session ${sessionId} 没有活跃 UI worker。`);
+    const instance = instanceId
+      ? snapshot.instances[instanceId]
+      : [...Object.values(snapshot.instances)].reverse().find((candidate) =>
+          candidate.sessionId === sessionId && candidate.mode === "ui" &&
+          candidate.state !== "stale" && candidate.state !== "stopping" &&
+          this.connections.has(candidate.instanceId),
+        );
+    if (
+      !instance ||
+      instance.sessionId !== sessionId ||
+      instance.mode !== "ui" ||
+      instance.state === "stale" ||
+      instance.state === "stopping"
+    ) {
+      throw new UiWorkerManagerError("worker_not_found", `session ${sessionId} 没有指定的活跃 UI worker。`);
     }
     const connection = this.connections.get(instance.instanceId);
     if (!connection) {
@@ -253,17 +241,27 @@ export class UiWorkerManager {
    *
    * @param sessionId Pi session ID。
    * @param abortRunning 是否允许中止正在运行的 turn。
+   * @param instanceId 可选的指定 UI worker 实例 ID。
    * @returns worker 注销并持久化 session 状态后正常结束。
    * @throws {UiWorkerManagerError} 当前 turn 正忙或 worker 无法关闭时抛出。
    */
-  async stop(sessionId: string, abortRunning = false): Promise<void> {
+  async stop(sessionId: string, abortRunning = false, instanceId?: string): Promise<void> {
     const snapshot = await this.options.registry.readSnapshot();
-    const instance = Object.values(snapshot.instances).find((candidate) =>
-      candidate.sessionId === sessionId && candidate.mode === "ui" &&
-      candidate.state !== "stale" && candidate.state !== "stopping",
-    );
-    if (!instance) {
-      throw new UiWorkerManagerError("worker_not_found", `session ${sessionId} 没有活跃 UI worker。`);
+    const instance = instanceId
+      ? snapshot.instances[instanceId]
+      : [...Object.values(snapshot.instances)].reverse().find((candidate) =>
+          candidate.sessionId === sessionId && candidate.mode === "ui" &&
+          candidate.state !== "stale" && candidate.state !== "stopping" &&
+          this.connections.has(candidate.instanceId),
+        );
+    if (
+      !instance ||
+      instance.sessionId !== sessionId ||
+      instance.mode !== "ui" ||
+      instance.state === "stale" ||
+      instance.state === "stopping"
+    ) {
+      throw new UiWorkerManagerError("worker_not_found", `session ${sessionId} 没有指定的活跃 UI worker。`);
     }
     const connection = this.connections.get(instance.instanceId);
     if (!connection) {
@@ -282,7 +280,7 @@ export class UiWorkerManager {
         throw new UiWorkerManagerError("worker_shutdown_timeout", "UI worker 未确认 abort; session owner 仍保留。 ");
       }
     }
-    this.explicitStops.add(sessionId);
+    this.explicitStops.add(instance.instanceId);
     const stopped = new Promise<void>((resolveStopped, rejectStopped) => {
       const waiters = this.disconnectWaiters.get(instance.instanceId) ?? new Set<() => void>();
       const resolveOnce = (): void => {
@@ -296,7 +294,7 @@ export class UiWorkerManager {
         waiters.delete(resolveOnce);
         rejectStopped(new UiWorkerManagerError(
           "worker_shutdown_timeout",
-          "UI worker 未在期限内完成 session shutdown; registry owner 保留以避免双 writer。",
+          "UI worker 未在期限内完成 session shutdown; registry instance 保留, 不把仍可能运行的 TUI 误判为已退出。",
         ));
       }, this.options.shutdownTimeoutMs ?? 10000);
       timer.unref();
@@ -317,7 +315,7 @@ export class UiWorkerManager {
       }
       throw new UiWorkerManagerError("worker_shutdown_timeout", "UI worker shutdown request 未完成。 ");
     } finally {
-      this.explicitStops.delete(sessionId);
+      this.explicitStops.delete(instance.instanceId);
     }
   }
 
@@ -389,32 +387,7 @@ export class UiWorkerManager {
       throw new UiWorkerManagerError("worker_launch_failed", "UI worker cwd 与受控 launch project 不匹配。 ");
     }
     const canonicalCwd = resolvedProject.path;
-    let snapshot = await this.options.registry.readSnapshot();
-    let otherOwner = Object.values(snapshot.instances).find((instance) =>
-      instance.sessionId === registration.sessionId &&
-      instance.instanceId !== registration.instanceId &&
-      isProcessAlive(instance.pid),
-    );
-    if (
-      otherOwner?.mode === "background" &&
-      this.options.backgroundWorkerManager &&
-      otherOwner.state !== "stale" &&
-      otherOwner.state !== "stopping"
-    ) {
-      await this.options.backgroundWorkerManager.stop(registration.sessionId);
-      snapshot = await this.options.registry.readSnapshot();
-      otherOwner = Object.values(snapshot.instances).find((instance) =>
-        instance.sessionId === registration.sessionId &&
-        instance.instanceId !== registration.instanceId &&
-        isProcessAlive(instance.pid),
-      );
-    }
-    if (otherOwner) {
-      throw new UiWorkerManagerError(
-        "session_owned_by_other_process",
-        `session ${registration.sessionId} 已由 ${otherOwner.mode} owner 持有; 拒绝双 writer。`,
-      );
-    }
+    const snapshot = await this.options.registry.readSnapshot();
     let previousInstance: WorkerInstanceRecord | undefined;
     let session: SessionIndexRecord;
 
@@ -423,7 +396,6 @@ export class UiWorkerManager {
       if (launchRecord.mode === "resume") {
         if (
           !existing ||
-          existing.state === "active" ||
           !samePath(existing.sessionFile, registration.sessionFile) ||
           existing.sessionId !== registration.sessionId
         ) {
@@ -496,9 +468,24 @@ export class UiWorkerManager {
           throw new UiWorkerManagerError("registry_inconsistent", "UI worker owner 缺少 session registry。 ");
         }
         if (previousSession.sessionId !== registration.sessionId) {
+          const remainingOwners = Object.values(snapshot.instances).filter((candidate) =>
+            candidate.sessionId === previousSession.sessionId &&
+            candidate.instanceId !== previousInstance!.instanceId &&
+            candidate.state !== "stale" &&
+            candidate.state !== "stopping",
+          );
+          const routeOwnerId = Object.values(snapshot.routes).find((route) =>
+            route.sessionId === previousSession.sessionId,
+          )?.workerInstanceId;
+          const routeOwner = remainingOwners.find((candidate) => candidate.instanceId === routeOwnerId);
+          const preferredOwner = routeOwner ?? remainingOwners.find((candidate) => candidate.mode === "ui") ?? remainingOwners[0];
+          const previousTranscriptExists = await isPersistedSessionFile(previousSession.sessionFile);
           await this.options.registry.upsertSession({
             ...previousSession,
-            state: await isPersistedSessionFile(previousSession.sessionFile) ? "saved" : "pending",
+            ...(preferredOwner ? { mode: preferredOwner.mode } : {}),
+            state: remainingOwners.length > 0
+              ? previousTranscriptExists ? "active" : "pending"
+              : previousTranscriptExists ? "saved" : "pending",
             lastActivityAt: new Date().toISOString(),
           });
           const nextExisting = snapshot.sessions[registration.sessionId];
@@ -604,73 +591,6 @@ export class UiWorkerManager {
       generation: route.generation + 1,
       updatedAt: new Date().toISOString(),
     })));
-  }
-
-  /**
-   * 验证 TUI 是否可以切换到目标 Pi session 而不违反单 writer。
-   *
-   * @param connection 已认证 UI worker connection。
-   * @param method 控制 request 方法名。
-   * @param params 目标 sessionFile 等参数。
-   * @returns 包含 allowed 与稳定理由代码的结果。
-   */
-  private async handleWorkerRequest(
-    connection: UiWorkerIpcConnection,
-    method: string,
-    params: Record<string, unknown>,
-  ): Promise<unknown> {
-    if (method !== "can_switch_session") {
-      throw new UiWorkerManagerError("registry_inconsistent", "Gateway 收到未知 UI worker request。 ");
-    }
-    if (typeof params.sessionFile !== "string" || !isAbsolute(params.sessionFile)) {
-      return { allowed: false, reason: "invalid_session_file" };
-    }
-    let snapshot = await this.options.registry.readSnapshot();
-    const target = Object.values(snapshot.sessions).find((session) =>
-      samePath(session.sessionFile, params.sessionFile as string),
-    );
-    if (!target) {
-      const unindexedOwner = Object.values(snapshot.instances).find((instance) =>
-        samePath(instance.sessionFile, params.sessionFile as string) &&
-        instance.instanceId !== connection.registration.instanceId &&
-        isProcessAlive(instance.pid),
-      );
-      return unindexedOwner
-        ? { allowed: false, reason: "session_owned_by_other_process" }
-        : { allowed: true, reason: "session_not_registered" };
-    }
-    try {
-      await this.options.projectService.resolveSession(target.projectAlias, target.cwd);
-    } catch {
-      return { allowed: false, reason: "project_path_denied" };
-    }
-    let competingOwner = Object.values(snapshot.instances).find((instance) =>
-      instance.sessionId === target.sessionId &&
-      instance.instanceId !== connection.registration.instanceId &&
-      isProcessAlive(instance.pid),
-    );
-    if (
-      competingOwner?.mode === "background" &&
-      competingOwner.state !== "stale" &&
-      competingOwner.state !== "stopping" &&
-      this.options.backgroundWorkerManager
-    ) {
-      try {
-        await this.options.backgroundWorkerManager.stop(target.sessionId);
-      } catch {
-        return { allowed: false, reason: "background_handoff_failed" };
-      }
-      snapshot = await this.options.registry.readSnapshot();
-      competingOwner = Object.values(snapshot.instances).find((instance) =>
-        instance.sessionId === target.sessionId &&
-        instance.instanceId !== connection.registration.instanceId &&
-        isProcessAlive(instance.pid),
-      );
-    }
-    if (competingOwner) {
-      return { allowed: false, reason: "session_owned_by_other_process" };
-    }
-    return { allowed: true };
   }
 
   /**
@@ -787,7 +707,7 @@ export class UiWorkerManager {
   }
 
   /**
-   * 将已退出 UI owner 的 session 保存, 并把关联 route 安全交给后台 RPC worker。
+   * 将已退出 UI runtime 的 route 交给同 session 的其他可用 runtime, 或在没有其他 runtime 时交给后台 RPC worker。
    *
    * @param instanceId UI worker instance ID。
    * @returns route 已交接或无须交接后正常结束。
@@ -805,13 +725,27 @@ export class UiWorkerManager {
     const routes = Object.entries(snapshot.routes).filter(([, route]) =>
       route.sessionId === instance.sessionId && route.workerInstanceId === instanceId,
     );
-    const explicitStop = this.explicitStops.has(instance.sessionId);
+    const explicitStop = this.explicitStops.has(instanceId);
+    const remainingOwners = Object.values(snapshot.instances).filter((candidate) =>
+      candidate.sessionId === instance.sessionId &&
+      candidate.instanceId !== instanceId &&
+      candidate.state !== "stale" &&
+      candidate.state !== "stopping",
+    );
+    const remainingOwner = [...remainingOwners].reverse().find((candidate) =>
+      candidate.mode === "ui"
+        ? this.connections.has(candidate.instanceId)
+        : this.options.backgroundWorkerManager?.hasWorker(candidate.sessionId) === true,
+    );
+    const remainingRuntime = remainingOwner ?? [...remainingOwners].reverse()[0];
     const transcriptExists = session ? await isPersistedSessionFile(session.sessionFile) : false;
     if (session) {
       await this.options.registry.upsertSession({
         ...session,
-        mode: explicitStop ? session.mode : "background",
-        state: transcriptExists ? "saved" : "pending",
+        mode: remainingRuntime?.mode ?? (explicitStop ? session.mode : "background"),
+        state: remainingOwners.length > 0
+          ? transcriptExists ? "active" : "pending"
+          : transcriptExists ? "saved" : "pending",
         lastActivityAt: new Date().toISOString(),
       });
     }
@@ -819,13 +753,20 @@ export class UiWorkerManager {
 
     if (explicitStop || routes.length === 0 || !session || !this.options.backgroundWorkerManager) {
       await Promise.all(routes.map(([routeId]) => this.options.registry.setRoute(routeId, null)));
+    } else if (remainingOwner) {
+      await Promise.all(routes.map(([routeId, route]) => this.options.registry.setRoute(routeId, {
+        ...route,
+        workerInstanceId: remainingOwner.instanceId,
+        generation: route.generation + 1,
+        updatedAt: new Date().toISOString(),
+      })));
     } else {
       try {
         const backgroundSession = transcriptExists
           ? await this.options.backgroundWorkerManager.resume(session.sessionId, "background")
           : await this.options.backgroundWorkerManager.startNew(session.projectAlias, session.name);
         const afterHandoff = await this.options.registry.readSnapshot();
-        const backgroundOwner = Object.values(afterHandoff.instances).find((candidate) =>
+        const backgroundOwner = [...Object.values(afterHandoff.instances)].reverse().find((candidate) =>
           candidate.sessionId === backgroundSession.sessionId &&
           candidate.mode === "background" &&
           candidate.state !== "stale" &&

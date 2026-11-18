@@ -16,7 +16,7 @@ import {
 } from "./durable-message-queue.ts";
 import { ManagerRegistry } from "../registry/manager-registry.ts";
 import { GatewayLease } from "../registry/gateway-lease.ts";
-import type { SessionIndexRecord, WorkerInstanceRecord } from "../registry/types.ts";
+import type { SessionIndexRecord, WorkerInstanceRecord, WorkerMode } from "../registry/types.ts";
 import { BackgroundWorkerManagerError } from "../runtime/background-worker-manager.ts";
 import type { GatewayWorkerService } from "../runtime/gateway-worker-manager.ts";
 import { UiWorkerManagerError } from "../runtime/ui-worker-manager.ts";
@@ -520,9 +520,9 @@ export class GatewayCommandRouter {
     const session = await this.workerManager.startNew(alias, name, requestedMode);
     const newSnapshot = await this.registry.readSnapshot();
     const indexedSession = newSnapshot.sessions[session.sessionId];
-    const owner = Object.values(newSnapshot.instances).find((instance) =>
-      instance.sessionId === session.sessionId,
-    );
+    const owner = this.workerManager.getAvailableOwner
+      ? await this.workerManager.getAvailableOwner(session.sessionId)
+      : selectRouteOwner(newSnapshot, session.sessionId, indexedSession?.mode ?? session.mode);
     if (!owner) {
       await this.workerManager.stop(session.sessionId).catch(() => undefined);
       throw new BackgroundWorkerManagerError(
@@ -789,9 +789,9 @@ export class GatewayCommandRouter {
     const previousRoute = (await this.registry.readSnapshot()).routes[routeId];
     await this.workerManager.resume(session.sessionId);
     const snapshot = await this.registry.readSnapshot();
-    const owner = Object.values(snapshot.instances).find((instance) =>
-      instance.sessionId === session.sessionId,
-    );
+    const owner = this.workerManager.getAvailableOwner
+      ? await this.workerManager.getAvailableOwner(session.sessionId)
+      : selectRouteOwner(snapshot, session.sessionId, snapshot.sessions[session.sessionId]?.mode ?? session.mode);
     if (!owner) {
       throw new BackgroundWorkerManagerError(
         "worker_not_found",
@@ -936,7 +936,10 @@ export class GatewayCommandRouter {
     if (!session) {
       return "当前 route 没有活跃 session; 可使用 /sessions 查看列表。";
     }
-    await this.workerManager.stop(session.sessionId);
+    const routeOwner = binding?.sessionId === session.sessionId
+      ? binding.workerInstanceId
+      : selectRouteOwner(snapshot, session.sessionId, session.mode)?.instanceId;
+    await this.workerManager.stop(session.sessionId, false, routeOwner);
     if (binding?.sessionId === session.sessionId) {
       await this.registry.setRoute(routeId, null);
     }
@@ -973,7 +976,7 @@ export class GatewayCommandRouter {
     if (!worker || worker.state === "stale" || worker.state === "stopping") {
       return "当前 route 没有可用的 Pi worker; 请使用 /resume <索引> 重连。";
     }
-    return this.workerManager.prompt(binding.sessionId, text);
+    return this.workerManager.prompt(binding.sessionId, text, binding.workerInstanceId);
   }
 
   /**
@@ -1780,6 +1783,27 @@ function truncatePreview(text: string): string {
     return normalized;
   }
   return `${characters.slice(0, 24).join("")}...`;
+}
+
+/**
+ * 从同一会话的多个 Pi runtime 中选择符合当前 session mode 的 route 目标。
+ *
+ * @param snapshot registry 快照。
+ * @param sessionId Pi session ID。
+ * @param preferredMode 当前 session 记录的首选模式。
+ * @returns 首选模式的最新 runtime, 不存在时回退到最新活跃 runtime。
+ */
+function selectRouteOwner(
+  snapshot: Awaited<ReturnType<ManagerRegistry["readSnapshot"]>>,
+  sessionId: string,
+  preferredMode?: WorkerMode,
+): WorkerInstanceRecord | undefined {
+  const owners = [...Object.values(snapshot.instances)].reverse().filter((instance) =>
+    instance.sessionId === sessionId &&
+    instance.state !== "stale" &&
+    instance.state !== "stopping",
+  );
+  return (preferredMode ? owners.find((instance) => instance.mode === preferredMode) : undefined) ?? owners[0];
 }
 
 /**

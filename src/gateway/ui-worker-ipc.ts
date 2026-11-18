@@ -99,11 +99,6 @@ export interface UiWorkerIpcServerHandlers {
     name: string,
     data: Record<string, unknown>,
   ) => Promise<void>;
-  onRequest?: (
-    connection: UiWorkerIpcConnection,
-    method: string,
-    params: Record<string, unknown>,
-  ) => Promise<unknown>;
   onDisconnect?: (connection: UiWorkerIpcConnection, serverStopping: boolean) => Promise<void>;
 }
 
@@ -383,10 +378,6 @@ export class UiWorkerIpcServer extends EventEmitter {
       if (!isPlainRecord(hello)) {
         throw new UiWorkerIpcError("handshake_rejected", "UI worker hello frame 无效。 ");
       }
-      if (hello.kind === "control_hello") {
-        await this.acceptControlConnection(peer, hello);
-        return;
-      }
       if (hello.kind !== "hello") {
         throw new UiWorkerIpcError("handshake_rejected", "UI worker 首个 IPC frame 必须为 hello。 ");
       }
@@ -427,9 +418,6 @@ export class UiWorkerIpcServer extends EventEmitter {
           await this.handlers?.onWorkerEvent?.(connection!, "worker_shutdown", params);
           return { accepted: true };
         }
-        if (this.handlers?.onRequest) {
-          return this.handlers.onRequest(connection!, method, params);
-        }
         throw new UiWorkerIpcError("invalid_frame", "Gateway 不支持该 UI worker IPC request。 ");
       });
       connection.once("close", () => {
@@ -456,49 +444,6 @@ export class UiWorkerIpcServer extends EventEmitter {
         : "UI worker 注册未通过安全校验。";
       peer.send({ kind: "registration_error", message });
       peer.close();
-    }
-  }
-
-  /**
-   * 建立只允许发起 can_switch_session request 的临时本机控制连接。
-   *
-   * @param peer 已连接 JSONL peer。
-   * @param hello 已通过 JSON decode 的首个 control frame。
-   * @returns control client ready handshake 完成后正常结束。
-   * @throws {UiWorkerIpcError} attach token 或 control request 校验失败时抛出。
-   */
-  private async acceptControlConnection(
-    peer: JsonLinePeer,
-    hello: Record<string, unknown>,
-  ): Promise<void> {
-    const registration = parseUiWorkerRegistration(hello.registration);
-    await this.lease.assertOwned();
-    const authHash = this.managerAuthHash;
-    if (!authHash) {
-      throw new UiWorkerIpcError("handshake_rejected", "Gateway UI attach key 尚未初始化。 ");
-    }
-    const nonce = randomBytes(32).toString("base64url");
-    peer.send({ kind: "challenge", nonce });
-    const proof = await peer.nextMessage(10000);
-    if (proof.kind !== "proof" || typeof proof.value !== "string") {
-      throw new UiWorkerIpcError("handshake_rejected", "UI switch control proof 格式无效。 ");
-    }
-    const expectedProof = createUiWorkerProof(authHash, nonce, registration);
-    if (!safeEqualBase64(proof.value, expectedProof)) {
-      throw new UiWorkerIpcError("handshake_rejected", "UI switch control attach token 校验失败。 ");
-    }
-    const connection = new UiWorkerIpcConnection(peer, registration);
-    peer.setRequestHandler(async (method, params) => {
-      await this.lease.assertOwned();
-      if (method !== "can_switch_session" || !this.handlers?.onRequest) {
-        throw new UiWorkerIpcError("invalid_frame", "UI switch control connection 仅允许 can_switch_session。 ");
-      }
-      return this.handlers.onRequest(connection, method, params);
-    });
-    peer.send({ kind: "control_registered", instanceId: registration.instanceId });
-    const ready = await peer.nextMessage(5000);
-    if (ready.kind !== "client_ready") {
-      throw new UiWorkerIpcError("handshake_rejected", "UI switch control client 未能就绪。 ");
     }
   }
 
@@ -645,62 +590,6 @@ export class UiWorkerIpcClient extends EventEmitter {
         throw error;
       }
       throw new UiWorkerIpcError("pipe_unavailable", "无法连接 Gateway named pipe。 ");
-    }
-  }
-
-  /**
-   * 建立不占有 session 的本机 UI switch control connection。
-   *
-   * @param endpoint Gateway UI IPC endpoint。
-   * @param managerDirectory Hub 私有数据目录。
-   * @param managerToken 当前 manager 目录稳定 attach token。
-   * @param options 握手超时配置。
-   * @returns 仅用于 can_switch_session 等授权 control request 的 client。
-   * @throws {UiWorkerIpcError} server 身份验证或连接失败时抛出。
-   */
-  static async connectControl(
-    endpoint: string,
-    managerDirectory: string,
-    managerToken: string,
-    options: { timeoutMs?: number } = {},
-  ): Promise<UiWorkerIpcClient> {
-    const registration: UiWorkerRegistration = {
-      launchId: randomUUID(),
-      instanceId: randomUUID(),
-      pid: process.pid,
-      processBirthId: `${process.pid}:${Math.floor(Date.now() - process.uptime() * 1000)}`,
-      sessionId: "control-only",
-      sessionFile: join(resolve(managerDirectory), "control-only.jsonl"),
-      cwd: resolve(managerDirectory),
-      projectAlias: "control",
-      state: "idle",
-    };
-    const peer = new JsonLinePeer(createConnection(endpoint));
-    const timeoutMs = options.timeoutMs ?? 3000;
-    try {
-      await peer.waitUntilOpen(timeoutMs);
-      peer.send({ kind: "control_hello", registration: publicRegistration(registration) });
-      const challenge = await peer.nextMessage(timeoutMs);
-      if (challenge.kind !== "challenge" || typeof challenge.nonce !== "string") {
-        throw new UiWorkerIpcError("handshake_rejected", "Gateway 未返回有效 control challenge。 ");
-      }
-      peer.send({
-        kind: "proof",
-        value: createUiWorkerProof(hashUiWorkerTicket(managerToken), challenge.nonce, registration),
-      });
-      const accepted = await peer.nextMessage(timeoutMs);
-      if (accepted.kind !== "control_registered") {
-        throw new UiWorkerIpcError("handshake_rejected", "Gateway 未确认 UI switch control connection。 ");
-      }
-      const client = new UiWorkerIpcClient(peer, registration);
-      peer.send({ kind: "client_ready" });
-      return client;
-    } catch (error) {
-      peer.close();
-      if (error instanceof UiWorkerIpcError) {
-        throw error;
-      }
-      throw new UiWorkerIpcError("pipe_unavailable", "无法连接 Gateway UI switch control endpoint。 ");
     }
   }
 

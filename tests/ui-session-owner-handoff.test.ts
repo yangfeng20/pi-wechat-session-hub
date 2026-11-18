@@ -25,7 +25,7 @@ async function createTemporaryDirectory(): Promise<string> {
   return mkdtemp(join(tmpdir(), "pi-wechat-session-owner-"));
 }
 
-test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后台", async () => {
+test("TUI 接入微信会话时保留后台 Pi runtime, TUI 退出后 route 返回后台", async () => {
   const root = await createTemporaryDirectory();
   const agentDirectory = join(root, "pi-agent");
   const managerDirectory = join(agentDirectory, "wechat-session-manager");
@@ -152,7 +152,6 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     assert.ok(autoSession);
     assert.equal(autoSession.projectAlias, "unregistered");
     assert.equal((await projectService.list()).config.projects.unregistered.displayName, "unregistered");
-    assert.equal(await bridge.canSwitchSession(session.sessionFile), true);
     await bridge.onSessionShutdown({ reason: "resume" });
     assert.equal(bridgeStates.at(-1), "disconnected");
     uiState.sessionId = session.sessionId;
@@ -176,6 +175,8 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     assert.notEqual(foregroundOwnerId, previousOwner.instanceId);
     assert.equal(foreground.instances[foregroundOwnerId].mode, "ui");
     assert.equal(foreground.sessions[session.sessionId].mode, "ui");
+    assert.equal(foreground.instances[previousOwner.instanceId].mode, "background");
+    assert.equal(backgroundManager.hasWorker(session.sessionId), true);
     assert.equal(foreground.routes["wx-owner-test"].generation, 2);
     const firstList = await router.receive({
       messageId: "wx-sessions-foreground",
@@ -187,14 +188,21 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     assert.match(foregroundListReply, /\| 1 \| 前后台切换测试（当前） \| 前台 \| 活跃 \|/);
     assert.match(foregroundListReply, /项目：测试项目/);
     assert.match(foregroundListReply, /\| 3 \| 后台会话 \| 后台 \| 等待首条记录 \|/);
-    assert.equal(await gatewayWorkerManager.prompt(session.sessionId, "桌面可见回复"), "UI 回复: 桌面可见回复");
+    const foregroundPrompt = await router.receive({
+      messageId: "wx-ui-owner-prompt",
+      senderId: "wx-owner-test",
+      text: "桌面可见回复",
+    });
+    assert.equal(foregroundPrompt.state, "completed");
+    assert.equal(sessionListReplies.at(-1), "UI 回复: 桌面可见回复");
 
     await bridge.onSessionShutdown({ reason: "quit" });
     assert.equal(bridgeStates.at(-1), "disconnected");
     const background = await registry.readSnapshot();
     const backgroundOwnerId = background.routes["wx-owner-test"].workerInstanceId;
-    assert.notEqual(backgroundOwnerId, foregroundOwnerId);
+    assert.equal(backgroundOwnerId, previousOwner.instanceId);
     assert.equal(background.instances[backgroundOwnerId].mode, "background");
+    assert.equal(backgroundManager.hasWorker(session.sessionId), true);
     assert.equal(background.sessions[session.sessionId].mode, "background");
     assert.equal(background.routes["wx-owner-test"].generation, 3);
     const secondList = await router.receive({
@@ -207,7 +215,13 @@ test("Pi TUI 接管后台微信会话后可回显, TUI 关闭后 route 回到后
     assert.match(backgroundListReply, /\| 1 \| 前后台切换测试（当前） \| 后台 \| 活跃 \|/);
     assert.match(backgroundListReply, /项目：测试项目/);
     assert.match(backgroundListReply, /\| 3 \| 后台会话 \| 后台 \| 等待首条记录 \|/);
-    assert.equal(await gatewayWorkerManager.prompt(session.sessionId, "微信仍可回复"), "测试回复: 微信仍可回复");
+    const backgroundPrompt = await router.receive({
+      messageId: "wx-background-owner-prompt",
+      senderId: "wx-owner-test",
+      text: "微信仍可回复",
+    });
+    assert.equal(backgroundPrompt.state, "completed");
+    assert.equal(sessionListReplies.at(-1), "测试回复: 微信仍可回复");
   } finally {
     await bridge?.onSessionShutdown({ reason: "quit" }).catch(() => undefined);
     await gatewayWorkerManager.stopAll().catch(() => undefined);

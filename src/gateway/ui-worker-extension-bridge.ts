@@ -1,19 +1,17 @@
 import { realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import {
   FooterComponent,
   type AgentSession,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { isProcessAlive } from "../system/process-liveness.ts";
 import { ProjectService, ProjectServiceError } from "../projects/project-service.ts";
 import {
   createStableNamedPipe,
   readOrCreateUiWorkerAttachToken,
-  readUiWorkerAttachToken,
   UiWorkerIpcClient,
   UiWorkerIpcError,
   readUiWorkerLaunchRecord,
@@ -175,100 +173,6 @@ export class UiWorkerExtensionBridge {
     this.reconnectDelayMs = 500;
     this.notifyConnectionState("connecting");
     this.scheduleConnect(0);
-  }
-
-  /**
-   * 在 Pi session switch 前向 Gateway 检查目标 session owner。
-   *
-   * @param sessionFile 用户选择的 Pi session transcript 文件。
-   * @returns Gateway 确认无 writer 冲突时返回 true。
-   */
-  async canSwitchSession(sessionFile: string): Promise<boolean> {
-    if (!isAbsolute(sessionFile)) {
-      return false;
-    }
-    if (this.client) {
-      try {
-        const result = await this.client.request("can_switch_session", { sessionFile }, 10000);
-        return isRecord(result) && result.allowed === true;
-      } catch {
-        return !(await this.hasLiveSessionOwner(sessionFile));
-      }
-    }
-
-    let controlClient: UiWorkerIpcClient | undefined;
-    try {
-      const managerToken = await readUiWorkerAttachToken(this.managerDirectory);
-      if (!managerToken) {
-        return !(await this.hasLiveSessionOwner(sessionFile));
-      }
-      controlClient = await UiWorkerIpcClient.connectControl(
-        createStableNamedPipe(this.managerDirectory),
-        this.managerDirectory,
-        managerToken,
-        { timeoutMs: 3000 },
-      );
-      const result = await controlClient.request("can_switch_session", { sessionFile }, 5000);
-      return isRecord(result) && result.allowed === true;
-    } catch {
-      return !(await this.hasLiveSessionOwner(sessionFile));
-    } finally {
-      controlClient?.close();
-    }
-  }
-
-  /**
-   * 在 Gateway IPC 不可用时检查目标 transcript 是否仍有存活 registry owner。
-   *
-   * @param sessionFile 用户选择的 Pi session transcript 文件。
-   * @returns 存在活跃/状态不明 owner 时返回 true。
-   */
-  private async hasLiveSessionOwner(sessionFile: string): Promise<boolean> {
-    let managerInfo;
-    try {
-      managerInfo = await lstat(this.managerDirectory);
-    } catch (error) {
-      return !(error instanceof Error && "code" in error && error.code === "ENOENT");
-    }
-    if (!managerInfo.isDirectory() || managerInfo.isSymbolicLink()) {
-      return true;
-    }
-    const instanceFile = join(this.managerDirectory, "instances.json");
-    let instanceFileInfo;
-    try {
-      instanceFileInfo = await lstat(instanceFile);
-    } catch (error) {
-      return !(error instanceof Error && "code" in error && error.code === "ENOENT");
-    }
-    if (!instanceFileInfo.isFile() || instanceFileInfo.isSymbolicLink()) {
-      return true;
-    }
-    let records: unknown;
-    try {
-      records = JSON.parse(await readFile(instanceFile, "utf8")) as unknown;
-    } catch {
-      return true;
-    }
-    if (!isRecord(records)) {
-      return true;
-    }
-    for (const value of Object.values(records)) {
-      if (!isRecord(value) || typeof value.sessionFile !== "string" || !samePath(value.sessionFile, sessionFile)) {
-        continue;
-      }
-      if (value.instanceId === this.instanceId) {
-        continue;
-      }
-      if (
-        typeof value.pid !== "number" ||
-        !Number.isSafeInteger(value.pid) ||
-        value.pid <= 0 ||
-        isProcessAlive(value.pid)
-      ) {
-        return true;
-      }
-    }
-    return false;
   }
 
   /**
@@ -942,26 +846,6 @@ export function registerUiWorkerBridgeHooks(
     }
   });
 
-  pi.on("session_before_switch", async (event, sessionContext) => {
-    if (!bridge) {
-      return;
-    }
-    if (!event.targetSessionFile) {
-      if (event.reason === "resume") {
-        sessionContext.ui.notify("Gateway 无法确认目标 session, 已拒绝恢复以避免双 writer。", "warning");
-        return { cancel: true };
-      }
-      return;
-    }
-    const allowed = await bridge.canSwitchSession(event.targetSessionFile);
-    if (!allowed) {
-      sessionContext.ui.notify(
-        "Gateway 检测到目标 session 仍由其他 Pi runtime 持有或 owner 状态不明, 为避免双 writer 已拒绝恢复。",
-        "warning",
-      );
-      return { cancel: true };
-    }
-  });
   pi.on("session_info_changed", async (event, sessionContext) => {
     await bridge?.onSessionInfoChanged(event, sessionContext);
   });

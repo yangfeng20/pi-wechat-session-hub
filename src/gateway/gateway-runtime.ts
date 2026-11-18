@@ -29,7 +29,7 @@ import { WindowsTerminalLauncher } from "./windows-terminal-launcher.ts";
 export type GatewayRuntimeState = "starting" | "online" | "auth_required" | "stopping" | "stopped" | "lease_lost";
 
 /**
- * 表示 Gateway runtime 无法在维持单 writer 与凭证隔离的前提下启动或停止。
+ * 表示 Gateway runtime 因配置、后台 worker 生命周期、registry 或凭证隔离问题无法安全启动或停止。
  */
 export class GatewayRuntimeError extends Error {
   /**
@@ -248,7 +248,7 @@ export class GatewayRuntime extends EventEmitter {
         }
         throw new GatewayRuntimeError(
           "worker_shutdown_failed",
-          "Gateway 初始化失败且后台资源未能全部停止; 为避免双 writer, manager.lock 已保留。",
+          "Gateway 初始化失败且后台资源未能全部停止; 为避免第二个 Gateway 同时接管 route/poller, manager.lock 已保留。",
         );
       }
       await registry?.setGateway(null).catch(() => undefined);
@@ -359,7 +359,7 @@ export class GatewayRuntime extends EventEmitter {
       } else {
         throw new GatewayRuntimeError(
           "live_worker_detected",
-          `发现仍存活的 Pi worker PID ${instance.pid} (session ${instance.sessionId}); 为避免双 writer, Gateway 未启动。`,
+          `检测到仍存活的 Pi RPC worker PID ${instance.pid} (session ${instance.sessionId}); 无法确认旧后台 worker 已退出, Gateway 未启动以避免重复后台 worker。`,
         );
       }
     }
@@ -420,17 +420,19 @@ export class GatewayRuntime extends EventEmitter {
           `route ${routeId} 与 session registry 不一致; 保留绑定并拒绝启动。`,
         );
       }
-      const owner = snapshot.instances[route.workerInstanceId];
-      const ownerIsActive = Boolean(
-        owner &&
-        owner.sessionId === route.sessionId &&
-        owner.state !== "stale" &&
-        owner.state !== "stopping" &&
-        this.gatewayWorkerManager.hasAvailableOwner(owner),
-      );
+      const routeOwner = await this.gatewayWorkerManager.getAvailableOwner(route.sessionId, route.workerInstanceId);
+      const ownerIsActive = routeOwner !== undefined;
       const sessionFileExists = await isPersistedSessionFile(session.sessionFile);
-      return { routeId, route, session, ownerIsActive, sessionFileExists };
+      return { routeId, route, session, ownerIsActive, routeOwner, sessionFileExists };
     }));
+    await Promise.all(routeAnalyses.filter(({ route, routeOwner }) =>
+      routeOwner !== undefined && route.workerInstanceId !== routeOwner.instanceId,
+    ).map(({ routeId, route, routeOwner }) => this.registry.setRoute(routeId, {
+      ...route,
+      workerInstanceId: routeOwner!.instanceId,
+      generation: route.generation + 1,
+      updatedAt: new Date().toISOString(),
+    })));
 
     const restorableRoutes = routeAnalyses.filter(({ session, ownerIsActive, sessionFileExists }) =>
       !ownerIsActive &&
@@ -501,10 +503,7 @@ export class GatewayRuntime extends EventEmitter {
       await this.registry.upsertSession({ ...session, state: "saved" });
     }
     const resumed = await this.gatewayWorkerManager.resume(session.sessionId, session.mode);
-    const afterResume = await this.registry.readSnapshot();
-    const owner = Object.values(afterResume.instances).find((instance) =>
-      instance.sessionId === resumed.sessionId,
-    );
+    const owner = await this.gatewayWorkerManager.getAvailableOwner(resumed.sessionId);
     if (!owner) {
       throw new GatewayRuntimeError(
         "registry_inconsistent",

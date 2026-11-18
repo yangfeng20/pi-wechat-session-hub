@@ -35,9 +35,9 @@ Pi TUI: /wx start|status|stop|restart|autostart
        独立 Hub daemon / Gateway
           ├─ iLink poller + durable queue
           ├─ route/session registry + 稳定索引
-          └─ 每个 session 唯一 Pi writer
-               ├─ TUI owner: 消息进入可见会话
-               └─ 无 TUI owner: 后台 Pi RPC worker
+          └─ session runtime 列表 + 按微信 route 选择一个接收端
+               ├─ 当前 TUI: 消息显示在该 TUI
+               └─ 无可用 TUI: 后台 Pi RPC worker
 ```
 
 - `/wx` 打开本机控制菜单. `/wechat-manager` 保留兼容.
@@ -45,7 +45,9 @@ Pi TUI: /wx start|status|stop|restart|autostart
 - Windows 当前用户登录自动启动配置默认关闭. 用户登录任务尚未在本机实际启用或创建.
 - `/new` 默认创建后台会话; 显式 `/new --mode ui` 会启动可见 Windows Terminal UI. 默认不打开新 tab.
 - `/sessions` 默认列出 Hub 管理的活跃前台/后台会话, 一次回复展示全部匹配会话, 每项显示标题、项目、模式和状态; 当前微信 route 在列表摘要和对应会话项中标记. 标题优先使用会话名; 没有名称时仅读取 Pi `/resume` 同样采用的首条用户文本. 标题最长 32 个 Unicode code point, 超出以 `...` 省略; 暂无用户消息时显示“尚无用户消息”.
-- 微信 `/resume <索引|名称>` 将该微信 sender 的 route 切换到目标 session. 空闲会话恢复后附带最多 800 个 Unicode 字符的最近回复预览; 内容过长时提示完整回复仍保留在会话记录中. 本机 TUI `/resume` 会进行 UI/background owner 交接.
+- 微信 `/resume <索引|名称>` 将该微信 sender 的 route 切换到目标 session. 空闲会话恢复后附带最多 800 个 Unicode 字符的最近回复预览; 内容过长时提示完整回复仍保留在会话记录中.
+- Pi 原生 `/resume`、`/tree`、`/fork`、`/clone` 不由 Hub 拦截. Hub 允许同一 session 登记多个 Pi runtime, 但微信 route 只向一个 runtime 投递.
+- `/tree` 不改变 session ID, route 保持在当前 TUI 和原 session; `/fork`、`/clone` 创建新 session ID, 若操作的 TUI 是 route 当前目标, route 随该 TUI 移到新 session. 其他 Pi runtime 与原 session 保持不变.
 
 ## 最近讨论: 活跃 turn 中切换 route
 

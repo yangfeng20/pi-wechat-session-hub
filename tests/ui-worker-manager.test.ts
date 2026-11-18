@@ -262,7 +262,7 @@ function restoreEnvironment(key: string, value: string | undefined): void {
   }
 }
 
-test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单 writer", { timeout: 20000 }, async () => {
+test("UI worker 握手、Pi 原生会话切换和微信 route 目标选择", { timeout: 20000 }, async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "pi-wechat-ui-worker-"));
   const agentDirectory = join(temporaryDirectory, "pi-agent");
   const managerDirectory = join(agentDirectory, "wechat-session-manager");
@@ -290,6 +290,7 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
   const endpoint = createStableNamedPipe(managerDirectory);
   const server = new UiWorkerIpcServer(managerDirectory, registry, lease, { endpoint });
   const workers: FakeUiWorker[] = [];
+  let forkBridge: UiWorkerExtensionBridge | undefined;
   const launcher = {
     launch: async (directory: string, cwd: string, launchId: string): Promise<void> => {
       const launch = await readUiWorkerLaunchRecord(directory, launchId);
@@ -360,54 +361,6 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
     assert.equal(created.mode, "ui");
     assert.equal(created.state, "active");
     assert.equal(replies.length, 0);
-    assert.equal(await workers[0].bridge.canSwitchSession(created.sessionFile), true);
-    const unregisteredSessionFile = join(sessionsDirectory, "unregistered.jsonl");
-    assert.equal(await workers[0].bridge.canSwitchSession(unregisteredSessionFile), true);
-    await registry.upsertInstance({
-      instanceId: "orphaned-unregistered-owner",
-      pid: process.pid,
-      processBirthId: `${process.pid}:orphaned-owner`,
-      sessionId: "orphaned-unregistered-session",
-      sessionFile: unregisteredSessionFile,
-      cwd: projectPath,
-      projectAlias: "demo",
-      mode: "ui",
-      state: "idle",
-      heartbeatAt: new Date().toISOString(),
-    });
-    assert.equal(await workers[0].bridge.canSwitchSession(unregisteredSessionFile), false);
-    await registry.removeInstance("orphaned-unregistered-owner");
-    const backgroundSessionId = "busy-background-session";
-    const backgroundSessionFile = join(sessionsDirectory, `${backgroundSessionId}.jsonl`);
-    await writeFile(backgroundSessionFile, `${JSON.stringify({ id: backgroundSessionId })}\n`, "utf8");
-    const now = new Date().toISOString();
-    await registry.upsertSession({
-      sessionId: backgroundSessionId,
-      sessionFile: backgroundSessionFile,
-      cwd: projectPath,
-      projectAlias: "demo",
-      mode: "background",
-      state: "active",
-      lastActivityAt: now,
-    });
-    await registry.upsertInstance({
-      instanceId: "busy-background-owner",
-      pid: process.pid,
-      processBirthId: `${process.pid}:busy-ui-test`,
-      sessionId: backgroundSessionId,
-      sessionFile: backgroundSessionFile,
-      cwd: projectPath,
-      projectAlias: "demo",
-      mode: "background",
-      state: "idle",
-      heartbeatAt: now,
-    });
-    assert.equal(await workers[0].bridge.canSwitchSession(backgroundSessionFile), false);
-    await registry.removeInstance("busy-background-owner");
-    await registry.upsertSession({
-      ...((await registry.readSnapshot()).sessions[backgroundSessionId]),
-      state: "saved",
-    });
     const promptResult = await router.receive({
       messageId: "ui-prompt-message",
       senderId: "wx-ui-route",
@@ -484,7 +437,103 @@ test("UI worker 握手、TUI session switch、prompt、stop 和 resume 维持单
     });
     assert.equal(stopResumedResult.state, "completed");
     assert.equal((await registry.readSnapshot()).sessions[switchedSessionId].state, "saved");
+
+    const resumedUiSession = await uiManager.resume(switchedSessionId);
+    const beforeSecondAttach = await registry.readSnapshot();
+    const firstRouteOwner = Object.values(beforeSecondAttach.instances).find((instance) =>
+      instance.sessionId === switchedSessionId && instance.mode === "ui",
+    );
+    assert.ok(firstRouteOwner);
+    await registry.setRoute("wx-ui-route", {
+      sessionId: switchedSessionId,
+      workerInstanceId: firstRouteOwner.instanceId,
+      generation: 1,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const forkState = {
+      sessionId: switchedSessionId,
+      sessionFile: resumedUiSession.sessionFile,
+      cwd: projectPath,
+      sessionName: "分叉前",
+    };
+    forkBridge = new UiWorkerExtensionBridge(undefined, projectService, managerDirectory);
+    const forkPi = {
+      sendUserMessage(content: string) {
+        setImmediate(() => {
+          forkBridge?.onAgentStart();
+          forkBridge?.onMessageEnd({ message: { role: "user", content: [{ type: "text", text: content }] } });
+          forkBridge?.onMessageEnd({ message: { role: "assistant", content: [{ type: "text", text: `分叉 UI 回复: ${content}` }] } });
+          forkBridge?.onAgentSettled();
+        });
+      },
+    } as unknown as ExtensionAPI;
+    const forkContext = {
+      mode: "tui",
+      cwd: projectPath,
+      sessionManager: {
+        getSessionId: () => forkState.sessionId,
+        getSessionFile: () => forkState.sessionFile,
+        getCwd: () => forkState.cwd,
+        getSessionName: () => forkState.sessionName,
+      },
+      isIdle: () => true,
+      abort: () => undefined,
+      shutdown: () => undefined,
+    } as unknown as ExtensionContext;
+    const secondRegistered = new Promise<void>((resolveRegistered) => {
+      const listener = (connection: { registration: { instanceId: string } }): void => {
+        if (connection.registration.instanceId === forkBridge?.getDiagnostics().instanceId) {
+          server.off("worker_registered", listener);
+          resolveRegistered();
+        }
+      };
+      server.on("worker_registered", listener);
+    });
+    await forkBridge.attach(forkPi, forkContext);
+    await secondRegistered;
+    const multiRuntime = await registry.readSnapshot();
+    const sessionOwners = Object.values(multiRuntime.instances).filter((instance) =>
+      instance.sessionId === switchedSessionId && instance.state !== "stale" && instance.state !== "stopping",
+    );
+    assert.equal(sessionOwners.length, 2);
+    assert.equal(multiRuntime.routes["wx-ui-route"].workerInstanceId, forkBridge.getDiagnostics().instanceId);
+    const selectedRuntimePrompt = await router.receive({
+      messageId: "ui-selected-runtime-prompt",
+      senderId: "wx-ui-route",
+      text: "发给选中的 TUI",
+    });
+    assert.equal(selectedRuntimePrompt.state, "completed");
+    assert.equal(replies.at(-1)?.text, "分叉 UI 回复: 发给选中的 TUI");
+
+    const childSessionId = "fake-ui-session-child";
+    const childSessionFile = join(sessionsDirectory, `${childSessionId}.jsonl`);
+    await writeFile(childSessionFile, `${JSON.stringify({ id: childSessionId })}\n`, "utf8");
+    await forkBridge.onSessionShutdown({ reason: "fork" });
+    forkState.sessionId = childSessionId;
+    forkState.sessionFile = childSessionFile;
+    forkState.sessionName = "分叉后";
+    const childRegistered = new Promise<void>((resolveRegistered) => {
+      const listener = (connection: { registration: { instanceId: string; sessionId: string } }): void => {
+        if (
+          connection.registration.instanceId === forkBridge?.getDiagnostics().instanceId &&
+          connection.registration.sessionId === childSessionId
+        ) {
+          server.off("worker_registered", listener);
+          resolveRegistered();
+        }
+      };
+      server.on("worker_registered", listener);
+    });
+    await forkBridge.attach(forkPi, forkContext);
+    await childRegistered;
+    const afterFork = await registry.readSnapshot();
+    assert.equal(afterFork.routes["wx-ui-route"].sessionId, childSessionId);
+    assert.equal(afterFork.sessions[switchedSessionId].state, "active");
+    assert.equal(afterFork.instances[firstRouteOwner.instanceId].sessionId, switchedSessionId);
+    assert.equal(afterFork.routes["wx-ui-route"].workerInstanceId, forkBridge.getDiagnostics().instanceId);
   } finally {
+    await forkBridge?.onSessionShutdown({ reason: "quit" }).catch(() => undefined);
     for (const worker of workers) {
       await worker.bridge.onSessionShutdown({ reason: "quit" }).catch(() => undefined);
     }

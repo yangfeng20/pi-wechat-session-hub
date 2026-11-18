@@ -130,11 +130,11 @@ export class BackgroundWorkerManager {
   }
 
   /**
-   * 恢复 registry 中已保存且没有活跃 owner 的 session。
+   * 恢复可持久化 session 到后台 Pi RPC worker; 同一 session 同时最多登记一个后台 worker, 可与 Pi TUI runtime 并存。
    *
    * @param sessionId Pi session ID。
    * @returns 恢复后的 session 索引记录。
-   * @throws {BackgroundWorkerManagerError} session 不存在或已有其他 owner 时抛出。
+   * @throws {BackgroundWorkerManagerError} session 不存在、transcript 缺失或已有后台 worker 时抛出。
    */
   async resume(sessionId: string, mode: "background" | "ui" = "background"): Promise<SessionIndexRecord> {
     return this.withStartQueue(() => this.withSessionQueue(sessionId, async () => {
@@ -160,14 +160,16 @@ export class BackgroundWorkerManager {
           `未找到 session: ${sessionId}。`,
         );
       }
-      const activeOwner = Object.values(snapshot.instances).find((instance) =>
+      const activeOwners = Object.values(snapshot.instances).filter((instance) =>
         instance.sessionId === sessionId && instance.state !== "stale" && instance.state !== "stopping",
       );
-      if (activeOwner || session.state === "active") {
+      const activeBackgroundOwner = activeOwners.find((instance) => instance.mode === "background");
+      const activeUiOwner = activeOwners.some((instance) => instance.mode === "ui");
+      if (activeBackgroundOwner || (session.state === "active" && !activeUiOwner)) {
         throw new BackgroundWorkerManagerError(
           "session_owned_by_other_process",
-          activeOwner
-            ? `session 已由另一个 Pi runtime 持有 (${activeOwner.mode}, PID ${activeOwner.pid}), 拒绝双开。`
+          activeBackgroundOwner
+            ? `session 已由后台 Pi runtime PID ${activeBackgroundOwner.pid} 持有, 不会启动重复后台 worker。`
             : `session ${sessionId} 在 registry 中仍标记为 active, owner 状态未核实, 拒绝恢复。`,
         );
       }
@@ -305,9 +307,8 @@ export class BackgroundWorkerManager {
         this.workers.delete(sessionId);
         await this.registry.removeInstance(worker.info.instanceId);
         const session = await this.findSession(sessionId);
-        await this.registry.upsertSession({
+        await this.syncSessionAfterOwnerChange({
           ...session,
-          state: await isPersistedSessionFile(session.sessionFile) ? "saved" : "pending",
           lastActivityAt: new Date().toISOString(),
         });
         await this.registry.appendEvent("worker.stopped", {
@@ -381,20 +382,22 @@ export class BackgroundWorkerManager {
         );
       }
       const current = await this.registry.readSnapshot();
-      const competingOwner = Object.values(current.instances).find((candidate) =>
+      const competingBackgroundOwner = Object.values(current.instances).find((candidate) =>
         candidate.sessionId === session.sessionId &&
+        candidate.mode === "background" &&
         candidate.instanceId !== instance.instanceId &&
         candidate.state !== "stale" &&
         candidate.state !== "stopping",
       );
-      if (competingOwner) {
+      if (competingBackgroundOwner) {
         throw new BackgroundWorkerManagerError(
           "session_owned_by_other_process",
-          `session ${session.sessionId} 已由 PID ${competingOwner.pid} 持有, 拒绝双 writer。`,
+          `session ${session.sessionId} 已由后台 Pi runtime PID ${competingBackgroundOwner.pid} 持有, 不会启动重复后台 worker。`,
         );
       }
       await this.registry.upsertInstance(instance);
       await this.registry.upsertSession(session);
+      await this.syncSessionAfterOwnerChange(session);
       await this.registry.appendEvent("worker.started", {
         sessionId: session.sessionId,
         instanceId: instance.instanceId,
@@ -408,10 +411,7 @@ export class BackgroundWorkerManager {
       });
     } catch (error) {
       await this.registry.removeInstance(instance.instanceId).catch(() => undefined);
-      await this.registry.upsertSession({
-        ...session,
-        state: await isPersistedSessionFile(session.sessionFile) ? "saved" : "pending",
-      }).catch(() => undefined);
+      await this.syncSessionAfterOwnerChange(session).catch(() => undefined);
       throw error;
     }
   }
@@ -493,14 +493,48 @@ export class BackgroundWorkerManager {
     this.workers.delete(sessionId);
     await this.registry.removeInstance(worker.info.instanceId);
     const session = await this.findSession(sessionId);
-    await this.registry.upsertSession({
+    await this.syncSessionAfterOwnerChange({
       ...session,
-      state: await isPersistedSessionFile(session.sessionFile) ? "saved" : "pending",
       lastActivityAt: new Date().toISOString(),
     });
     await this.registry.appendEvent("worker.exited", {
       sessionId,
       instanceId: worker.info.instanceId,
+    });
+  }
+
+  /**
+   * 将 session 的状态与当前仍登记的 runtime 和微信 route 目标同步。
+   *
+   * @param fallbackSession registry 中尚未存在时使用的 session 记录。
+   * @returns 同步完成后正常结束。
+   */
+  private async syncSessionAfterOwnerChange(fallbackSession: SessionIndexRecord): Promise<void> {
+    const snapshot = await this.registry.readSnapshot();
+    const session = snapshot.sessions[fallbackSession.sessionId] ?? fallbackSession;
+    const activeOwners = Object.values(snapshot.instances).filter((instance) =>
+      instance.sessionId === session.sessionId &&
+      instance.state !== "stale" &&
+      instance.state !== "stopping",
+    );
+    const activeRouteOwner = Object.values(snapshot.routes)
+      .filter((route) => route.sessionId === session.sessionId)
+      .map((route) => snapshot.instances[route.workerInstanceId])
+      .find((instance) =>
+        instance &&
+        instance.sessionId === session.sessionId &&
+        instance.state !== "stale" &&
+        instance.state !== "stopping",
+      );
+    const preferredOwner = activeRouteOwner ?? activeOwners.find((instance) => instance.mode === "ui") ?? activeOwners[0];
+    const transcriptExists = await isPersistedSessionFile(session.sessionFile);
+    await this.registry.upsertSession({
+      ...session,
+      ...(preferredOwner ? { mode: preferredOwner.mode } : {}),
+      state: activeOwners.length > 0
+        ? transcriptExists ? "active" : "pending"
+        : transcriptExists ? "saved" : "pending",
+      lastActivityAt: fallbackSession.lastActivityAt,
     });
   }
 

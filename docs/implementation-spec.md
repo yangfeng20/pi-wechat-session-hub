@@ -1,8 +1,8 @@
 # Pi 微信会话枢纽实现方案
 
-- 状态: 后台 daemon、会话 owner 切换、稳定会话索引和可选 Windows 登录自动启动已实现并通过本轮自动化验证.
-- 目标: 用户通过微信管理 Hub 注册的 Pi sessions; 本机 Pi TUI 可随时接管/释放同一 session.
-- 持久事实源: Pi session JSONL. Hub registry 只保存 session 索引元数据、唯一 owner、route 和运行状态.
+- 状态: 后台 daemon、Pi 原生 session 接入、微信 route runtime 选择、稳定会话索引和可选 Windows 登录自动启动已实现并通过本轮自动化验证.
+- 目标: 用户通过微信管理 Hub 注册的 Pi sessions; 本机 Pi TUI 可自由切换、分支和恢复 session, Hub 不拦截 Pi 原生行为.
+- 持久事实源: Pi session JSONL. Hub registry 保存 session 索引元数据、可接入的 Pi runtime 实例、微信 route 和运行状态; 一个 route 指向一个 session 和一个具体 runtime.
 
 ## 1. 目标行为
 
@@ -10,10 +10,11 @@
 2. 所有 Pi TUI 退出后, Hub daemon 和后台 RPC workers 继续提供微信收发.
 3. 任意 Pi TUI 中 `/wx status|stop|restart` 控制同一后台服务. `/wx stop` 必须由可见 UI 二次确认.
 4. Windows 用户登录自动启动是可选项, 配置默认关闭. 开启后使用之前的 Hub 微信授权, 不在登录任务中打开 QR UI.
-5. session 的前台/后台模式表示当前 owner, 不是固定 session 属性:
-   - 有可见 Pi TUI owner 时, 微信消息进入该 TUI transcript, assistant 最终回复同时回到微信.
-   - TUI 关闭后, 已路由 session 安全交给后台 Pi RPC worker.
-   - 本机 Pi `/resume` 已由后台处理的 Hub session 时, background writer 先退出, 再由 TUI 接管同一 session.
+5. session mode 表示当前微信 route 的首选 runtime, 不是 Pi 的 writer 限制:
+   - 有可见 Pi TUI 接入时, 微信 route 可指向该 TUI; assistant 最终回复同时回到微信.
+   - TUI 退出时, route 优先交给同 session 的其他已接入 runtime; 没有其他 runtime 时再交给后台 Pi RPC worker.
+   - 本机 Pi 原生 `/resume`、`/tree`、`/fork`、`/clone` 始终允许. `/tree` 不改变 session ID, route 保持不变; `/fork` 和 `/clone` 创建新 session, 当前 route 随其所连接的 TUI 移到新 session.
+   - 多个 Pi runtime 可以打开同一 session; Hub 只选择一个 runtime 接收微信消息, 不广播, 也不替 Pi 处理 session 分支.
    - 未登记 session 可由 Pi 原生 `/resume` 恢复; 仅当 cwd 位于授权根内时才自动接入 Hub.
 6. `allowedProjectRoots` 是授权边界, 根内 TUI session 自动登记, 项目展示名使用当前 cwd 文件夹名称. 微信端 `/sessions` 列出 Hub 管理的活跃 sessions.
 
@@ -26,20 +27,18 @@
           ▼
 ┌────────────────────────────────────────────────────────┐
 │ 独立 Hub daemon (detached Node process)                 │
-│                                                        │
 │ Gateway lease / control server / iLink poller / router │
 │ durable queue / route registry / stable session index  │
 │                                                        │
-│ 每个 session 同时只有一个 Pi writer                    │
-│   ├─ 有活跃 TUI: UI owner + sendUserMessage()           │
-│   └─ 无活跃 TUI: headless Pi RPC worker                │
+│ 多个 Pi runtime 可打开同一 session; Pi 管理分支        │
+│ 微信 route 只指向一个选定的 runtime                    │
 └─────────────────────────┬──────────────────────────────┘
                           │
                           ▼
-               Pi 原生 session JSONL
+               Pi 原生 session JSONL 树
 ```
 
-Hub daemon 本身是独立后台 Node 进程, 负责 Gateway、poller 和 session owner 调度. 处理每个对话的后台会话由 Pi `--mode rpc` worker 执行. daemon 和 worker 都不需要 TUI 窗口.
+Hub daemon 本身是独立后台 Node 进程, 负责 Gateway、poller 和微信 route 调度. 处理每个对话的后台会话由 Pi `--mode rpc` worker 执行. daemon 和 worker 都不需要 TUI 窗口.
 
 ## 3. 后台 daemon 生命周期
 
@@ -66,19 +65,22 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 - 每个可见 Pi TUI 在 `session_start` 后尝试连接 Gateway UI IPC. `allowedProjectRoots` 负责安全授权; cwd 位于授权根时, extension 按 cwd 文件夹名自动建立或复用项目记录, 不要求预先逐个添加 alias. cwd 超出授权范围时, session 仍可本机使用, TUI 会提示 `/wx roots add-current` 等本机授权入口. UI worker 连接成功后, Pi footer 扩展状态行显示 `🟢 微信: 已接入`; 连接重建期间显示 `🟡 微信: 连接中`.
 
 ```text
-后台 RPC owner -- Pi /resume / UI attach --> 前台 TUI owner
-前台 TUI owner -- session shutdown -------> 后台 RPC owner
+本机 Pi TUI -- /resume /tree /fork /clone --> Pi 原生 session 生命周期
+                                                │
+                                                ▼
+                          多个 runtime 可连接同一 session JSONL 树
+                                                │
+微信 <-- iLink <-- Hub route(sessionId, instanceId) --> 一个选定 runtime
 ```
 
-- UI 接管时, IPC server 验证 Pi session file、授权根范围和 lease; 项目记录按 cwd 文件夹名自动创建或复用. 如果现有 owner 是 Hub 的 background worker, 先优雅停止该 worker, 再注册 UI owner, 并更新 route generation.
-- UI owner 收到微信消息时, extension 用 Pi 原生 `sendUserMessage()` 注入消息. `agent_settled` 后将完整最终 assistant 文本交给 Gateway, 再由 iLink 发回微信.
-- UI TUI 正常关闭时, 移除前台 owner; 有 route 的 session 交给后台 RPC worker, route 和 session ID 不变.
-- `/wx stop` 会断开 Gateway IPC, 但仍运行的 TUI 保持本地会话. 下次 `start` 时, UI extension 会重连并恢复 owner.
-- Hub 启动时, 曾标记为 UI 但已没有活跃 UI owner 的 saved route 改由后台 RPC 恢复, 不自动打开 Windows Terminal tab.
-- 未登记目标的 Pi 原生 `/resume` 不因缺少 Hub registry 记录而被取消. 如果目标 transcript 没有活跃或状态不明的 Hub owner, 允许 Pi 恢复; 恢复后 cwd 在授权根内则自动登记并接入, 否则只保留本机使用.
-- 已登记 session 若由其他活跃 UI owner 持有, 或旧 owner 状态不明且进程仍存活, 拒绝第二 writer. 后台 owner 则尝试安全停止并交接; 停止或交接失败时拒绝恢复.
-- Gateway 重启时, 已标记为 `stale` 或 `stopping` 的 UI owner 不会阻塞 Gateway 启动, 也不会被自动改为 background writer; 其 route 保留并等待原 TUI 重新接入. 只有进程已确认退出后, 下一次恢复才会清理 owner 并按安全规则交接.
-- 未登记 transcript 不会触发本机 session 文件扫描; 仅通过用户当前 Pi 的 `/resume` 选择单个目标.
+- UI 接入时, IPC server 验证 Pi session file、授权根范围和 lease; 多个 UI/background runtime 可以登记同一 Pi session. 新接入的当前 TUI 可成为相关微信 route 的接收 runtime, 不停止原 Pi runtime.
+- UI runtime 收到微信消息时, extension 用 Pi 原生 `sendUserMessage()` 注入消息. `agent_settled` 后将完整最终 assistant 文本交给 Gateway, 再由 iLink 发回微信. route 只向选中的一个 runtime 投递, 不广播.
+- TUI 正常关闭时, route 优先切到同 session 的其他可用 runtime; 如果没有, 再交给后台 RPC worker. route 与 sessionId 保持绑定, 除非当前 route 所连接的 TUI 切换到另一个 session.
+- `/wx stop` 会断开 Gateway IPC, 但仍运行的 TUI 保持本地会话. 下次 `start` 时, UI extension 会重连并恢复实例登记.
+- Hub 启动时, route 指向的 runtime 未能接入时, 优先复用该 session 的其他可用 runtime; 没有可用 runtime 时按 session mode 恢复 background/UI worker.
+- Pi 原生 `/resume` 不由 Hub 的 `session_before_switch` 钩子取消. `session_start` 后, cwd 在授权根内的 session 自动登记; 根外 session 仍可由 Pi 本机使用, 不接入 Hub.
+- `/tree` 在同一 session 文件内改变当前分支, route 继续指向当前 Pi runtime. `/fork` 与 `/clone` 切换到新 session ID 时, 仅当前 route 绑定到该 runtime 的微信 route 跟随至新 session; 原 session 及其他 runtime 保持不变.
+- Gateway 重启时, stale UI instance 仍等待原 TUI 重连; 活跃 runtime 和 route 状态按实例 ID 恢复, 不会因同 session 存在其他 Pi runtime 而取消 Pi 本机操作.
 
 ## 5. 微信端会话和索引
 
@@ -91,7 +93,7 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 /retry <message-id> --confirm
 ```
 
-`/new` 默认在后台创建 session, 不接受任意工作目录或 shell 参数; 用户可显式指定 `--mode ui` 请求在新 Windows Terminal tab 中打开可见 session. 若 route 后续通过本机 Pi TUI `/resume` 打开该 session, owner 会自动切换为 UI. 微信端 `/resume` 切换到已停止或 idle 的 session 时, 回复会附上 transcript 中最近一条 assistant 文本; 若目标 agent 正在运行, 则只确认 route 切换.
+`/new` 默认在后台创建 session, 不接受任意工作目录或 shell 参数; 用户可显式指定 `--mode ui` 请求在新 Windows Terminal tab 中打开可见 session. 如果 Pi TUI 后续原生 `/resume` 到受管 session, Hub 登记该 runtime 并按 route 规则选择微信接收端. 微信端 `/resume` 仍只切换对应 route, 不改变 Pi 的本机 session 语义.
 
 `/sessions` 默认状态为 `active`, active 集合由当前 UI 和 background owner 共同构成. 需要查看已保存/待启动 session 时可使用 `--state all` 或相应过滤项. 一次回复列出全部匹配会话, 每个会话展示稳定索引、标题、项目、模式和状态; 当前微信 route 在会话项和列表摘要中标记. 标题优先使用 session name, 未命名时读取 Pi `/resume` 同样采用的首条 user 文本, 并在 32 个 Unicode 字符后以 `...` 省略. 微信命令帮助按会话、项目和 Hub 状态分组; `/status` 使用中文状态和会话摘要, 不显示 PID. 空闲会话的 `/resume` 回复附带最近 assistant 文本预览, 最多 800 个 Unicode 字符, 超长时明确提示剩余内容仍保留在 transcript.
 
@@ -135,7 +137,7 @@ control endpoint 为 Windows named pipe 或 POSIX Unix socket. 客户端使用 `
 - IPC challenge 使用 Gateway lease token HMAC; 普通 Pi TUI attach 使用 manager 目录 ACL 保护的稳定随机 `ui-attachment.key`. manager 目录及凭证使用当前用户专属 ACL/mode.
 - iLink QR 登录只写 Hub 自己的凭证, create-only; 不读取、复制、覆盖或删除其他客户端凭证.
 - 审计日志不含 prompt、模型输出、消息正文或 credential.
-- Gateway registry 不修改 Pi transcript; 任何写入都由对应的唯一 Pi runtime 完成.
+- Gateway registry 不修改 Pi transcript; transcript 的树与分支由 Pi `SessionManager` 管理. Hub route 只指定微信消息的一个 runtime 接收目标, 不对 Pi 原生会话切换施加 writer 限制.
 
 ## 10. 验证
 
