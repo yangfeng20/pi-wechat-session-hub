@@ -242,6 +242,8 @@ export class GatewayCommandRouter {
     if (message.replyContext) {
       try {
         await this.notificationService?.recordInboundContext(message.replyContext);
+        // 本次消息可能已续命: 有积压时异步补发, 不阻塞消息处理。
+        void this.notificationService?.replayBacklogIfFresh();
       } catch {
         // token 捕获失败只影响通知通道, 不阻断会话消息。
       }

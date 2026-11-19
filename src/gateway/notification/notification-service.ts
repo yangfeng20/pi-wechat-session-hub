@@ -220,6 +220,23 @@ export class NotificationService {
   }
 
   /**
+   * token 新鲜时补发积压通知; 由入站消息路径触发, 不抛出。
+   *
+   * @returns 补发条数, 无法补发时为 0。
+   */
+  async replayBacklogIfFresh(): Promise<number> {
+    try {
+      const record = await this.loadTokenRecord();
+      if (!record || !isTokenFresh(record.receivedAt) || this.backlogCount === 0) {
+        return 0;
+      }
+      return await this.replayBacklog();
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * 补发积压通知; 已有补发进行中时等待其完成。
    *
    * @returns 本轮实际补发条数。
