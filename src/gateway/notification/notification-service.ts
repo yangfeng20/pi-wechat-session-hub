@@ -1,6 +1,9 @@
 import type { ManagerConfiguration } from "../../config/types.ts";
 import type { IlinkReplyContext } from "../channel-types.ts";
 import { IlinkApiClient } from "../wechat-ilink/api-client.ts";
+import { readFile, rename, unlink, open } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   ContextTokenStore,
   ContextTokenStoreError,
@@ -38,6 +41,11 @@ export const MAX_BACKLOG_REPLAY_COUNT = 10;
  * 积压通知的最大保留条数, 超出后丢弃最旧的。
  */
 export const MAX_BACKLOG_ITEMS = 100;
+
+/**
+ * 积压通知落盘文件名, 位于 manager 数据目录 (ACL 保护)。
+ */
+const BACKLOG_FILE_NAME = "notification-backlog.json";
 
 /**
  * 续命提醒的固定正文。
@@ -106,10 +114,11 @@ export class NotificationService {
     private readonly api: IlinkApiClient,
     private readonly tokenStore: ContextTokenStore,
     private readonly configStore: NotificationConfigStore,
+    private readonly backlogFilePath?: string,
   ) {}
 
   /**
-   * 返回当前积压的通知条数。
+   * 返回当前积压的通知条数 (内存缓存, 启动时从磁盘恢复)。
    *
    * @returns 积压条数。
    */
@@ -124,6 +133,76 @@ export class NotificationService {
    */
   getBacklog(): BackloggedNotification[] {
     return [...this.backlog];
+  }
+
+  /**
+   * 从磁盘恢复积压通知; daemon 启动时调用一次。
+   *
+   * @returns 无返回值。
+   */
+  async restoreBacklog(): Promise<void> {
+    if (!this.backlogFilePath) {
+      return;
+    }
+    try {
+      const contents = await readFile(this.backlogFilePath, "utf8");
+      const parsed: unknown = JSON.parse(contents);
+      if (
+        typeof parsed !== "object" || parsed === null || Array.isArray(parsed) ||
+        !Array.isArray((parsed as { items?: unknown }).items)
+      ) {
+        return;
+      }
+      const items = (parsed as { items: unknown[] }).items;
+      const restored: BackloggedNotification[] = [];
+      for (const item of items) {
+        if (typeof item !== "object" || item === null) {
+          continue;
+        }
+        const candidate = item as Record<string, unknown>;
+        if (typeof candidate.text !== "string" || typeof candidate.enqueuedAt !== "string") {
+          continue;
+        }
+        restored.push({
+          ...(typeof candidate.title === "string" ? { title: candidate.title } : {}),
+          text: candidate.text,
+          ...(typeof candidate.source === "string" ? { source: candidate.source } : {}),
+          enqueuedAt: candidate.enqueuedAt,
+        });
+      }
+      this.backlog = restored.slice(-MAX_BACKLOG_ITEMS);
+    } catch {
+      // 文件不存在或损坏时视为空积压; 积压丢失不阻断 Hub 服务。
+    }
+  }
+
+  /**
+   * 将积压通知原子写入磁盘; 写入失败只影响持久性, 不影响本次内存操作。
+   *
+   * @returns 无返回值。
+   */
+  private async persistBacklog(): Promise<void> {
+    if (!this.backlogFilePath) {
+      return;
+    }
+    const payload = { schemaVersion: 1, items: this.backlog };
+    try {
+      await mkdir(dirname(this.backlogFilePath), { recursive: true });
+      const temporaryPath = `${this.backlogFilePath}.${process.pid}.tmp`;
+      const handle = await open(temporaryPath, "wx", 0o600);
+      try {
+        await handle.writeFile(JSON.stringify(payload, null, 2), "utf8");
+        await handle.sync();
+        await handle.close();
+        await rename(temporaryPath, this.backlogFilePath);
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await unlink(temporaryPath).catch(() => undefined);
+        throw error;
+      }
+    } catch {
+      // 落盘失败不阻断内存操作; 下次积压变更时重试。
+    }
   }
 
   /**
@@ -275,6 +354,10 @@ export class NotificationService {
       }
       replayed += batch.length;
       this.backlog = this.backlog.slice(batch.length);
+      await this.persistBacklog();
+      if (summaryMode) {
+        break;
+      }
       if (summaryMode) {
         break;
       }
@@ -335,6 +418,7 @@ export class NotificationService {
     if (this.backlog.length > MAX_BACKLOG_ITEMS) {
       this.backlog = this.backlog.slice(-MAX_BACKLOG_ITEMS);
     }
+    await this.persistBacklog();
     return { kind: "queued", position: this.backlog.length };
   }
 

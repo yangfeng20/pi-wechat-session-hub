@@ -243,3 +243,33 @@ test("投递失败返回 failed 而不积压", async () => {
 test("通知安全余量为 20 小时, 与硬过期相差 4 小时", () => {
   assert.equal(CONTEXT_TOKEN_HARD_EXPIRY_MS - CONTEXT_TOKEN_FRESHNESS_MS, 4 * 60 * 60 * 1000);
 });
+
+test("积压通知落盘: daemon 重启后 restoreBacklog 恢复并补发", async () => {
+  const directory = await createTemporaryDirectory();
+  try {
+    const backlogPath = join(directory, "notification-backlog.json");
+    const store = new ContextTokenStore(directory);
+    const staleTime = new Date(Date.now() - CONTEXT_TOKEN_HARD_EXPIRY_MS - 60_000).toISOString();
+    await store.record({ recipientId: "wx-user-1", contextToken: "token-stale" }, staleTime);
+    const api = createFakeApi();
+    const service = new NotificationService(api as never, store, createFakeConfigStore(), backlogPath);
+    await service.notify({ title: "重启前的通知", text: "不能丢" });
+    assert.equal(service.backlogCount, 1);
+
+    // 模拟 daemon 重启: 新实例从磁盘恢复。
+    const revivedService = new NotificationService(api as never, store, createFakeConfigStore(), backlogPath);
+    assert.equal(revivedService.backlogCount, 0);
+    await revivedService.restoreBacklog();
+    assert.equal(revivedService.backlogCount, 1);
+
+    // 续命后补发, 磁盘文件同步清空。
+    await revivedService.renew({ recipientId: "wx-user-1", contextToken: "token-renewed" });
+    assert.equal(revivedService.backlogCount, 0);
+    assert.equal(api.calls.length, 1);
+    assert.match(api.calls[0].text, /重启前的通知/);
+    const raw = JSON.parse(await readFile(backlogPath, "utf8")) as { items: unknown[] };
+    assert.equal(raw.items.length, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

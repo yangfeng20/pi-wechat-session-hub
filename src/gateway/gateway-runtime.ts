@@ -189,7 +189,13 @@ export class GatewayRuntime extends EventEmitter {
       });
       const typingIndicator = new IlinkTypingIndicator(api);
       const contextTokenStore = new ContextTokenStore(dataDirectory);
-      const notificationService = new NotificationService(api, contextTokenStore, options.configStore);
+      const notificationService = new NotificationService(
+        api,
+        contextTokenStore,
+        options.configStore,
+        join(dataDirectory, "notification-backlog.json"),
+      );
+      await notificationService.restoreBacklog().catch(() => undefined);
       const notificationIngress = new NotificationIngressServer(dataDirectory, notificationService);
       channel = new IlinkChannelAdapter(
         api,
