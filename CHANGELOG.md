@@ -6,6 +6,47 @@
 
 暂无.
 
+## [0.1.5] - 2026-11-19
+
+本版包含两大变更: 会话架构重构 (Hub 不再限制 writer, 只选择微信消息的目标 runtime) 与全新的微信通知入口 (外部程序与 Pi 会话可直发微信通知).
+
+### 会话架构: 保留 Pi 原生会话切换
+
+- **Hub 不再强制「单 writer」**: 此前 TUI 打开即接管、TUI 关闭即交回后台, 始终只有一个 writer; 现在多个 Pi runtime (TUI/RPC) 可同时打开同一 session, Pi 自己管理会话分支, Hub 只负责选择微信消息投递给哪个 runtime, 不广播
+- Pi 原生 `/resume`、`/tree`、`/fork`、`/clone` 完全不被 Hub 拦截: `/tree` 不改变 route; `/fork`、`/clone` 创建新 session 时, 仅当前 route 所连接的 TUI 跟随转到新 session
+- 微信 route 规则不变: 优先已接入的当前 TUI, TUI 关闭后交给同 session 其他已接入 runtime, 最后交给后台 RPC worker
+- 新增原生会话切换测试覆盖 `/tree` `/fork` 场景
+
+### 新增: 微信通知入口
+
+- **其他程序/脚本可直发微信通知**: `node <包目录>/scripts/wx-notify.mjs "标题" "正文"`, 不经过会话队列、不触发模型、不耗 token; 退出码 0 表示已送达, 非 0 返回明确失败原因
+- **Pi 会话内自动获得 `wx_notify` 工具**: 安装本包后每个会话注册该工具并进入系统提示词, 用户说「构建完微信通知我」等即可被 agent 调用, 无需任何配置
+- **通知通道凭证自动管理**: 每条入站微信消息授权后捕获最新 `context_token` (ACL 保护目录, 0600, 原子写), 供主动发送使用; durable queue 完成后删除 token 的行为不变
+- **24 小时窗口应对** (微信平台限制: 用户 24h 内未互动则 Bot 无法主动发送):
+  - 距过期不足 4 小时时 Bot 主动提醒回复 `/renew` 续命, 每个周期最多一次
+  - 过期后的通知默认积压 (`notification.overflowPolicy: "queue"`), 续命后自动补发; 可配 `"drop"` 改为直接拒绝并返回错误
+  - 任意入站消息 (不只 `/renew`) 续命后都会自动补发积压
+  - 积压落盘持久化 (`notification-backlog.json`, ACL 保护目录), daemon 重启不再丢失
+  - 补发单轮最多 10 条, 超过合并为摘要, 避免触发微信侧连续发送限制
+- **微信端新增 `/renew` 命令**: 续命通知通道并补发积压, 零副作用 (不进队列、不触发 Pi turn、不耗 token)
+- 每条通知末尾固定附加「〔系统通知, 与会话无关, 请勿直接回复〕」, 防止把通知当会话上下文误回复
+- 安全边界: 本机 named pipe / unix socket (不监听 TCP), `notify-shared.key` HMAC 鉴权 + ±5 分钟防重放 + 内存级限流 (默认 10 条/分钟、60 条/小时), 详见 `docs/decisions/0002-notification-ingress-context-token.md`
+
+### 变更
+
+- 新增依赖 `typebox@1.3.7` (`wx_notify` 工具参数 schema, 与 Pi 内置版本一致)
+- 新增配置节 `notification.overflowPolicy` (默认 `queue`, 旧配置无需手动修改)
+
+### 测试
+
+- 新增通知模块用例: token 存储与损坏拒绝、queue/drop 策略分支、续命补发与摘要、提醒窗口、HMAC 篡改与时间戳拒绝、限流器、端到端 pipe 通信、`/renew` 解析、`wx_notify` 工具路径、积压落盘恢复
+- 全量测试 155 条, 152 通过 / 0 失败 / 3 跳过
+
+### 升级提示
+
+- 升级后需重启 Pi TUI 并执行 `/wx restart`, 让 daemon 跑新代码
+- 首次使用通知入口: 在微信给 Bot 发一条消息激活通道, 之后即可用 `wx-notify` CLI 或会话内 `wx_notify` 工具发通知
+
 ## [0.1.4] - 2026-11-12
 
 本版重做 `/watch` 会话健康总览: 默认视图改为「当前打开着的会话」, 并新增「最后提问」列.
@@ -143,7 +184,8 @@
 - 授权根目录白名单与 fail-closed 命令处理
 - AGPL-3.0 许可证与安装文档
 
-[未发布]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.4...HEAD
+[未发布]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/yangfeng20/pi-wechat-session-hub/compare/v0.1.1...v0.1.2
