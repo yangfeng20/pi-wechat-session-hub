@@ -4,6 +4,7 @@ import type { RuntimeMode } from "../config/types.ts";
 export type GatewayCommand =
   | { kind: "help" }
   | { kind: "status" }
+  | { kind: "renew" }
   | { kind: "projects"; arguments: string }
   | { kind: "new"; mode?: RuntimeMode; projectAlias?: string; name?: string }
   | { kind: "sessions"; projectAlias?: string; state: "default" | "active" | "saved" | "pending" | "all" }
@@ -64,6 +65,10 @@ export function parseGatewayCommand(text: string): GatewayCommand {
   if (commandName === "status") {
     ensureNoArguments(arguments_);
     return { kind: "status" };
+  }
+  if (commandName === "renew") {
+    ensureNoArguments(arguments_);
+    return { kind: "renew" };
   }
   if (commandName === "projects") {
     return {

@@ -16,6 +16,9 @@ import { GatewayLease } from "../registry/gateway-lease.ts";
 import { ManagerRegistry } from "../registry/manager-registry.ts";
 import type { GatewayStatusRecord, RouteRecord, SessionIndexRecord, WorkerInstanceRecord } from "../registry/types.ts";
 import { isProcessAlive } from "../system/process-liveness.ts";
+import { ContextTokenStore } from "./notification/context-token-store.ts";
+import { NotificationService } from "./notification/notification-service.ts";
+import { NotificationIngressServer } from "./notification/notification-ingress-server.ts";
 import { BackgroundWorkerManager } from "../runtime/background-worker-manager.ts";
 import { GatewayWorkerManager } from "../runtime/gateway-worker-manager.ts";
 import { UiWorkerManager } from "../runtime/ui-worker-manager.ts";
@@ -76,6 +79,8 @@ export class GatewayRuntime extends EventEmitter {
     private readonly uiIpcServer: UiWorkerIpcServer,
     private readonly router: GatewayCommandRouter,
     private readonly channel: IlinkChannelAdapter,
+    private readonly notificationService?: NotificationService,
+    private readonly notificationIngress?: NotificationIngressServer,
   ) {
     super();
     this.channel.on("session_expired", () => {
@@ -183,6 +188,9 @@ export class GatewayRuntime extends EventEmitter {
         ...(options.fetcher ? { fetcher: options.fetcher } : {}),
       });
       const typingIndicator = new IlinkTypingIndicator(api);
+      const contextTokenStore = new ContextTokenStore(dataDirectory);
+      const notificationService = new NotificationService(api, contextTokenStore, options.configStore);
+      const notificationIngress = new NotificationIngressServer(dataDirectory, notificationService);
       channel = new IlinkChannelAdapter(
         api,
         new IlinkCursorStore(join(dataDirectory, "ilink-sync.json"), lease),
@@ -196,6 +204,7 @@ export class GatewayRuntime extends EventEmitter {
         queue,
         lease,
         processingIndicator: typingIndicator,
+        notificationService,
         uiModeCapability: () => uiWorkerManager!.describeUiModeCapability(),
         replySink: (routeId, messageId, reply, replyContext) =>
           channel!.sendReply(routeId, messageId, reply, replyContext),
@@ -210,6 +219,8 @@ export class GatewayRuntime extends EventEmitter {
         uiIpcServer,
         router,
         channel,
+        notificationService,
+        notificationIngress,
       );
       await runtime.initialize(options.onControlReady);
       return runtime;
@@ -309,6 +320,10 @@ export class GatewayRuntime extends EventEmitter {
   ): Promise<void> {
     await this.registry.setGateway(this.toGatewayRecord("starting"));
     await this.uiWorkerManager.listen();
+    // 通知入口随 Gateway 生命周期启停; 失败不阻断 Hub 主体服务。
+    if (this.notificationIngress) {
+      await this.notificationIngress.listen().catch(() => undefined);
+    }
     await onControlReady?.(this.lease, this.registry);
     await this.recoverRoutes();
     await this.channel.start((message) => this.router.acceptInbound(message));
@@ -317,6 +332,8 @@ export class GatewayRuntime extends EventEmitter {
     }
     this.heartbeatTimer = setInterval(() => {
       void this.refreshHeartbeat();
+      // 续命提醒: 距 token 过期不足 4 小时时 best-effort 提醒一次。
+      void this.notificationService?.maybeSendRenewalReminder().catch(() => undefined);
     }, this.config.runtime.heartbeatIntervalMs);
     this.heartbeatTimer.unref();
   }
@@ -539,6 +556,9 @@ export class GatewayRuntime extends EventEmitter {
       statusWriteFailed = true;
     }
     await this.channel.stop();
+    if (this.notificationIngress) {
+      await this.notificationIngress.close().catch(() => undefined);
+    }
     await this.queue.waitForIdle();
     await this.uiWorkerManager.detachGateway();
     try {

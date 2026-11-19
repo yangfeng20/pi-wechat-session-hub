@@ -1,5 +1,16 @@
-import type { ManagerConfiguration } from "./types.ts";
+import type { ManagerConfiguration, NotificationConfiguration } from "./types.ts";
 import { getCredentialFilePath } from "./paths.ts";
+
+/**
+ * 创建默认通知配置。
+ *
+ * @returns 默认使用积压补发策略的通知配置。
+ */
+export function createDefaultNotificationConfiguration(): NotificationConfiguration {
+  return {
+    overflowPolicy: "queue",
+  };
+}
 
 /**
  * 创建默认运行时配置。
@@ -26,5 +37,6 @@ export function createDefaultConfiguration(
       maxBackgroundWorkers: 4,
       maxQueuePerSession: 20,
     },
+    notification: createDefaultNotificationConfiguration(),
   };
 }

@@ -3,6 +3,7 @@ import { createDefaultConfiguration } from "./defaults.ts";
 import { getCredentialFilePath } from "./paths.ts";
 import type {
   ManagerConfiguration,
+  NotificationConfiguration,
   ProjectDefinition,
   RuntimeConfiguration,
   RuntimeMode,
@@ -46,6 +47,9 @@ export function validateConfiguration(
   const inputRuntime = input.runtime === undefined
     ? {}
     : asRecord(input.runtime, "runtime");
+  const inputNotification = input.notification === undefined
+    ? {}
+    : asRecord(input.notification, "notification");
 
   const candidate: Record<string, unknown> = {
     ...defaults,
@@ -57,6 +61,10 @@ export function validateConfiguration(
     runtime: {
       ...defaults.runtime,
       ...inputRuntime,
+    },
+    notification: {
+      ...defaults.notification,
+      ...inputNotification,
     },
     allowedProjectRoots: input.allowedProjectRoots ?? defaults.allowedProjectRoots,
     projects: input.projects ?? defaults.projects,
@@ -127,6 +135,7 @@ export function validateConfiguration(
 
   const wechat = validateWechat(candidate.wechat);
   const runtime = validateRuntime(candidate.runtime);
+  const notification = validateNotification(candidate.notification);
 
   return {
     ...candidate,
@@ -137,6 +146,7 @@ export function validateConfiguration(
     projects,
     wechat,
     runtime,
+    notification,
   } as ManagerConfiguration;
 }
 
@@ -188,6 +198,25 @@ function validateWechat(value: unknown): WechatConfiguration {
     throw new ConfigurationValidationError("wechat.credentialFile 必须是非空绝对路径。");
   }
   return wechat as WechatConfiguration;
+}
+
+/**
+ * 校验通知入口配置并保留扩展字段。
+ *
+ * @param value 待校验值。
+ * @returns 通知配置对象。
+ */
+function validateNotification(value: unknown): NotificationConfiguration {
+  const notification = asRecord(value, "notification");
+  if (
+    notification.overflowPolicy !== "queue" &&
+    notification.overflowPolicy !== "drop"
+  ) {
+    throw new ConfigurationValidationError(
+      "notification.overflowPolicy 只能是 queue 或 drop。",
+    );
+  }
+  return notification as NotificationConfiguration;
 }
 
 /**

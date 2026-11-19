@@ -20,6 +20,22 @@ export interface RuntimeConfiguration {
   [key: string]: unknown;
 }
 
+/**
+ * 通知入口的过期处理策略。
+ */
+export type NotificationOverflowPolicy = "queue" | "drop";
+
+/**
+ * 通知入口配置。
+ */
+export interface NotificationConfiguration {
+  /**
+   * 过期通知的处理策略: queue 为积压补发, drop 为直接拒绝。
+   */
+  overflowPolicy: NotificationOverflowPolicy;
+  [key: string]: unknown;
+}
+
 export interface ManagerConfiguration {
   schemaVersion: 1;
   autoStartOnWindowsLogon: boolean;
@@ -29,5 +45,6 @@ export interface ManagerConfiguration {
   projects: Record<string, ProjectDefinition>;
   wechat: WechatConfiguration;
   runtime: RuntimeConfiguration;
+  notification: NotificationConfiguration;
   [key: string]: unknown;
 }

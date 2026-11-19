@@ -189,6 +189,7 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 /last [会话索引|名称]
 /stop [会话索引|名称]
 /retry <message-id> --confirm
+/renew
 /watch [--all]
 /status
 /projects
@@ -203,6 +204,7 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 | `/last` | **否** | 只读回顾目标会话最近一轮对话 |
 | `/stop` | 是 | 停止目标会话的 Pi worker |
 | `/retry` | 是 | 重新执行指定消息, 可能产生副作用 |
+| `/renew` | **否** | 续命通知通道并补发积压通知, 不触发会话与模型 |
 | `/watch` | 否 | 默认总览「打开着」的会话; `--all` 查看全部历史会话 |
 | `/status` | 否 | 展示 Hub、当前会话与 UI 模式可用性 |
 | `/projects` | 否 | 列出已登记项目 |
@@ -215,6 +217,31 @@ Windows 自动启动默认关闭; 开启后在当前用户登录 Windows 时使�
 之所以按「是否还有 worker 实例」而非「会话状态」筛选, 是因为大量历史会话长期处于空闲状态, 若按状态展示会让总览被上百个早已关闭的会话淹没. 失败类型直接从 Pi transcript 的 `stopReason` 与 `errorMessage` 读取, 可识别周/5 小时/月额度、TPM 限流、网络错误、鉴权错误与上游合规拦截; 如果上游错误提供重置时间, 会原样显示.
 
 只有真正需要用户处理的失败才算异常: 用户主动中断(`aborted`)归为「已中断」, 默认与空闲会话一起收起; 超过 24 小时的失败视为历史记录, 不再占据异常列表. 这样早已结束的会话不会永久显示为错误. 当前 worker 的 `running` 状态可直接读取, 但 Hub 没有独立的 turn 定时心跳, 因此不臆测“卡住”状态. `/status` 额外输出 `可见 UI 模式`; 平台不支持或缺少 `wt.exe` 时显示 `不可用` 及具体原因.
+
+## 通知入口: 从其他程序推送微信通知
+
+其他 Pi 会话、脚本、CI 或任意程序可以通过本机入口把通知直接发到你的微信, **不经过会话队列、不触发模型、不耗 token**:
+
+```bash
+node "<包目录>/scripts/wx-notify.mjs" "构建完成" "beacon 项目编译通过, 耗时 2 分钟"
+node "<包目录>/scripts/wx-notify.mjs" "CI 失败" "main 分支测试挂了" --source github-actions
+```
+
+成功时退出码 0; Hub 未启动、通道过期或被限流时返回非 0 并说明原因。
+
+工作原理:
+
+- CLI 通过本机 named pipe (Windows) / unix socket 连接 Hub daemon, 用 `notify-shared.key` 的 HMAC proof 鉴权, 不监听 TCP。
+- Hub 复用你最近一条微信消息携带的 `context_token` 直接发送。
+- 每条通知末尾都带「请勿直接回复」提示; 通知与会话完全隔离。
+
+**24 小时窗口限制 (微信平台规则)**: 你超过 24 小时没和 Bot 聊过天, Bot 就无法主动发消息。Hub 的应对:
+
+1. 距过期不足 4 小时时, Bot 会主动提醒你回复 `/renew` 续命 (每个周期最多一次)。
+2. 过期后的通知默认**积压**在本地 (`notification.overflowPolicy: "queue"`), 你续命后自动补发; 超过 10 条合并为摘要, 单轮最多补 10 条, 避免触发微信风控。
+3. 改为 `"drop"` 则过期通知直接拒绝, CLI 返回明确错误, 由调用方自行处理。
+
+`/renew` 在微信端零副作用: 不进队列、不触发 Pi turn、不耗 token, 只续命并补发积压。
 
 ## 在微信端找回上下文
 
@@ -338,9 +365,14 @@ Pi TUI 的内置 `/resume` 始终由 Pi 自己处理, Hub extension 不再注册
   "projects": {},
   "wechat": {
     "authorizedUserId": ""
+  },
+  "notification": {
+    "overflowPolicy": "queue"
   }
 }
 ```
+
+`notification.overflowPolicy` 控制通知通道 token 过期后的处理策略: `queue` 为积压待续命后补发 (默认), `drop` 为直接拒绝并返回错误。详见「通知入口」章节。
 
 缺省字段会使用安全默认值. 历史配置中的 `defaultMode` 字段为兼容旧配置保留, 不决定微信端 `/new` 的运行模式; `/new` 默认创建后台会话, 也可通过 `--mode ui` 显式创建可见 UI 会话. `wechat.credentialFile` 固定指向 manager 数据目录中的 `credentials.json`; reader 拒绝目录外路径、符号链接、未知 schema 或授权用户不匹配. QR 凭证只在文件不存在时 create-only 写入, 不读取或覆盖其他应用数据.
 
@@ -352,6 +384,7 @@ Windows 首次创建空 manager 目录时会关闭继承 ACL, 仅授权当前用
 - Gateway 通过 `manager.lock` 保证单实例. control IPC 使用当前 lease token 完成 HMAC challenge, UI attach 使用 manager 目录 ACL 保护的稳定随机 key; 在线状态由活跃 IPC 校验, 不依赖过期 `gateway.json`.
 - route 绑定、会话索引和 worker owner 持久保存; session 恢复前重新验证项目路径是否仍位于 `allowedProjectRoots`.
 - 审计事件不记录消息正文、模型输出或凭证. 队列只在未完成期间保存原消息及 `replyContext`; 完成后压缩移除 payload, 并保留最近 1000 个 messageId 的 SHA-256 摘要用于去重.
+- 通知入口使用 manager 目录 ACL 保护的 `notify-shared.key` HMAC 鉴权, 不监听 TCP; 通知积压仅存内存, 不落盘; 详见 ADR 0002.
 - iLink `sendtyping` 仅提供 best-effort "正在输入"提示. Pi turn settled 后 Hub 发送一条完整最终回复, 不做 token 级微信流式回传.
 - 关闭服务后不会自动登录或生成 QR. 自动启动仅由 `autoStartOnWindowsLogon` 和当前用户登录启动项控制.
 - 可见 UI 模式在执行前校验平台和 `wt.exe`, 校验不通过即阻塞, 不产生半启动进程.

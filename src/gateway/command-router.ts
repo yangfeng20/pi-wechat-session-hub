@@ -20,6 +20,7 @@ import type { SessionIndexRecord, WorkerInstanceRecord, WorkerMode } from "../re
 import { BackgroundWorkerManagerError } from "../runtime/background-worker-manager.ts";
 import type { GatewayWorkerService } from "../runtime/gateway-worker-manager.ts";
 import { UiWorkerManagerError } from "../runtime/ui-worker-manager.ts";
+import type { NotificationService } from "./notification/notification-service.ts";
 import {
   evaluateHealth,
   formatHealthState,
@@ -100,6 +101,7 @@ export class GatewayCommandRouter {
   private readonly lease: GatewayLease;
   private readonly replySink?: GatewayReplySink;
   private readonly processingIndicator?: GatewayProcessingIndicator;
+  private readonly notificationService?: NotificationService;
   private readonly uiModeCapability?: () => Promise<import("../gateway/windows-terminal-launcher.ts").WindowsTerminalCapability>;
 
   /**
@@ -116,6 +118,7 @@ export class GatewayCommandRouter {
     lease: GatewayLease;
     replySink?: GatewayReplySink;
     processingIndicator?: GatewayProcessingIndicator;
+    notificationService?: NotificationService;
     uiModeCapability?: () => Promise<import("../gateway/windows-terminal-launcher.ts").WindowsTerminalCapability>;
   }) {
     this.configStore = options.configStore;
@@ -126,6 +129,7 @@ export class GatewayCommandRouter {
     this.lease = options.lease;
     this.replySink = options.replySink;
     this.processingIndicator = options.processingIndicator;
+    this.notificationService = options.notificationService;
     this.uiModeCapability = options.uiModeCapability;
     this.queue.setSkippedNotifier((routeId, item) =>
       this.notifySkippedItem(routeId, item),
@@ -233,6 +237,15 @@ export class GatewayCommandRouter {
     await this.lease.assertOwned();
     const { config } = await this.configStore.load();
     this.assertAuthorized(message.senderId, config);
+    // 授权通过后立即捕获最新 context token, 供通知通道主动发送使用。
+    // best-effort: 捕获失败不影响正常消息处理。
+    if (message.replyContext) {
+      try {
+        await this.notificationService?.recordInboundContext(message.replyContext);
+      } catch {
+        // token 捕获失败只影响通知通道, 不阻断会话消息。
+      }
+    }
     if (!message.messageId.trim() || !message.text.trim()) {
       throw new GatewayCommandParseError("微信消息缺少 messageId 或正文, 已拒绝路由。");
     }
@@ -264,6 +277,9 @@ export class GatewayCommandRouter {
         config,
         message.replyContext,
       );
+    }
+    if (command.kind === "renew") {
+      return this.renewNotificationChannel(routeId, message, config);
     }
 
     const enqueued = await this.queue.enqueue(
@@ -320,6 +336,42 @@ export class GatewayCommandRouter {
       } finally {
         this.processingIndicator?.stop(item.messageId);
       }
+    };
+  }
+
+  /**
+   * 处理微信端 /renew 命令: 续命通知通道并补发积压, 不进 durable queue。
+   *
+   * /renew 零副作用, 不触发 Pi turn; 续命效果由入站 token 捕获自动完成。
+   *
+   * @param routeId 微信 route ID。
+   * @param message 原始入站消息。
+   * @param config 当前配置快照。
+   * @returns receive 结果, 状态固定为 completed。
+   */
+  private async renewNotificationChannel(
+    routeId: string,
+    message: InboundGatewayMessage,
+    _config: ManagerConfiguration,
+  ): Promise<GatewayReceiveResult> {
+    let reply: string;
+    if (!this.notificationService) {
+      reply = "通知通道未启用; 当前 Hub 版本不支持 /renew。";
+    } else {
+      try {
+        reply = await this.notificationService.renew(message.replyContext);
+      } catch {
+        reply = "续命失败, 请稍后重试。";
+      }
+    }
+    if (this.replySink) {
+      await this.replySink(routeId, message.messageId, reply, message.replyContext);
+    }
+    return {
+      messageId: message.messageId,
+      state: "completed",
+      duplicate: false,
+      ...(this.replySink ? {} : { reply }),
     };
   }
 
@@ -1137,6 +1189,10 @@ export class GatewayCommandRouter {
           return GATEWAY_HELP_TEXT;
         case "status":
           return await this.formatStatus(routeId, config);
+        case "renew":
+          // /renew 在入站路径已直接处理, 到达这里说明走了 queue 兼容路径。
+          return "通知通道已续命。";
+        case "projects":
         case "projects":
           return await this.handleProjects(command.arguments);
         case "new":
@@ -1836,6 +1892,9 @@ const GATEWAY_HELP_TEXT = [
   "- `/status` 查看连接与当前会话状态",
   "- `/watch [--all]` 总览运行中与异常会话, `--all` 查看全部",
   "- `/retry <message-id> --confirm` 重新执行失败消息 (可能产生副作用)",
+  "",
+  "**通知通道**",
+  "- `/renew` 续命通知通道并补发积压通知 (零副作用, 不触发会话)",
   "",
   "发送 `/help` 查看此帮助。",
 ].join("\n");

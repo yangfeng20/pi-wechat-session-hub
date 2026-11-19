@@ -152,3 +152,17 @@ npm run test:pi-runtime
 测试覆盖: config 默认关闭和非法值拒绝, IPC HMAC、detached daemon ready/failure, Windows 当前用户 Run 自动启动命令与 launcher 生成、route/session index 迁移, background/UI handoff, saved UI route 不再开 tab, durable queue、fake iLink、typing indicator、凭证 create-only 和 Pi RPC command smoke. `npm test` 不启动真实 Windows Terminal、不访问真实微信或模型.
 
 Pi 版本兼容矩阵通过 typecheck、完整测试和 RPC smoke. Windows 当前用户登录启动项、真实微信 QR 和真实模型仍需在用户设备上验收; 自动启动项通过 HKCU Run 写入, 不要求系统级 Windows service 或管理员权限.
+
+## 11. 通知入口 (ADR 0002)
+
+其他 Pi 会话与外部程序通过本机 named pipe / unix socket 入口推送微信通知, 不经过 durable queue、Pi worker 与模型, 零副作用:
+
+- `ContextTokenStore` 在入站消息授权通过后捕获最新 `context_token` 到 `ilink-context-token.json` (ACL 保护, 0600, 原子写); durable queue 完成后删除 token 的行为不变, 此处仅保留一条活跃记录.
+- `NotificationService` 复用 `IlinkApiClient.sendText` 直发; 发送前按 20 小时新鲜度预检 (24 小时硬过期留 4 小时余量); 正文末尾固定附加"请勿直接回复"提示.
+- 过期策略 `notification.overflowPolicy`: `queue` (默认) 积压待续命后补发, 内存上限 100 条; `drop` 直接拒绝. 补发单轮最多 10 条, 超过 10 条合并摘要.
+- 微信端 `/renew` 在入站路径直接拦截: 续命 (由入站 token 捕获自动完成) + 补发积压 + 确认回复, 不进队列不触发 Pi turn.
+- 距过期不足 4 小时时由 Gateway 心跳触发续命提醒, 每个过期周期最多一次, 文案引导回复 `/renew`.
+- 通知入口 `NotificationIngressServer`: endpoint 由 manager 目录哈希推导 (与 control IPC 同模式), `notify-shared.key` HMAC proof 鉴权 (绑定 requestId + 时间戳 + payload, ±5 分钟防重放), 默认限流 10 条/分钟、60 条/小时. 不监听 TCP.
+- `scripts/wx-notify.mjs` 零依赖 CLI: `node wx-notify.mjs "标题" "正文" [--source 标识]`, 退出码 0 表示送达或已积压, 非 0 返回明确失败原因.
+
+测试覆盖: token 存储与损坏拒绝、策略分支、续命补发与摘要、提醒窗口、HMAC 篡改与时间戳拒绝、限流器、端到端 pipe 通信与 `/renew` 解析.

@@ -99,3 +99,8 @@ test("/projects parser 保留原始引号供项目命令解析器使用", () => 
     },
   );
 });
+
+test("/renew 无参数直接续命, 带参数时报错", () => {
+  assert.deepEqual(parseGatewayCommand("/renew"), { kind: "renew" });
+  assert.throws(() => parseGatewayCommand("/renew extra"), GatewayCommandParseError);
+});
