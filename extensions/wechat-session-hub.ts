@@ -28,6 +28,7 @@ import { BackgroundWorkerManagerError } from "../src/runtime/background-worker-m
 import { UiWorkerManagerError } from "../src/runtime/ui-worker-manager.ts";
 import { PiCliUnavailableError, resolveCurrentPiCli } from "../src/runtime/pi-cli.ts";
 import { ProjectService, ProjectServiceError } from "../src/projects/project-service.ts";
+import { registerWechatNotifyTool } from "../src/commands/wechat-notify-tool.ts";
 
 const HELP_TEXT = [
   "Pi 微信会话枢纽命令:",
@@ -269,6 +270,8 @@ export default function registerWechatSessionHub(pi: ExtensionAPI): void {
   const store = createDefaultConfigurationStore();
   const projectService = new ProjectService(store);
   registerUiWorkerBridgeHooks(pi, projectService, getManagerDataDirectory());
+  // 随包注册 wx_notify 工具: 任何安装本包的 Pi 会话都能直接发微信通知。
+  registerWechatNotifyTool(pi);
   const handleWechatManagerCommand = async (
     args: string,
     ctx: ExtensionCommandContext,
