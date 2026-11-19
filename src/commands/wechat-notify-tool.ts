@@ -150,6 +150,10 @@ export function registerWechatNotifyTool(pi: ExtensionAPI): void {
       "适用: 长任务完成、构建/测试结果、后台任务需要用户决策。",
       "不适用: 普通对话回复 (直接在会话里说即可)。正文请简洁, 一两句话。",
     ].join(" "),
+    promptSnippet: "Send a WeChat notification to the user (wx_notify)",
+    promptGuidelines: [
+      "Use wx_notify when the user asks to be notified via 微信/WeChat (例如: 构建完微信通知我、发微信告诉我、结果发我微信), or when a long-running task finishes while the user is likely away.",
+    ],
     parameters: Type.Object({
       title: Type.String({ description: "通知标题, 例如: 构建完成" }),
       text: Type.String({ description: "通知正文, 一两句话说明结果" }),
